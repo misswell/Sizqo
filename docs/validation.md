@@ -196,6 +196,65 @@ Gate status: this release followed the v0.1.x precedent — the user asked for
 signed-sandbox (App Store) runtime check, the §11 video acceptance matrix, the
 FFmpeg GPL licensing review, and the signed Direct GUI pass above.
 
+## CI release secrets (jollyfon/Sizqo, 2026-10-13)
+
+Secret names were taken from **this** repository's pipeline, not from the
+MacPilot setup note: [.github/workflows/release.yml](../.github/workflows/release.yml)
+and `scripts/sign_notarize_macos_ci.sh` consume
+`APPLE_DEVELOPER_ID_P12_BASE64`, `APPLE_DEVELOPER_ID_P12_PASSWORD`, `APPLE_ID`,
+`APPLE_TEAM_ID`, `APPLE_APP_SPECIFIC_PASSWORD`, `TAURI_SIGNING_PRIVATE_KEY` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The `APPLE_CERTIFICATE_*` /
+`APPLE_DEVELOPER_ID` names from that note would have been dead config here.
+
+Configured (2026-10-13, values never printed, committed or piped through argv):
+
+```sh
+security find-identity -v -p codesigning     # 3 valid; Developer ID Application: Guofeng Liu (U8U443D7ZL)
+gh api user --jq .login                     # jollyfon (admin on jollyfon/Sizqo)
+zsh /tmp/sizqo_configure_ci_secrets.sh --repo jollyfon/Sizqo \
+  --apple-id <Apple ID email> \
+  --developer-id 'Developer ID Application: Guofeng Liu (U8U443D7ZL)' --team-id U8U443D7ZL
+gh secret list --repo jollyfon/Sizqo        # names + timestamps only
+```
+
+`gh secret list` then shows exactly `APPLE_DEVELOPER_ID_P12_BASE64`,
+`APPLE_DEVELOPER_ID_P12_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID`. The P12 is the
+single-identity export (certificate matched to its private key by public-key
+SHA-256), imported into a throwaway keychain and asserted to yield **exactly
+one** codesigning identity equal to the requested Developer ID *before* upload;
+`find` for stray `.p12`/`cert-*.pem`/`key-*.pem`/`verify.keychain-db` under the
+temp roots returns nothing and `security list-keychains -d user` no longer
+lists the verify keychain. The scratch copy of the skill script was deleted.
+
+Two deviations worth knowing: `gh auth status` exits **1** on this machine
+because the suspended `misswell` token is still in the keyring, so the script
+was changed to gate on `gh api user` + `repos/<repo> .permissions.admin`
+instead; and the pushed `v0.1.0`–`v0.2.0` tags produced **no** Actions runs
+(`gh run list --repo jollyfon/Sizqo` → `[]`).
+
+Not done — this section is configured, not end-to-end verified:
+
+- `APPLE_APP_SPECIFIC_PASSWORD` must be typed by the user directly at
+  <https://github.com/jollyfon/Sizqo/settings/secrets/actions>; it never goes
+  through chat. The alternative that already works locally is the App Store
+  Connect API-key trio (`notarytool --key/--key-id/--issuer`), which would mean
+  changing the workflow's notarization step rather than adding this secret.
+- `TAURI_SIGNING_PRIVATE_KEY`/`_PASSWORD` were deliberately **not** uploaded:
+  that minisign key (`sizqo-updater-privkey`, pubkey `CA755A8F7DAAC119`) signs
+  the auto-update payload for shipped binaries, so publishing it to a second
+  GitHub account needs an explicit decision — and it buys nothing yet, since
+  the baked feed still points at `github.com/misswell/Sizqo/…/latest.json`,
+  which 404s while that account is suspended.
+- The release workflow is still the inherited OctoShrink one (16 `OctoShrink`
+  matches, 0 `Sizqo`; it zips `bundle/macos/OctoShrink.app`, which no longer
+  exists because `productName` is `Sizqo`, and it publishes a Release named
+  章小压 · OctoShrink with an OctoShrink body and artifact names). It therefore
+  cannot cut a Sizqo release today even with these secrets, and per AGENTS.md
+  its historical names/endpoints MUST NOT be used for Sizqo publishing. Rewriting
+  it — including the `SIZQO_UPDATER_CONFIGURED` gate that `scripts/notarize.sh`
+  sets locally — is the blocker before any CI release; a name list is not proof
+  the values work, which only a runner's cert import + sign + notarize proves.
+
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
 Before any tag/Release: full three-track build, signed Direct runtime check,
