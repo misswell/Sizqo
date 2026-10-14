@@ -242,9 +242,27 @@ Not done — this section is configured, not end-to-end verified:
 - `TAURI_SIGNING_PRIVATE_KEY`/`_PASSWORD` were deliberately **not** uploaded:
   that minisign key (`sizqo-updater-privkey`, pubkey `CA755A8F7DAAC119`) signs
   the auto-update payload for shipped binaries, so publishing it to a second
-  GitHub account needs an explicit decision — and it buys nothing yet, since
-  the baked feed still points at `github.com/misswell/Sizqo/…/latest.json`,
-  which 404s while that account is suspended.
+  GitHub account needs an explicit decision rather than being done as a
+  convenience.
+
+### 2026-10-14 复核：misswell 恢复，上面的 jollyfon 配置失去消费方
+
+The `misswell` suspension is over, so the premise of this whole section
+changed. Re-measured: `gh api user` → `misswell` (active again; `jollyfon` is
+now the inactive keyring entry, which is why `gh secret list --repo
+jollyfon/Sizqo` returns HTTP 403), `ssh -T git@github.com` → `Hi misswell!`,
+and `gh api repos/misswell/Sizqo/releases/latest` resolves to **v0.2.0** with
+four assets (`latest.json` 659 B, `Sizqo-0.2.0-macos.dmg` 31,703,781 B,
+`Sizqo.app.tar.gz` 4,432,774 B, `.sig` 404 B) — the baked updater feed is live
+again, so the "feed 404s" caveat above no longer applies. `gh secret list
+--repo misswell/Sizqo` is **empty**: the original repository has no CI secrets
+at all, and the four just written to `jollyfon/Sizqo` have no consumer there.
+
+Measurement note: plain HTTPS to `github.com:443` from this shell times out
+(`curl -w '%{http_code}'` → `000`, "Failed to connect … port 443"), while
+`api.github.com` via `gh` and git-over-SSH both work. A `000` here is this
+shell's transport, **not** the repository's status — release/feed checks must
+go through `gh api`, or they read as an outage that isn't happening.
 - The release workflow is still the inherited OctoShrink one (16 `OctoShrink`
   matches, 0 `Sizqo`; it zips `bundle/macos/OctoShrink.app`, which no longer
   exists because `productName` is `Sizqo`, and it publishes a Release named
