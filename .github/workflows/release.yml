@@ -57,8 +57,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install CLI tools
+        # ffmpeg/ffprobe 是 Direct 视频轨的捆绑引擎，scripts/collect_macos_tools.sh 缺它会直接失败。
+        # Homebrew 的 ffmpeg 带 GPL 编码器，对外分发前的对应源码义务仍未完成（见 THIRD_PARTY_NOTICES.md）。
         run: |
-          brew install pngquant oxipng mozjpeg gifsicle webp jpeg-xl libavif
+          brew install pngquant oxipng mozjpeg gifsicle webp jpeg-xl libavif ffmpeg
           bash scripts/collect_macos_tools.sh src-tauri/resources
 
       - name: Install Tauri CLI
@@ -66,17 +68,48 @@ jobs:
 
       - name: Build
         working-directory: src-tauri
-        run: |
-          cargo tauri build --target "${{ matrix.target }}" --bundles app \
-            --config '{"bundle":{"resources":["resources/bin/*","resources/lib/*"]}}'
         env:
           CODE_SIGN_IDENTITY: ""
+          # 没有独立更新私钥就按「更新禁用」构建，与 src-tauri/src/lib.rs 的 option_env! 门禁一致；
+          # 公钥/端点只在 tauri.conf.updater.json 里，绝不回落到上游 OctoShrink 的密钥或 feed。
+          SIZQO_UPDATER_CONFIGURED: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && '1' || '0' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # --config 只接受一个值，所以资源清单和更新配置得先合成同一份 JSON。
+          RESOURCES='{"bundle":{"resources":["resources/bin/*","resources/lib/*"]}}'
+          if [ "${SIZQO_UPDATER_CONFIGURED}" = "1" ]; then
+            jq -n --argjson r "$RESOURCES" --slurpfile u tauri.conf.updater.json '$r * $u[0]' \
+              > "${RUNNER_TEMP}/ci.tauri.conf.json"
+            CONFIG="${RUNNER_TEMP}/ci.tauri.conf.json"
+          else
+            CONFIG="$RESOURCES"
+          fi
+          cargo tauri build --target "${{ matrix.target }}" --bundles app --config "$CONFIG"
+
+      - name: Bundle the video engine
+        # src-tauri/src/video/process.rs 只在 <exe>/../Resources/video/bin 找 ffmpeg/ffprobe；
+        # 上面的 bundle.resources 只覆盖图片 CLI，视频轨必须显式投递，否则应用内视频功能必然报缺引擎。
+        run: |
+          set -euo pipefail
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Sizqo.app"
+          SRC="src-tauri/resources/video"
+          [ -d "$APP" ] || { echo "构建产物不存在：$APP" >&2; exit 1; }
+          [ -d "$SRC/bin" ] || { echo "缺少视频引擎源：$SRC/bin" >&2; exit 1; }
+          mkdir -p "$APP/Contents/Resources/video/bin" "$APP/Contents/Resources/video/lib"
+          cp "$SRC/bin/"* "$APP/Contents/Resources/video/bin/"
+          if compgen -G "$SRC/lib/*.dylib" >/dev/null; then
+            cp "$SRC/lib/"*.dylib "$APP/Contents/Resources/video/lib/"
+          fi
+          chmod 755 "$APP/Contents/Resources/video/bin/"*
+          echo "video/bin:"; ls -1 "$APP/Contents/Resources/video/bin"
 
       - name: Package app for signing
         run: |
-          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/OctoShrink.app"
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Sizqo.app"
           ditto -c -k --sequesterRsrc --keepParent "$APP" \
-            "src-tauri/target/${{ matrix.target }}/release/bundle/OctoShrink_${{ matrix.arch }}.app.zip"
+            "src-tauri/target/${{ matrix.target }}/release/bundle/Sizqo_${{ matrix.arch }}.app.zip"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -112,7 +145,7 @@ jobs:
           : "${DEVELOPER_ID_P12_BASE64:?Missing APPLE_DEVELOPER_ID_P12_BASE64 secret}"
           : "${DEVELOPER_ID_P12_PASSWORD:?Missing APPLE_DEVELOPER_ID_P12_PASSWORD secret}"
 
-          KEYCHAIN_PATH="${RUNNER_TEMP}/octoshrink-signing.keychain-db"
+          KEYCHAIN_PATH="${RUNNER_TEMP}/sizqo-signing.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
           P12_PATH="${RUNNER_TEMP}/developer-id.p12"
 
@@ -143,31 +176,46 @@ jobs:
       - name: Merge Universal app
         run: |
           mkdir -p work/arm64 work/x86_64 work/universal release
-          ditto -x -k artifacts/arm64/OctoShrink_arm64.app.zip work/arm64
-          ditto -x -k artifacts/x86_64/OctoShrink_x86_64.app.zip work/x86_64
+          ditto -x -k artifacts/arm64/Sizqo_arm64.app.zip work/arm64
+          ditto -x -k artifacts/x86_64/Sizqo_x86_64.app.zip work/x86_64
           bash scripts/merge_macos_universal.sh \
-            work/arm64/OctoShrink.app \
-            work/x86_64/OctoShrink.app \
-            work/universal/OctoShrink.app
+            work/arm64/Sizqo.app \
+            work/x86_64/Sizqo.app \
+            work/universal/Sizqo.app
 
       - name: Sign, notarize, and staple macOS assets
         env:
+          # 公证优先走 App Store Connect API key（本机实测唯一可用的非交互路线），
+          # 没有这组 Secret 才回落到 Apple ID + App 专用密码。
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           SIGNING_IDENTITY: 'Developer ID Application: Guofeng Liu (U8U443D7ZL)'
         run: |
           bash scripts/sign_notarize_macos_ci.sh \
-            work/arm64/OctoShrink.app \
-            work/x86_64/OctoShrink.app \
-            work/universal/OctoShrink.app \
+            work/arm64/Sizqo.app \
+            work/x86_64/Sizqo.app \
+            work/universal/Sizqo.app \
             release
 
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0" --locked
 
       - name: Sign updater archive
-        run: cargo tauri signer sign "release/OctoShrink_${RELEASE_TAG}_macos_universal.app.tar.gz"
+        run: |
+          set -euo pipefail
+          ARCHIVE="release/Sizqo_${RELEASE_TAG}_macos_universal.app.tar.gz"
+          [ -f "$ARCHIVE" ] || { echo "缺少更新包：$ARCHIVE" >&2; exit 1; }
+          # 没有独立更新私钥就中止：Release 里缺 latest.json 会让已装客户端的检查永久 404，
+          # 而带着空签名发布更糟。宁可不出版。
+          [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || {
+            echo "未配置 TAURI_SIGNING_PRIVATE_KEY：无法签名在线更新包，本轮发布中止" >&2
+            exit 1
+          }
+          cargo tauri signer sign "$ARCHIVE"
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -402,12 +450,12 @@ jobs:
           find artifacts -name "*.tar.gz" -exec cp {} release/ \;
           find artifacts -name "*.sig" -exec cp {} release/ \;
           VERSION="${RELEASE_TAG#v}"
-          ARCHIVE="OctoShrink_${RELEASE_TAG}_macos_universal.app.tar.gz"
+          ARCHIVE="Sizqo_${RELEASE_TAG}_macos_universal.app.tar.gz"
           SIGNATURE="$(cat "release/${ARCHIVE}.sig")"
           DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${ARCHIVE}"
           jq -n \
             --arg version "$VERSION" \
-            --arg notes "OctoShrink ${VERSION}: fixes App Store compression failing after selecting individual files by requesting and retaining output-folder write permission. Direct and Swift compression behavior is preserved." \
+            --arg notes "Sizqo ${VERSION}" \
             --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg signature "$SIGNATURE" \
             --arg url "$DOWNLOAD_URL" \
@@ -419,35 +467,36 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: 章小压 · OctoShrink ${{ env.RELEASE_TAG }}
+          name: Sizqo ${{ env.RELEASE_TAG }}
           body: |
-            ## 章小压 · OctoShrink
+            ## Sizqo ${{ env.RELEASE_TAG }}
 
-            免费开源的本机图片压缩工具，图片不会上传到服务器。
-
-            ### 本版
-            修复 App Store 沙盒版选择单个文件后无法写入压缩结果的问题：启动压缩前验证输出文件夹写权限，必要时请求授权，并保持授权直到输出事务完成。Direct 和 Swift 的压缩行为保持一致。
+            本机媒体压缩工具，图片与视频都只在本地处理，不上传服务器。
 
             ### 下载
 
             | 平台 | 文件 | 说明 |
             |------|------|------|
-            | macOS Universal 2 | `_universal.dmg` | 推荐，兼容 Apple Silicon 与 Intel |
-            | macOS Apple Silicon | `_arm64.dmg` | M 系列芯片专用 |
-            | macOS Intel | `_x86_64.dmg` | Intel 芯片专用 |
-            | Windows | `.exe` / `.msi` | 内置压缩工具，开箱即用 |
-            | Linux | `.deb` / `.AppImage` | 内置压缩工具，开箱即用 |
+            | macOS Universal 2 | `Sizqo_${{ env.RELEASE_TAG }}_macos_universal.dmg` | 推荐，兼容 Apple Silicon 与 Intel |
+            | macOS Apple Silicon | `Sizqo_${{ env.RELEASE_TAG }}_macos_arm64.dmg` | M 系列芯片专用 |
+            | macOS Intel | `Sizqo_${{ env.RELEASE_TAG }}_macos_x86_64.dmg` | Intel 芯片专用 |
+            | Windows | `.exe` / `.msi` | 内置压缩工具 |
+            | Linux | `.deb` / `.AppImage` | 内置压缩工具 |
 
-            ### 功能
-            - 支持 PNG、JPEG、GIF、WebP、AVIF 图片压缩与格式转换
+            macOS 资产均经 Developer ID 签名、Apple 公证与装订；`latest.json` 是应用内更新源，
+            仅在本轮配置了独立更新签名时产出。
+
+            ### 能力
+            - 图片：PNG、JPEG、GIF、WebP、AVIF、JPEG XL 压缩与格式转换
             - macOS 支持系统 JPEG、PNG、HEIF 转换、尺寸调整和元数据保留
+            - 视频：Direct 轨捆绑 FFmpeg，可编码能力由运行时探测决定；不支持的轨道、HDR/高位深等在选择时即拒绝并解释
+            - 意图优先双栏工作台：选意图而不是裸参数，队列、详情与结果同屏
             - 图片与文件夹批量导入，支持追加、去重、排序和失败重试
-            - 支持覆盖原图、添加文件名后缀或输出到指定文件夹
-            - 覆盖前备份原图，提供压缩历史、原图恢复和备份保留设置
-            - 可暂停、继续或停止当前一轮；未开始的图片留在队列中
+            - 支持覆盖原图、添加文件名后缀或输出到指定文件夹；覆盖前备份原图
+            - 压缩历史、原图恢复与备份保留设置
+            - 可暂停、继续或停止当前一轮；未开始的项留在队列中
             - 独立窗口对比压缩前后效果
             - 可调整 CPU 并行上限，支持自动、亮色和暗色外观
-            - macOS GitHub 直发版支持应用内更新
           files: release/*
           fail_on_unmatched_files: true
           draft: false

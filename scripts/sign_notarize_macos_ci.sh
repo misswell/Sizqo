@@ -14,9 +14,28 @@ ENTITLEMENTS="${ENTITLEMENTS:-${PROJECT_DIR}/src-tauri/entitlements.plist}"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:-Developer ID Application: Guofeng Liu (U8U443D7ZL)}"
 SIGNING_KEYCHAIN="${SIGNING_KEYCHAIN:?SIGNING_KEYCHAIN is required}"
 RELEASE_TAG="${RELEASE_TAG:?RELEASE_TAG is required}"
-APPLE_ID="${APPLE_ID:?APPLE_ID is required}"
-APPLE_TEAM_ID="${APPLE_TEAM_ID:?APPLE_TEAM_ID is required}"
-APPLE_APP_SPECIFIC_PASSWORD="${APPLE_APP_SPECIFIC_PASSWORD:?APPLE_APP_SPECIFIC_PASSWORD is required}"
+
+# Notarization credentials, resolved the same way as scripts/notarize.sh:
+# an App Store Connect API key first (works non-interactively and needs no
+# app-specific password), falling back to the Apple ID + app-specific password
+# pair. Never default to an inherited upstream credential.
+NOTARY_ARGS=()
+NOTARY_KEY_FILE=""
+if [ -n "${APPLE_API_KEY:-}" ] && [ -n "${APPLE_API_KEY_ID:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ]; then
+  NOTARY_KEY_FILE="$(mktemp "${TMPDIR:-/tmp}/sizqo-notary-key.XXXXXX")"
+  printf '%s' "${APPLE_API_KEY}" | base64 -D > "${NOTARY_KEY_FILE}"
+  chmod 600 "${NOTARY_KEY_FILE}"
+  NOTARY_ARGS=(--key "${NOTARY_KEY_FILE}" --key-id "${APPLE_API_KEY_ID}" --issuer "${APPLE_API_ISSUER}")
+  echo "==> Notarization credentials: App Store Connect API key (${APPLE_API_KEY_ID})"
+elif [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
+  APPLE_TEAM_ID="${APPLE_TEAM_ID:?APPLE_TEAM_ID is required when notarizing with an Apple ID}"
+  NOTARY_ARGS=(--apple-id "${APPLE_ID}" --team-id "${APPLE_TEAM_ID}" --password "${APPLE_APP_SPECIFIC_PASSWORD}")
+  echo "==> Notarization credentials: Apple ID + app-specific password"
+else
+  echo "Missing notarization credentials: provide APPLE_API_KEY + APPLE_API_KEY_ID + APPLE_API_ISSUER," >&2
+  echo "or APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID." >&2
+  exit 2
+fi
 
 for app in "${ARM_APP}" "${INTEL_APP}" "${UNIVERSAL_APP}"; do
   [ -d "${app}" ] || { echo "Missing app: ${app}" >&2; exit 1; }
@@ -110,12 +129,16 @@ create_dmg() {
 
 notarize_dmg() {
   local dmg="$1"
-  xcrun notarytool submit "${dmg}" \
-    --apple-id "${APPLE_ID}" \
-    --team-id "${APPLE_TEAM_ID}" \
-    --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
-    --wait
+  xcrun notarytool submit "${dmg}" "${NOTARY_ARGS[@]}" --wait
 }
+
+# The extracted .p8 exists only for this job's lifetime.
+cleanup_notary_key() {
+  if [ -n "${NOTARY_KEY_FILE:-}" ] && [ -e "${NOTARY_KEY_FILE}" ]; then
+    rm -f "${NOTARY_KEY_FILE}"
+  fi
+}
+trap cleanup_notary_key EXIT
 
 log "Verify app architectures"
 verify_architectures "${ARM_APP}" arm64

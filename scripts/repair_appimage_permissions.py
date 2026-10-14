@@ -71,7 +71,7 @@ def repair(image: Path) -> None:
     image = image.resolve(strict=True)
     offset, compressor, block_size = image_layout(image)
 
-    with tempfile.TemporaryDirectory(prefix="octoshrink-appimage-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="sizqo-appimage-") as temporary:
         temporary_path = Path(temporary)
         app_dir = temporary_path / "squashfs-root"
         squashfs = temporary_path / "payload.squashfs"
