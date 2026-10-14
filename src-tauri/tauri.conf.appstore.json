@@ -11,15 +11,15 @@
     "windows": [
       {
         "title": "Sizqo",
-        "width": 1180,
-        "height": 760,
-        "minWidth": 940,
-        "minHeight": 620,
+        "width": 1200,
+        "height": 780,
+        "minWidth": 960,
+        "minHeight": 640,
         "resizable": true,
         "fullscreen": false,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "backgroundColor": "#f8f6f8"
+        "backgroundColor": "#f5f7f7"
       }
     ],
     "security": {

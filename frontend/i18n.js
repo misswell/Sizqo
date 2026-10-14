@@ -162,6 +162,8 @@
     '把当前高级选项存成视频预设': 'Save the current advanced options as a video preset',
     '体积预算': 'Size budget', '最长边上限': 'Longest edge cap', '加后缀': 'Add suffix', '输出到目录': 'Save to a folder',
     '选择左侧的文件看详情': 'Select a file on the left to see its details',
+    '更轻的文件，让创作更自由': 'Lighter files, more room to create',
+    '每一次压缩都留了回来的路': 'Every compression keeps a way back',
     '省 ': 'Saved ', '多 ': 'Grew ', ' 个产物': ' files', ' 后缀': ' suffix',
     '队列为空': 'Queue is empty', '未开始': 'Not started', '正在停止': 'Stopping', '已停止': 'Stopped', '结束': 'Ended',
     '已完成': 'Finished', '耗时': 'Elapsed', '体积目标': 'Size target', '是否达标': 'Met the target',

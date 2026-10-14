@@ -2807,6 +2807,24 @@ function detailPreviewSrc(container, src) {
   box.appendChild(img);
 }
 
+var DETAIL_EMPTY_ART = '<svg class="detail-empty-art" viewBox="0 0 96 82" aria-hidden="true">'
+  + '<rect x="26.5" y="9.5" width="44" height="34" rx="7"/>'
+  + '<circle cx="38" cy="20" r="3"/>'
+  + '<path d="M31 37l9-10 6 6 5-5 10 11"/>'
+  + '<path d="M26 55h44 M26 65h28"/>'
+  + '<path class="art-accent" d="M17 44c-7 4-11 10-13 18" stroke-dasharray="3 4"/>'
+  + '<path class="art-accent" d="M79 48l1.8 4.2 4.2 1.8-4.2 1.8-1.8 4.2-1.8-4.2-4.2-1.8 4.2-1.8Z"/>'
+  + '</svg>';
+
+/// 空着的详情列不是"没有内容"，而是这一栏还没被点亮：给它线稿和一句产品话，
+/// 而不是孤零零一行灰色提示。
+function detailEmptyState(parent, title, sub) {
+  var box = detailSection(parent, 'detail-empty');
+  box.innerHTML = DETAIL_EMPTY_ART;
+  detailText(box, 'detail-hint', title);
+  detailText(box, 'detail-empty-sub', sub);
+}
+
 /// 详情列画什么，全看选中项**此刻**在队列里的状态。
 function renderDetailPane() {
   var body = document.getElementById('detailBody');
@@ -2815,7 +2833,8 @@ function renderDetailPane() {
   var filePath = selectedQueueFile;
   var item = filePath ? queueItems.get(filePath) : null;
   if (!item) {
-    detailText(body, 'detail-hint', localizeUiText('选择左侧的文件看详情'));
+    detailEmptyState(body, localizeUiText('选择左侧的文件看详情'),
+      localizeUiText('更轻的文件，让创作更自由'));
     return;
   }
   if (item.mediaKind === 'video') buildVideoDetail(body, filePath, item);
@@ -3124,6 +3143,8 @@ function formatBytes(bytes) {
 var VIEWS = ['main', 'history', 'settings'];
 var RAIL_KEYS = { main: 'workspace', history: 'history', settings: 'settings' };
 var VIEW_TITLES = { main: '媒体工作台', history: '压缩历史', settings: '设置' };
+// 水印是装饰性展示字，不参与本地化：三种语言下都用同一组英文大字。
+var VIEW_WATERMARKS = { main: 'Compress', history: 'History', settings: 'Settings' };
 var currentView = 'main';
 
 function showView(name) {
@@ -3142,6 +3163,8 @@ function showView(name) {
   });
   var context = document.getElementById('titlebarContext');
   if (context) context.textContent = localizeUiText(VIEW_TITLES[view]);
+  var watermark = document.getElementById('decorWord');
+  if (watermark) watermark.textContent = VIEW_WATERMARKS[view];
   // 每次进入都重新读盘：历史是后端状态，不能只信启动时那份快照。
   if (view === 'history') refreshHistory();
   if (view === 'settings') { loadRetentionSetting(); loadCpuSetting(); initUpdatePanel(); }
@@ -3642,7 +3665,8 @@ function renderHistoryDetail() {
     if (historyEntries[i].id === selectedHistoryKey) { entry = historyEntries[i]; break; }
   }
   if (!entry) {
-    detailText(body, 'detail-hint', localizeUiText('选择一条记录，看它此刻在磁盘上还剩什么'));
+    detailEmptyState(body, localizeUiText('选择一条记录，看它此刻在磁盘上还剩什么'),
+      localizeUiText('每一次压缩都留了回来的路'));
     return;
   }
   var isVideo = entry.mediaKind === 'video';

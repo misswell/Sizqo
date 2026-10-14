@@ -18,13 +18,13 @@
       document.documentElement.dataset.themeMode = mode;
       document.documentElement.dataset.theme = resolved;
       document.documentElement.style.colorScheme = resolved;
-      document.documentElement.style.backgroundColor = resolved === 'dark' ? '#16171a' : '#f2f2f4';
+      document.documentElement.style.backgroundColor = resolved === 'dark' ? '#0f1716' : '#f5f7f7';
     })();
   </script>
   <script src="i18n.js"></script>
   <style>
-    html, body { background: #f2f2f4; }
-    html[data-theme="dark"], html[data-theme="dark"] body { background: #16171a; }
+    html, body { background: #f5f7f7; }
+    html[data-theme="dark"], html[data-theme="dark"] body { background: #0f1716; }
   </style>
   <link rel="stylesheet" href="style.css">
 </head>
@@ -72,6 +72,13 @@
   </svg>
 
   <div class="app-shell">
+    <!-- 装饰层：水印大字 + 环境圆。纯视觉，永远画在面板之下，且不吞标题栏拖拽。 -->
+    <div class="decor" aria-hidden="true">
+      <span class="decor-orb decor-orb-1"></span>
+      <span class="decor-orb decor-orb-2"></span>
+      <span class="decor-word" id="decorWord">Compress</span>
+    </div>
+
     <header class="titlebar">
       <div class="titlebar-traffic-spacer"></div>
       <div class="titlebar-drag" data-tauri-drag-region>
@@ -323,9 +330,18 @@
               <!-- 空队列时这里就是拖放区：不再额外占一整屏。 -->
               <div class="dropzone" id="dropzone">
                 <div class="dropzone-content" id="dropzoneContent">
-                  <div class="dropzone-icon">
-                    <span class="dropzone-icon-disc"><svg class="symbol-icon symbol-icon-hero"><use href="#icon-add-images"/></svg></span>
-                  </div>
+                  <svg class="dropzone-art" viewBox="0 0 104 78" aria-hidden="true">
+                    <rect x="30.5" y="5.5" width="44" height="32" rx="7" transform="rotate(-6 52.5 21.5)"/>
+                    <rect x="14.5" y="17.5" width="48" height="36" rx="8"/>
+                    <circle cx="26" cy="29" r="3.2"/>
+                    <path d="M18 47l10-11 7 7 6-6 11 12"/>
+                    <rect x="60.5" y="28.5" width="30" height="23" rx="6"/>
+                    <path d="M72 35.5l8 4.5-8 4.5Z"/>
+                    <path class="art-accent" d="M85 11c-7 1.5-12 5-14.5 10" stroke-dasharray="3 4"/>
+                    <path class="art-accent" d="M9 13l2.5 2.5M19 8l-1.4 3.6L14 13l3.6 1.4L19 18l1.4-3.6L24 13l-3.6-1.4Z"/>
+                    <circle class="art-accent" cx="62" cy="55" r="7.5"/>
+                    <path class="art-accent" d="M62 51.8v6.4M58.8 55h6.4"/>
+                  </svg>
                   <h2 data-i18n-zh="拖拽图片、视频或文件夹到此处">Drop images, videos, or folders here</h2>
                   <p data-i18n-zh="自动识别媒体类型 · 文件夹递归扫描 · 大文件分析不阻塞界面">Media types detected automatically · folders scanned recursively</p>
                   <div class="dropzone-buttons">
