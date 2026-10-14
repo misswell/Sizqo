@@ -263,15 +263,132 @@ Measurement note: plain HTTPS to `github.com:443` from this shell times out
 `api.github.com` via `gh` and git-over-SSH both work. A `000` here is this
 shell's transport, **not** the repository's status — release/feed checks must
 go through `gh api`, or they read as an outage that isn't happening.
-- The release workflow is still the inherited OctoShrink one (16 `OctoShrink`
-  matches, 0 `Sizqo`; it zips `bundle/macos/OctoShrink.app`, which no longer
-  exists because `productName` is `Sizqo`, and it publishes a Release named
-  章小压 · OctoShrink with an OctoShrink body and artifact names). It therefore
-  cannot cut a Sizqo release today even with these secrets, and per AGENTS.md
-  its historical names/endpoints MUST NOT be used for Sizqo publishing. Rewriting
-  it — including the `SIZQO_UPDATER_CONFIGURED` gate that `scripts/notarize.sh`
-  sets locally — is the blocker before any CI release; a name list is not proof
-  the values work, which only a runner's cert import + sign + notarize proves.
+- The release workflow has since been rewritten for Sizqo (commit `cbb0b23`,
+  recorded in "CI 发布链路重做" below); at the time of writing it was still the
+  inherited OctoShrink one — 16 `OctoShrink` matches, 0 `Sizqo`, zipping
+  `bundle/macos/OctoShrink.app`, which no longer exists because `productName`
+  is `Sizqo`.
+
+## CI 发布链路重做与端到端验证（2026-10-14）
+
+### 六个失败 run 的真实原因不是 Secrets
+
+`gh api repos/misswell/Sizqo/actions/runs` 显示 6 次 Release run **全部 failure**，
+每一次都停在同一位置。job 114819441433 的日志尾部：
+
+```
+Collected 7 tools -> src-tauri/resources/bin (29 dylibs)
+Missing required tool: ffmpeg
+##[error]Process completed with exit code 1.
+```
+
+`scripts/collect_macos_tools.sh` 收两组工具（图片 7 个 + `resources/video/bin` 的
+`ffmpeg ffprobe`），而 workflow 的 `brew install pngquant oxipng mozjpeg gifsicle
+webp jpeg-xl libavif` 从来没有装 ffmpeg——上游 OctoShrink 没有视频轨。
+所以只配 Secrets 一步 CI 都推进不了；这轮改动先解决它。
+
+### 四个必须改的结构问题
+
+1. **视频引擎根本不进 bundle**。`src-tauri/src/video/process.rs` 只在
+   `<exe>/../Resources/video/bin` 找 `ffmpeg/ffprobe`，而 Build 步骤的
+   `--config '{"bundle":{"resources":["resources/bin/*","resources/lib/*"]}}'`
+   只覆盖图片 CLI。新增 "Bundle the video engine" 步骤，在签名前把
+   `src-tauri/resources/video/{bin,lib}` 投进 `Contents/Resources/video/`，
+   与 `scripts/notarize.sh:148-166` 的本地路线一致。`sign_app()` 遍历
+   `Contents` 下所有 Mach-O，因此这些文件照样被正式签名。
+2. **`--config` 不可重复**。`cargo tauri build --help` 显示
+   `-c, --config <CONFIG>`（没有 `...`），传两次只会留下最后一次。改用
+   `jq -n --argjson r '$RESOURCES' --slurpfile u tauri.conf.updater.json '$r * $u[0]'`
+   合成 `${RUNNER_TEMP}/ci.tauri.conf.json` 后单次传入。
+3. **公证凭据**。`scripts/sign_notarize_macos_ci.sh` 原来硬要求
+   `APPLE_ID + APPLE_TEAM_ID + APPLE_APP_SPECIFIC_PASSWORD`。现在与
+   `scripts/notarize.sh` 同路线：App Store Connect API key 三件套优先
+   （`notarytool --key/--key-id/--issuer`），没有才回落 Apple ID + 专用密码，
+   两者都没有则 `exit 2`。临时 `.p8` 由 `trap cleanup_notary_key EXIT` 清理。
+   这条改动直接取消了「用户必须手工粘一个 app-specific password」的前置条件。
+4. **更新签名门禁**。Build 用 `SIZQO_UPDATER_CONFIGURED: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && '1' || '0' }}`
+   决定是否合并 `tauri.conf.updater.json`，与 `src-tauri/src/lib.rs:65,287,376,514`
+   的 `option_env!` 门禁一致；"Sign updater archive" 在没有私钥时**中止本轮**，
+   而不是发一个 `latest.json` 里签名为空的 Release。
+   其余为去 OctoShrink 化：资产名、临时 keychain `sizqo-signing.keychain-db`、
+   `scripts/repair_appimage_permissions.py` 的临时目录前缀、Release 标题与正文
+   （正文按三轨真实能力重写，含「视频由运行时探测」「意图优先双栏工作台」）。
+
+### misswell/Sizqo 的 9 个 Actions Secrets
+
+`gh api user --jq .login` → `misswell`，`repos/misswell/Sizqo .permissions.admin` → true。
+`gh auth status` 在本机仍退出 1（钥匙串留着失效的 `jollyfon` 条目），所以脚本门禁改成
+上面两条断言。所有值一律 keychain → stdin → `gh secret set`，不经 argv、不打印、
+不进仓库；`APPLE_APP_SPECIFIC_PASSWORD` 全程没有出现过。
+
+| Secret | 来源 | 上传前的证明 |
+| --- | --- | --- |
+| `APPLE_DEVELOPER_ID_P12_BASE64` / `_PASSWORD` | 登录钥匙串导出，按公钥 SHA-256 把证书与私钥配对，只保留目标身份 | 导入一次性 keychain 后断言 `find-identity` **恰好一个**身份等于 `Developer ID Application: Guofeng Liu (U8U443D7ZL)` |
+| `APPLE_ID` / `APPLE_TEAM_ID` | `misswell@foxmail.com` / `U8U443D7ZL` | — |
+| `APPLE_API_KEY`（base64 的 .p8）/ `APPLE_API_KEY_ID` / `APPLE_API_ISSUER` | 钥匙串 `asc:credential:agentspace-notary` | `xcrun notarytool history --key … --key-id … --issuer …` 返回 "Successfully received submission history" |
+| `TAURI_SIGNING_PRIVATE_KEY` / `_PASSWORD` | 钥匙串 `sizqo-updater-privkey` / `sizqo-updater-key-password` | 见下 |
+
+**私钥编码坑**：`sizqo-updater-privkey` 存的是**两层 base64**。只解一层得到 348 字节
+文本，其内容本身仍是 base64；直接解两层得到 258 字节 `untrusted comment: …` 原文，
+而 `cargo tauri signer sign` 对它会报
+`Error failed to decode base64 secret key: Invalid symbol 32, offset 9`。
+也就是说 `TAURI_SIGNING_PRIVATE_KEY` 要的正是**解一层**的那个值——与
+`scripts/notarize.sh:71` 完全一致。用该值签一个探针文件、把 `.sig` 再 base64 解码后
+`minisign -V -x … -p <tauri.conf.updater.json 的 pubkey 解码> -m …`：
+
+```
+Signature and comment signature verified
+Trusted comment: timestamp:1791943123	file:probe.bin
+```
+
+### 端到端验证：run 38498689210（publish=false）
+
+`gh workflow run release.yml -f tag=v0.2.1 -f publish=false --ref main`，
+落在 `cbb0b23`。7 个 job 全 `success`，`release` 按预期 `skipped`
+（`if: github.event_name == 'push' || inputs.publish`），**没有产出任何 Release**。
+<https://github.com/misswell/Sizqo/actions/runs/38498689210>
+
+日志证据（arm64 job 115640244219 / universal job 115647722328）：
+
+- `Collected 7 tools -> src-tauri/resources/bin (29 dylibs)`
+  + `Collected 2 tools -> src-tauri/resources/video/bin (19 dylibs)` — 曾经致命的那一步过了
+- `video/bin:\nffmpeg\nffprobe` — CI 产物里第一次带上视频引擎
+- `Bundling …/bundle/macos/Sizqo.app.tar.gz` — `createUpdaterArtifacts` 经合并配置生效
+- `==> Notarization credentials: App Store Connect API key (U7LW75MAWP)`
+- `verified 58 / 58 / 59 Mach-O files`，`Authority=Developer ID Application: Guofeng Liu (U8U443D7ZL)` ×3
+- `Current status: Accepted` ×3，`The staple and validate action worked!` ×6
+- `release/`：`Sizqo_v0.2.1_macos_arm64.dmg` 29M、`_x86_64.dmg` 35M、`_universal.dmg` 63M、
+  `_universal.app.tar.gz` 57M + `.sig`
+- `Universal app created`，`Merge Universal app` 对 `Resources/video` 里的 ffmpeg 做了 lipo
+
+### 顺带查出的线上缺陷：v0.2.0 的更新包没有引擎
+
+对比本地 v0.2.0 的更新产物与按最终 app 重打包的结果：
+
+| | 字节 | 条目 | 含 `Resources/{bin,lib,video}` |
+| --- | --- | --- | --- |
+| 已发布的 `Sizqo.app.tar.gz` | 4,432,774 | 7 | 0 |
+| 装订后的 app 重打包 | 28,731,687 | 71 | 61 |
+
+那 7 个条目只有 `Info.plist`、`Resources/icon.icns`、`MacOS/sizqo`。原因在
+`scripts/notarize.sh`：旧的「1.5 生成在线更新产物清单」直接取构建期
+`createUpdaterArtifacts` 的 tar.gz，而内置工具是**第 2 步**才拷进 bundle 的。
+即 `latest.json` 指向的在线更新会装出一个没有任何压缩引擎的 app——DMG 不受影响。
+已改为第 10 步（装订完成后 `tar` + `cargo tauri signer sign` + 生成 `latest.json`），
+并按上表验证。**已发布的 v0.2.0 资产仍是坏的**，是否回填替换需要单独决定。
+
+CI 路线本身没有这个缺陷：`sign_notarize_macos_ci.sh:192` 是在 staple 之后打包。
+
+### 仍未做完
+
+- 这轮 run 只证明链路能产出正确资产，**没有**对 CI 产物跑 GUI 验收矩阵；
+  AGENTS.md 的发布门槛（三轨真实构建、沙盒运行时、fixture 视频矩阵、
+  用户验收）仍未满足，所以 `publish=false`。
+- FFmpeg（Homebrew 构建带 x264/x265）的 GPL **对应源码义务**还没有落地方案，
+  公开分发前需要发布负责人/法务确认。
+- `jollyfon/Sizqo` 上 2026-10-13 写入的 4 个 Secrets 现在没有任何消费方，
+  其中包含真实 Developer ID 私钥与口令。建议删除（`gh secret delete`），
+  但这是不可逆动作，留给用户执行。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 

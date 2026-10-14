@@ -87,34 +87,11 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
 fi
 [ -d "$APP" ] || fail "构建产物不存在：${APP}（请先 SKIP_BUILD=0 跑一次构建）"
 
-# ---------- 1.5 生成在线更新产物清单 ----------
-if [ "$UPDATER_ENABLED" = "1" ]; then
-  APP_VERSION="$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")"
-  TGZ="$TAURI_DIR/target/release/bundle/macos/$APP_NAME.app.tar.gz"
-  SIG="$TGZ.sig"
-  [ -f "$TGZ" ] || fail "更新包缺失：${TGZ}（createUpdaterArtifacts 未生效？）"
-  [ -f "$SIG" ] || fail "更新包签名缺失：$SIG"
-  LATEST="$TAURI_DIR/target/release/bundle/macos/latest.json"
-  python3 - "$APP_VERSION" "$TGZ" "$SIG" "$LATEST" << 'PYEOF'
-import datetime, json, sys
-version, tgz, sig, out = sys.argv[1:5]
-signature = open(sig).read().strip()
-feed = {
-    "version": version,
-    "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    "notes": f"Sizqo {version}",
-    "platforms": {
-        "darwin-aarch64": {
-            "signature": signature,
-            "url": f"https://github.com/misswell/Sizqo/releases/download/v{version}/Sizqo.app.tar.gz",
-        }
-    },
-}
-open(out, "w").write(json.dumps(feed, ensure_ascii=False, indent=2) + "\n")
-print(f"latest.json -> {version}")
-PYEOF
-  ok "latest.json 已生成（darwin-aarch64 → v${APP_VERSION}）"
-fi
+# ---------- 1.5 在线更新产物 ----------
+# 更新包必须在内置工具拷进 .app、签名并装订之后才生成：构建期 createUpdaterArtifacts
+# 产出的 tar.gz 只含 Info.plist / icon.icns / 主程序（Resources 里既没有 bin/lib，
+# 也没有 video），拿它发 feed 等于让在线更新装出一个没有压缩引擎的 app。
+# 构建期那份只是副产品，第 10 步会用装订完成的 app 覆盖它。
 
 # ---------- 2. 打包内置工具到 .app ----------
 log "复制内置 CLI 工具和动态库到 .app/Contents/Resources"
@@ -268,6 +245,39 @@ ok "stapled"
 log "校验装订"
 xcrun stapler validate "$APP" 2>&1 | sed 's/^/    /'
 spctl -a -vvv -t exec "$APP" 2>&1 | sed 's/^/    /'
+
+# ---------- 10. 用装订完成的 app 生成更新包 ----------
+if [ "$UPDATER_ENABLED" = "1" ]; then
+  APP_VERSION="$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")"
+  BUNDLE_DIR="$TAURI_DIR/target/release/bundle/macos"
+  TGZ="$BUNDLE_DIR/$APP_NAME.app.tar.gz"
+  SIG="$TGZ.sig"
+  LATEST="$BUNDLE_DIR/latest.json"
+  log "重新打包更新产物：$(basename "$TGZ")（含内置工具与视频引擎）"
+  tar -czf "$TGZ" -C "$(dirname "$APP")" "$APP_NAME.app"
+  env TAURI_SIGNING_PRIVATE_KEY="$UPDATER_PRIVKEY" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$UPDATER_KEYPW" \
+    cargo tauri signer sign "$TGZ" >/dev/null || fail "更新包签名失败"
+  [ -f "$SIG" ] || fail "更新包签名缺失：$SIG"
+  python3 - "$APP_VERSION" "$TGZ" "$SIG" "$LATEST" << 'PYEOF'
+import datetime, json, os, sys
+version, tgz, sig, out = sys.argv[1:5]
+signature = open(sig).read().strip()
+feed = {
+    "version": version,
+    "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "notes": f"Sizqo {version}",
+    "platforms": {
+        "darwin-aarch64": {
+            "signature": signature,
+            "url": f"https://github.com/misswell/Sizqo/releases/download/v{version}/Sizqo.app.tar.gz",
+        }
+    },
+}
+open(out, "w").write(json.dumps(feed, ensure_ascii=False, indent=2) + "\n")
+print(f"latest.json -> {version} | archive {os.path.getsize(tgz)} bytes")
+PYEOF
+  ok "更新包 $(du -h "$TGZ" | awk '{print $1}')，latest.json 已生成"
+fi
 
 echo ""
 log "🎉 分发完成！"
