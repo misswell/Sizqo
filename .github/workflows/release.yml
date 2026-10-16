@@ -27,6 +27,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.SOURCE_REF }}
+      # 推标签即发布，且没有确认环节。这条守卫让标签与配置版本不一致时在一分钟内停下，
+      # 而不是等四十分钟的构建全跑完才在 release 作业里拒绝发版。
+      # workflow_dispatch 是自检路线，标签名由 inputs.tag 随便挑，所以不受此守卫约束。
+      - name: Refuse a tag that does not match the app version
+        if: github.event_name == 'push'
+        run: |
+          CONFIG_VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
+          if [ "${RELEASE_TAG}" != "v${CONFIG_VERSION}" ]; then
+            echo "✗ 标签 ${RELEASE_TAG} 与 src-tauri/tauri.conf.json 的 ${CONFIG_VERSION} 不一致" >&2
+            echo "  要么先改版本号，要么删掉这个标签；推标签会立刻发布一个 Release" >&2
+            exit 1
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -477,9 +489,9 @@ jobs:
 
             | 平台 | 文件 | 说明 |
             |------|------|------|
-            | macOS Universal 2 | `Sizqo_${{ env.RELEASE_TAG }}_macos_universal.dmg` | 推荐，兼容 Apple Silicon 与 Intel |
-            | macOS Apple Silicon | `Sizqo_${{ env.RELEASE_TAG }}_macos_arm64.dmg` | M 系列芯片专用 |
-            | macOS Intel | `Sizqo_${{ env.RELEASE_TAG }}_macos_x86_64.dmg` | Intel 芯片专用 |
+            | macOS Universal 2 | `Sizqo_${{ env.RELEASE_TAG }}_macos_universal.dmg` | 推荐，一个包同时带 Apple Silicon 与 Intel 切片 |
+            | macOS Apple Silicon | `Sizqo_${{ env.RELEASE_TAG }}_macos_arm64.dmg` | M 系列芯片专用，真机验收过 |
+            | macOS Intel | `Sizqo_${{ env.RELEASE_TAG }}_macos_x86_64.dmg` | 已签名公证，但尚无人在 Intel 真机上完成验收 |
             | Windows | `.exe` / `.msi` | 内置压缩工具 |
             | Linux | `.deb` / `.AppImage` | 内置压缩工具 |
 
