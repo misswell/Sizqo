@@ -292,6 +292,9 @@ Gate status: this release followed the v0.1.x precedent — the user asked for
 signed-sandbox (App Store) runtime check, the §11 video acceptance matrix, the
 FFmpeg GPL licensing review, and the signed Direct GUI pass above.
 
+处置结果（同日）：坏 feed 已撤，链路顺序与自检判据均已修正，并按修正链路发布
+v0.3.0 —— 见下文「Release: v0.3.0」。v0.2.0 的 DMG 资产保持原样，不回头改写已发布字节。
+
 ## CI release secrets (jollyfon/Sizqo, 2026-10-13)
 
 Secret names were taken from **this** repository's pipeline, not from the
@@ -485,6 +488,81 @@ CI 路线本身没有这个缺陷：`sign_notarize_macos_ci.sh:192` 是在 stapl
 - `jollyfon/Sizqo` 上 2026-10-13 写入的 4 个 Secrets 现在没有任何消费方，
   其中包含真实 Developer ID 私钥与口令。建议删除（`gh secret delete`），
   但这是不可逆动作，留给用户执行。
+
+### 分发顺序倒正的端到端验证，以及一次把好包判成坏包的自检（2026-10-16）
+
+云端 dry-run `38854784499`（workflow_dispatch，publish=false）验证 `4a1e45a` 的顺序改动：
+三个架构的 DMG 都在 `stapler staple` 后 `stapler validate` 通过，说明"先给 .app 装订票据、
+再造 DMG"确实让镜像里那份 app 带上了票据——这正是 v0.2.0 缺的那一步。作业随后停在
+`build-macos-universal`，报 `DMG arm64: Contents/Resources/bin is empty`。
+
+下载该 run 上传的 `macos-arm64-build` 产物实测 bundle 内部（zip 27,775,540 B）：
+
+```
+Contents/Resources/icon.icns
+Contents/Resources/resources/bin/{pngquant,oxipng,cjpeg,cwebp,avifenc,cjxl,gifsicle}
+Contents/Resources/resources/lib/*        (30 项)
+Contents/Resources/video/bin/{ffmpeg,ffprobe}
+Contents/Resources/video/lib/*            (20 项)
+```
+
+即 **判据错了，不是包错了**：`release.yml:93` 用 `bundle.resources` 的通配
+`"resources/bin/*"`，tauri-bundler 会保留 `resources/` 前缀，引擎落在
+`Contents/Resources/resources/bin`；而 `scripts/notarize.sh` 是手工投递成扁平
+`Contents/Resources/bin`。`src-tauri/src/engine.rs:314-324` 的 `find_tool` 两种位置都认
+（先 `<res>/resources/bin`，再 `<res>/bin`），所以 CI 那份装上是能压东西的。
+`assert_distributable` 只按本地那条路线的布局查，就把 CI 的好包拦了下来。
+
+`87b68bd` 把两条路线的自检都改成"两个候选目录任一非空"，与运行时解析顺序一致；
+CI 侧另加 `Resources/video/bin` 非空一条——视频轨是 `release.yml:103-118` 手工投递的，
+原先没有任何检查会发现它没进去。修正后按上表的真实产物排练过该判据（命中
+`resources/bin`，七个引擎）。
+
+发布 run：`v0.3.0` 标签先前指向 `b28192b`（内容 `73ddb17`，仍带错判据），
+`38857380118` 会在同一处失败，已取消该 run；由于 GitHub 上**尚不存在** v0.3.0 Release
+（`gh release view v0.3.0` → `release not found`，线上 Latest 仍是 v0.2.0），
+标签被重打到含修正的提交（`b28192b → 61f79ea`，`git push --force`）后重新触发发布。
+
+### Release: v0.3.0（2026-10-16，run `38859583185`，completed/success）
+
+标签 `v0.3.0`（重打后指向 `87b68bd`）推送即触发发布；Release
+`https://github.com/misswell/Sizqo/releases/tag/v0.3.0` 于 2026-10-16T06:48:04Z 发布，
+`gh api repos/misswell/Sizqo/releases/latest` 现返回 `v0.3.0`，v0.2.0 不再是 Latest。
+
+云端日志（`gh run view 38859583185 --log`）里的硬证据：
+
+| 判据 | 证据 |
+| --- | --- |
+| 公证顺序已倒正 | 6 次 `notarytool` 提交全部 `status: Accepted`（arm64/x86_64/universal 三份 `.app` 先装订，三份 `.dmg` 后提交） |
+| 用户真正拿到的对象合格 | 挂载 DMG 与解包 tar.gz 后各跑一次自检：`DMG arm64`、`DMG x86_64`、`DMG universal`、`updater archive` 全部 `Developer ID + engines + ticket` |
+| 更新能力确实编译进包 | `Build` 步骤 env 打印 `SIZQO_UPDATER_CONFIGURED: 1`，配置由 `tauri.conf.updater.json` 合并进 `ci.tauri.conf.json` |
+| 发布的是装订后那份，不是 Tauri 空壳 | Tauri 自产的 10.63 MiB `Sizqo.app.tar.gz`（无内置资源）没有出现在资产里；线上 `Sizqo_v0.3.0_macos_universal.app.tar.gz` 为 59,991,869 B |
+
+在线更新源（app 实际请求的那个 URL）：
+
+```
+GET https://github.com/misswell/Sizqo/releases/latest/download/latest.json
+→ 200，1,309 B，version "0.3.0"
+   darwin-aarch64 / darwin-x86_64 各 signature 432 字符，
+   url 指向 v0.3.0/Sizqo_v0.3.0_macos_universal.app.tar.gz
+```
+
+签名格式与运行时一致：`tauri-plugin-updater-2.10.1/src/updater.rs:1451-1462` 的
+`verify_signature` 先对 `latest.json` 里的 `signature` 做 base64 解码得到 minisign 文本，
+再 `Signature::decode`。线上字段正是这种「base64(整个 .sig 文本)」形态
+（解出首行 `untrusted comment: signature from tauri secret key`），与 432 B 的 `.sig` 资产同内容。
+
+密钥身份：`src-tauri/tauri.conf.updater.json` 内公钥解出 sig type `Ed`、
+key id `CA755A8F7DAAC119`（与公钥自带注释一致），是 Sizqo 自己的密钥，
+不是 AGENTS.md 禁止沿用的 OctoShrink 密钥。
+
+资产字节对齐（HTTP 侧 `Content-Length`/`Content-Range` 对 API `size`）：
+universal DMG 66,123,825；arm64 DMG 30,500,877；x86_64 DMG 36,797,942；
+universal `.app.tar.gz` 59,991,869（HEAD 不回长度，用 `206 + bytes 0-0/59991869` 证实）；
+`.sig` 432；`latest.json` 1,309。全部 MATCH。
+
+本机直连 GitHub 每连接被限速到约 7 KB/s，126 MB 的 macOS 资产改用分段并发拉取
+（`/tmp/pget.sh`，2 MB 窗口 × 14 路），落盘后再做挂载与验签复核。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
