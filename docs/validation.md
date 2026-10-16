@@ -561,8 +561,35 @@ universal DMG 66,123,825；arm64 DMG 30,500,877；x86_64 DMG 36,797,942；
 universal `.app.tar.gz` 59,991,869（HEAD 不回长度，用 `206 + bytes 0-0/59991869` 证实）；
 `.sig` 432；`latest.json` 1,309。全部 MATCH。
 
-本机直连 GitHub 每连接被限速到约 7 KB/s，126 MB 的 macOS 资产改用分段并发拉取
-（`/tmp/pget.sh`，2 MB 窗口 × 14 路），落盘后再做挂载与验签复核。
+本机直连 GitHub 每连接被限速到约 7 KB/s（`gh release download` 单流下不动 126 MB），
+改用 2 MB 窗口 × 14 路的分段并发拉取后落盘，两份 universal 资产字节与 API `size` 一致。
+以下是对**下载到的线上字节**做的复核，不是对构建目录里那份：
+
+| 对象 | `stapler validate` | 签名 | 架构 | 版本 | 引擎 |
+| --- | --- | --- | --- | --- | --- |
+| DMG 内 `Sizqo.app`（挂载 `-readonly -nobrowse`） | `The validate action worked!` | `Authority=Developer ID Application: Guofeng Liu (U8U443D7ZL)`，`flags=0x10000(runtime)`，Signature size 9042 | `x86_64 arm64` | 0.3.0 | `Resources/resources/bin`＝avifenc cjpeg cjxl cwebp gifsicle oxipng pngquant；`Resources/video/bin`＝ffmpeg ffprobe |
+| tar.gz 解包出的 `Sizqo.app` | `The validate action worked!` | 同上，另 `codesign --verify --deep --strict` → `valid on disk` / `satisfies its Designated Requirement` | `x86_64 arm64` | 0.3.0 | 同上 |
+
+在线更新签名用 `scripts/verify_updater_signature.sh` 复核，其逻辑与依赖
+（`minisign-verify =0.2.5`）与 `tauri-plugin-updater-2.10.1` 的 `verify_signature`
+完全一致，因此这条通过就等于应用内更新那一步会通过：
+
+```
+$ bash scripts/verify_updater_signature.sh \
+    /Users/guofeng/sizqo-release-archive/v0.3.0/Sizqo_v0.3.0_macos_universal.app.tar.gz
+archive=…59991869 bytes  untrusted_comment="untrusted comment: signature from tauri secret key"
+OK: 这份签名的确覆盖这组字节，且由配置里的公钥所对应的私钥签发
+sha256 87f46a6e9929382514c970ef8d20b73d4e55cf4c086cb2bccc2800e5c875a71d  .app.tar.gz
+sha256 d3430adcc2c26d2c57a512c50deaae99415d6b0674a6ed3f4cac5feda9133c3e  .app.tar.gz.sig
+```
+
+这同时补上了此前只能推测的一环：CI 里的私钥与 `tauri.conf.updater.json` 内公钥
+`CA755A8F7DAAC119` 确实是同一对（否则 `PublicKey::verify` 必失败）。
+反向对照也做了：把归档第 1000 字节改掉后再验，报 `Error: InvalidSignature`，
+说明这个判据不是永真。`latest.json` 里的 `signature` 字段与线上 `.sig` 资产内容逐字符相同。
+
+仍未做的只有肉眼验收：新工作台在签名包里的点击通过、§11 视频矩阵、App Store 沙盒运行时、
+FFmpeg GPL 对应源码义务。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 

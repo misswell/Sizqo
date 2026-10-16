@@ -22,8 +22,13 @@ engineering rules live in [AGENTS.md](AGENTS.md).
   内置压缩引擎，此前 v0.1.3–v0.2.0 的 `latest.json` 一直把这份空壳发给用户。
 - **.app 先公证装订，再拿它造 DMG**；并新增"挂载 DMG 后验包内 app""解包更新包后验包内
   app"两条断言。此前只有 dmg 外壳被提交公证，包内 app 没有票据。
-- 新增 `assert_distributable`：非 ad-hoc、Developer ID 签名链、`Resources/bin` 非空、
-  票据在——四条全过才算可分发。
+- 新增 `assert_distributable`：非 ad-hoc、Developer ID 签名链、内置引擎非空、票据在——
+  全过才算可分发。引擎位置按运行时的两种解析布局都认（本地脚本投递成扁平
+  `Resources/bin`，CI 的 `bundle.resources` 通配保留前缀落在 `Resources/resources/bin`），
+  否则会把好包判成坏包。
+- 新增 `scripts/verify_updater_signature.sh`：对**已下载到本地的更新包**用与
+  `tauri-plugin-updater` 同一套 `minisign-verify` 验签。签名曾覆盖过错误字节而全程绿灯，
+  只有"下载什么就验什么"才能证明线上那 60 MB 真的能被应用接受。
 - v0.2.0 的 `latest.json` 已从 Release 资产撤下（更新通道返回 404），避免继续派发坏包；
   原文件与哈希备份在 `/Users/guofeng/sizqo-release-archive/v0.2.0/`。
 
