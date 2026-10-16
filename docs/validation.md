@@ -158,13 +158,82 @@ this commit's sources.
 
 | Check | Command | Result |
 |-------|---------|--------|
-| Stapled | `xcrun stapler validate Sizqo.app` / `… Sizqo-0.2.0-macos.dmg` | ✅ EXIT 0 both |
+| Stapled | `xcrun stapler validate Sizqo.app` / `… Sizqo-0.2.0-macos.dmg` | ~~✅ EXIT 0 both~~ **INVALID — see the 2026-10-16 finding below.** Both objects were the wrong ones: the build-directory app and the dmg envelope, never the app *inside* the image or inside the update archive. |
 | Deep signature | `codesign --verify --deep --strict --verbose=2 Sizqo.app` | ✅ EXIT 0 |
-| Gatekeeper | `spctl --assess -vvv -t install Sizqo.app` | ✅ accepted, `source=Notarized Developer ID`, `com.misswell.sizqo` |
-| Feed serves this version | `curl -L …/releases/latest/download/latest.json` | ✅ HTTP 200, `version: "0.2.0"`, URL → `…/download/v0.2.0/Sizqo.app.tar.gz` |
+| Gatekeeper | `spctl --assess -vvv -t install Sizqo.app` | ✅ accepted, `source=Notarized Developer ID`, `com.misswell.sizqo` — **but this line cannot detect a missing ticket** (see finding). |
+| Feed serves this version | `curl -L …/releases/latest/download/latest.json` | ✅ HTTP 200, `version: "0.2.0"`, URL → `…/download/v0.2.0/Sizqo.app.tar.gz` — the feed pointed at a **defective package** (see finding). |
 | Anonymous download | `curl -L` DMG + tar.gz | ✅ byte-identical SHA-256 to local (`2d4887b8…`, `50f11e0c…`) |
-| Updater signature | `minisign -V -x sig -p <committed pubkey> -m Sizqo.app.tar.gz` | ✅ "Signature and comment signature verified" (key `CA755A8F7DAAC119`, Sizqo's own) |
-| Published install path | `hdiutil attach` the downloaded DMG → `spctl --assess -t exec` + `CFBundleShortVersionString` | ✅ accepted as Notarized Developer ID, version `0.2.0` |
+| Updater signature | `minisign -V -x sig -p <committed pubkey> -m Sizqo.app.tar.gz` | ✅ "Signature and comment signature verified" (key `CA755A8F7DAAC119`, Sizqo's own) — the signature is valid **over the wrong bytes**; verification could not have caught this. |
+| Published install path | `hdiutil attach` the downloaded DMG → `spctl --assess -t exec` + `CFBundleShortVersionString` | ~~✅ accepted as Notarized Developer ID, version `0.2.0`~~ **INVALID** — `spctl` online reports a ticket it fetched from Apple, not one attached to the bundle. |
+
+## Post-release finding: the v0.1.3–v0.2.0 updater package is a different (broken) app (2026-10-16)
+
+Re-checking the live v0.2.0 artifacts against the Sevqo runbook's rule "notarize and
+staple the `.app` **before** the dmg is built from it" surfaced a second, worse defect
+the runbook does not cover. One release shipped **two different apps**:
+
+| | `Sizqo-0.2.0-macos.dmg` (31,703,781 B) | `Sizqo.app.tar.gz` (4,432,774 B) |
+|---|---|---|
+| app size | 70 MB | 12 MB |
+| signature | Developer ID Application: Guofeng Liu (U8U443D7ZL), `flags=0x10000(runtime)` | `Signature=adhoc`, `flags=0x20002(adhoc,linker-signed)`, `TeamIdentifier=not set` |
+| `Contents/Resources/` | `bin/` `lib/` `video/` | `icon.icns` only — no image engine, no FFmpeg |
+| entitlements | `allow-unsigned`, `disable-library-validation` | none |
+| notarization ticket | **absent** (`stapler validate` → `does not have a ticket stapled to it`, rc=65) | absent |
+| `Info.plist` | 0.2.0 / `com.misswell.sizqo` | 0.2.0 / `com.misswell.sizqo`, updater still compiled in |
+
+DMG byte size matched `gh release view` exactly, so this is truncation-ruled-out, real
+shipped content. `v0.1.3` (4,302,173 B) and `v0.1.4` (4,302,631 B) tar.gz are the same
+size class → same defect, and each of those releases published a `latest.json`, so the
+in-app update channel was serving an engine-less, ad-hoc-signed Sizqo to anyone who
+accepted it.
+
+Root cause is ordering inside `scripts/notarize.sh`, two independent inversions:
+
+1. **The update archive predates everything.** `cargo tauri build` emitted
+   `Sizqo.app.tar.gz` + `.sig` as a build by-product, and the old step 1.5 read that
+   file and wrote `latest.json` *immediately* — before the step that copies the bundled
+   CLI tools/dylibs/FFmpeg into `Contents/Resources`, and before the Developer ID
+   signing step. The `.sig` was therefore a valid minisign signature over a stale,
+   unsigned, tool-less shell; no signature check could ever have caught it.
+2. **Only the DMG was submitted to Apple.** `hdiutil create` copied the app and the
+   image was built first, `notarytool submit` only ever saw the `.dmg`, and
+   `stapler staple "$APP"` ran afterwards — so the in-image copy can never catch the
+   ticket. The only validation was `stapler validate`/`spctl` against the
+   build-directory bundle, i.e. the two objects nobody receives.
+
+Why the recorded acceptance above looked green: `spctl --assess -t exec` reports
+`source=Notarized Developer ID` for an unticketed bundle while online (the assessment
+does a live lookup that supplies the context the ticket would carry). On the very same
+in-image app, `spctl --type open` returned `source=Insufficient Context` while
+`stapler validate` returned rc=65. Only `stapler validate`, run against the app
+*inside* the mounted image (and inside the extracted tar.gz), separates the two cases.
+
+Mitigation applied on 2026-10-16:
+
+- `latest.json` **removed from the v0.2.0 release assets**, so
+  `releases/latest/download/latest.json` now returns HTTP 404 and clients are offered
+  no update instead of a broken one. The DMG asset is untouched (200). Byte-exact
+  backups of what was removed, plus the tar.gz and its `.sig`, are in
+  `/Users/guofeng/sizqo-release-archive/v0.2.0/` (sha256
+  `73e51c30…` latest.json, `50f11e0c…` tar.gz, `666602e7…` sig).
+- `scripts/notarize.sh` reordered: notarize + staple the `.app` → build the DMG from
+  the ticketed app → notarize + staple the DMG → **mount the DMG and assert the app
+  inside it** → only then re-`tar` the final app, sign it with `cargo tauri signer
+  sign`, assert the extracted app, and emit `latest.json`. The assertion
+  (`assert_distributable`) requires all four of: not ad-hoc, a `Developer ID
+  Application` authority, a non-empty `Contents/Resources/bin`, and a valid stapled
+  ticket. Verified clause-by-clause against four samples on 2026-10-16: a legitimate
+  notarized Developer ID app passes; the live v0.2.0 in-image app fails on the ticket;
+  the live v0.2.0 tar.gz app fails on ad-hoc; a missing path fails clean.
+  A tar round-trip of a real stapled app was confirmed to preserve the ticket, so the
+  new order is what makes the update package carry one.
+
+Still not proven: the reordered script has **not** been run end-to-end (no build, no
+submission to Apple), and the updater branch cannot be exercised at all right now —
+`security find-generic-password -s sizqo-updater-privkey` returns nothing on this
+machine, so every build from now on is updater-disabled until the key is recovered or
+rotated. Restoring `latest.json` is only correct after a release whose artifacts pass
+`assert_distributable`.
 
 UI verification actually performed for this release:
 

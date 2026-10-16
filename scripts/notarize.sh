@@ -1,5 +1,7 @@
 #!/bin/bash
-# Sizqo 分发管线（构建 + 签名 + 公证 + 装订）
+# Sizqo 分发管线（构建 + 内置工具 + 签名 + 公证装订 app + 造 DMG + 公证装订 DMG + 更新包）
+# 步骤顺序不可调换：票据必须在拷进 dmg 和打进 tar **之前**落到 app 上，更新包必须用
+# "塞完内置工具、签完 Developer ID、装完票据"的最终 app 生成。理由见第 7、8、11 步注释。
 # 镜像已签名公证的 OctoPilot 方案：Team U8U443D7ZL / hardened runtime /
 # disable-library-validation / notarized + stapled / arm64-only。
 #
@@ -24,7 +26,8 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TAURI_DIR="$PROJECT_DIR/src-tauri"
 APP_NAME="Sizqo"
-APP="$TAURI_DIR/target/release/bundle/macos/$APP_NAME.app"
+MACOS_DIR="$TAURI_DIR/target/release/bundle/macos"
+APP="$MACOS_DIR/$APP_NAME.app"
 BUNDLE_ID="com.misswell.sizqo"
 ENTITLEMENTS="$TAURI_DIR/entitlements.plist"
 DEFAULT_TEAM_ID="U8U443D7ZL"
@@ -32,6 +35,39 @@ DEFAULT_TEAM_ID="U8U443D7ZL"
 log()  { echo "==> $*"; }
 ok()   { echo "    ✓ $*"; }
 fail() { echo "✗ $*" >&2; exit 1; }
+
+# 临时目录统一登记，退出时清理（挂载点必须先 detach 才删得掉）。
+STAGING=""; MNT=""; UPCHK=""
+cleanup() {
+  [ -n "$MNT" ] && hdiutil detach "$MNT" -quiet >/dev/null 2>&1
+  [ -n "$UPCHK" ] && rm -rf "$UPCHK"
+  [ -n "$STAGING" ] && rm -rf "$STAGING"
+  return 0
+}
+trap cleanup EXIT
+
+# 分发出去的每一份 app 都要同时满足四条。v0.1.3–v0.2.0 的更新包只满足零条、dmg 里那份
+# 只满足三条，却一路绿灯——因为验收验的是构建目录那份 app 和 dmg 外壳，而不是用户真正
+# 拿到的那两个对象。spctl 联网时对没有票据的包也报 accepted，分不开这两种情况。
+assert_distributable() {
+  local a="$1" label="$2"
+  if [ ! -d "$a" ]; then
+    fail "$label 里找不到 $APP_NAME.app：$a"
+  fi
+  if codesign -dvv "$a" 2>&1 | grep -q 'Signature=adhoc'; then
+    fail "$label 里的 $APP_NAME.app 是 ad-hoc 签名（没走 Developer ID 签名这一步）"
+  fi
+  if ! codesign -dvv "$a" 2>&1 | grep -q '^Authority=Developer ID Application'; then
+    fail "$label 里的 $APP_NAME.app 没有 Developer ID 签名链"
+  fi
+  if [ ! -d "$a/Contents/Resources/bin" ] || [ -z "$(ls -A "$a/Contents/Resources/bin" 2>/dev/null)" ]; then
+    fail "$label 里的 $APP_NAME.app 缺 Resources/bin —— 内置引擎没进去，这个包装上就能用但压不了任何东西"
+  fi
+  if ! xcrun stapler validate "$a" >/dev/null 2>&1; then
+    fail "$label 里的 $APP_NAME.app 没有公证票据（离线或被代理挡住时会被判已损坏）"
+  fi
+  ok "$label 自检通过：Developer ID + 内置引擎 + 票据"
+}
 
 # ---------- 0. 前置检查 ----------
 [ -f "$ENTITLEMENTS" ] || fail "找不到 entitlements：$ENTITLEMENTS"
@@ -91,7 +127,7 @@ fi
 # 更新包必须在内置工具拷进 .app、签名并装订之后才生成：构建期 createUpdaterArtifacts
 # 产出的 tar.gz 只含 Info.plist / icon.icns / 主程序（Resources 里既没有 bin/lib，
 # 也没有 video），拿它发 feed 等于让在线更新装出一个没有压缩引擎的 app。
-# 构建期那份只是副产品，第 10 步会用装订完成的 app 覆盖它。
+# 构建期那份只是副产品，第 11 步会用装订完成的 app 覆盖它。
 
 # ---------- 2. 打包内置工具到 .app ----------
 log "复制内置 CLI 工具和动态库到 .app/Contents/Resources"
@@ -221,43 +257,65 @@ else
   exit 3
 fi
 
-# ---------- 7. 制作 DMG ----------
+# ---------- 7. 先公证并装订 .app ----------
+# 这条顺序是死的。原来第 8、9 步的做法是"造 dmg → 只提交 dmg → 之后才 staple app"，
+# 于是镜像里那份副本永远追不上票据：dmg 自己 stapler validate 通过，包内 app 却没有，
+# 而验收验的是构建目录那份（装订过的），两头都对不上用户拿到的是什么。
+log "打包 .app 送公证（ditto --keepParent 保留权限与元数据）"
+NOTARY_ZIP="$(mktemp -t sizqo_notary).zip"
+rm -f "${NOTARY_ZIP%.zip}"   # mktemp 先建的裸文件用不上，只留 .zip 那份
+ditto -c -k --keepParent "$APP" "$NOTARY_ZIP"
+log "提交 .app 公证（notarytool --wait）"
+xcrun notarytool submit "$NOTARY_ZIP" "${NOTARY_ARGS[@]}" --wait
+rm -f "$NOTARY_ZIP"
+log "装订票据到 .app"
+xcrun stapler staple "$APP"
+xcrun stapler validate "$APP" 2>&1 | sed 's/^/    /'
+ok ".app 已带票据"
+
+# ---------- 8. 制作 DMG（源是带票据的 app） ----------
 STAGING="$(mktemp -d -t sizqo_dmg)"
-trap 'rm -rf "$STAGING"' EXIT
 cp -R "$APP" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
-DMG="$TAURI_DIR/target/release/bundle/macos/$APP_NAME-$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")-macos.dmg"
+DMG="$MACOS_DIR/$APP_NAME-$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")-macos.dmg"
 log "制作 DMG：$(basename "$DMG")"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGING" -ov -format UDZO "$DMG" >/dev/null
 codesign "${CS_OPTS[@]}" --no-strict "$DMG" >/dev/null 2>&1 || true
 ok "$(basename "$DMG")"
 
-# ---------- 8. 提交公证 ----------
-log "提交 Apple 公证（notarytool --wait）"
+# ---------- 9. 公证并装订 DMG ----------
+log "提交 DMG 公证（notarytool --wait）"
 xcrun notarytool submit "$DMG" "${NOTARY_ARGS[@]}" --wait
-
-# ---------- 9. 装订公证票据 ----------
-log "装订公证票据"
-xcrun stapler staple "$APP"
+log "装订票据到 DMG"
 xcrun stapler staple "$DMG"
-ok "stapled"
+xcrun stapler validate "$DMG" 2>&1 | sed 's/^/    /'
 
-log "校验装订"
-xcrun stapler validate "$APP" 2>&1 | sed 's/^/    /'
-spctl -a -vvv -t exec "$APP" 2>&1 | sed 's/^/    /'
+# ---------- 10. 挂载 DMG 自检包内 app ----------
+# 必须挂载之后验**里面那份**；构建目录那份早就装订过，验它等于没验。
+log "挂载 DMG 自检包内 app"
+MNT="$(mktemp -d -t sizqo_mnt)"
+hdiutil attach -readonly -nobrowse -mountpoint "$MNT" "$DMG" >/dev/null
+assert_distributable "$MNT/$APP_NAME.app" "DMG"
+spctl -a -vvv -t exec "$MNT/$APP_NAME.app" 2>&1 | sed 's/^/    /' || true
+hdiutil detach "$MNT" -quiet >/dev/null 2>&1 || true
+MNT=""
 
-# ---------- 10. 用装订完成的 app 生成更新包 ----------
+# ---------- 11. 用装订完成的 app 生成更新包 ----------
 if [ "$UPDATER_ENABLED" = "1" ]; then
   APP_VERSION="$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")"
-  BUNDLE_DIR="$TAURI_DIR/target/release/bundle/macos"
-  TGZ="$BUNDLE_DIR/$APP_NAME.app.tar.gz"
+  TGZ="$MACOS_DIR/$APP_NAME.app.tar.gz"
   SIG="$TGZ.sig"
-  LATEST="$BUNDLE_DIR/latest.json"
+  LATEST="$MACOS_DIR/latest.json"
   log "重新打包更新产物：$(basename "$TGZ")（含内置工具与视频引擎）"
-  tar -czf "$TGZ" -C "$(dirname "$APP")" "$APP_NAME.app"
+  tar -czf "$TGZ" -C "$MACOS_DIR" "$APP_NAME.app"
   env TAURI_SIGNING_PRIVATE_KEY="$UPDATER_PRIVKEY" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$UPDATER_KEYPW" \
     cargo tauri signer sign "$TGZ" >/dev/null || fail "更新包签名失败"
   [ -f "$SIG" ] || fail "更新包签名缺失：$SIG"
+  # 签完再验一次解包结果：票据能过 tar 往返（已实测），过不了说明这份包发出去就是坏的。
+  UPCHK="$(mktemp -d -t sizqo_upchk)"
+  tar -xzf "$TGZ" -C "$UPCHK"
+  assert_distributable "$UPCHK/$APP_NAME.app" "更新包"
+  rm -rf "$UPCHK"; UPCHK=""
   python3 - "$APP_VERSION" "$TGZ" "$SIG" "$LATEST" << 'PYEOF'
 import datetime, json, os, sys
 version, tgz, sig, out = sys.argv[1:5]
