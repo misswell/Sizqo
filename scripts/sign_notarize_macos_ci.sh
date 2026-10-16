@@ -46,6 +46,46 @@ mkdir -p "${OUTPUT_DIR}"
 
 log() { echo "==> $*"; }
 
+# Every artifact a user can actually receive must satisfy all four of these.
+# The shipped v0.2.0 updater archive failed all four and the app inside the DMG
+# failed the ticket check, while the pipeline stayed green — the old checks only
+# ever ran against the build-directory app and the dmg envelope. spctl cannot
+# stand in for the ticket check: online it reports "Notarized Developer ID" even
+# for a bundle with no ticket attached.
+assert_distributable() {
+  local app="$1"
+  local label="$2"
+  local csinfo
+  if [ ! -d "${app}" ]; then
+    echo "Missing app inside ${label}: ${app}" >&2
+    exit 1
+  fi
+  # Capture then match with case: this script runs under pipefail, so
+  # `codesign | grep -q` would let grep exit first, hand codesign a SIGPIPE and
+  # fail the whole pipeline on a perfectly good bundle.
+  csinfo="$(codesign -dv --verbose=2 "${app}" 2>&1 || true)"
+  case "${csinfo}" in
+    *'Signature=adhoc'*)
+      echo "${label}: app is ad-hoc signed, the Developer ID step never applied to it" >&2
+      exit 1 ;;
+  esac
+  case "${csinfo}" in
+    *'Authority=Developer ID Application'*) ;;
+    *)
+      echo "${label}: no Developer ID signature chain" >&2
+      exit 1 ;;
+  esac
+  if [ -z "$(ls -A "${app}/Contents/Resources/bin" 2>/dev/null)" ]; then
+    echo "${label}: Contents/Resources/bin is empty — the compression engines did not make it in" >&2
+    exit 1
+  fi
+  if ! xcrun stapler validate "${app}" >/dev/null 2>&1; then
+    echo "${label}: no notarization ticket stapled to the app" >&2
+    exit 1
+  fi
+  echo "    ${label}: Developer ID + engines + ticket"
+}
+
 verify_architectures() {
   local app="$1"
   shift
@@ -150,7 +190,48 @@ sign_app "${ARM_APP}"
 sign_app "${INTEL_APP}"
 sign_app "${UNIVERSAL_APP}"
 
-log "Create signed DMGs"
+# The apps are notarized and stapled FIRST. An image or an archive built from an
+# app that has no ticket can never gain one afterwards, and "the dmg validates"
+# says nothing about the copy sealed inside it — that is how v0.2.0 shipped.
+notarize_app() {
+  local app="$1"
+  local zip
+  zip="$(mktemp "${TMPDIR:-/tmp}/sizqo-app-notary.XXXXXX").zip"
+  rm -f "${zip%.zip}"
+  ditto -c -k --keepParent "${app}" "${zip}"
+  xcrun notarytool submit "${zip}" "${NOTARY_ARGS[@]}" --wait
+  rm -f "${zip}"
+}
+
+log "Notarize the three apps"
+notarize_app "${ARM_APP}" &
+arm_app_pid=$!
+notarize_app "${INTEL_APP}" &
+intel_app_pid=$!
+notarize_app "${UNIVERSAL_APP}" &
+universal_app_pid=$!
+
+set +e
+wait "${arm_app_pid}"
+arm_app_status=$?
+wait "${intel_app_pid}"
+intel_app_status=$?
+wait "${universal_app_pid}"
+universal_app_status=$?
+set -e
+
+if [ "${arm_app_status}" -ne 0 ] || [ "${intel_app_status}" -ne 0 ] || [ "${universal_app_status}" -ne 0 ]; then
+  echo "App notarization failed: arm64=${arm_app_status}, x86_64=${intel_app_status}, universal=${universal_app_status}" >&2
+  exit 1
+fi
+
+log "Staple the notarization tickets into the apps"
+for app in "${ARM_APP}" "${INTEL_APP}" "${UNIVERSAL_APP}"; do
+  xcrun stapler staple "${app}"
+  xcrun stapler validate "${app}"
+done
+
+log "Create signed DMGs from the ticketed apps"
 ARM_DMG="$(create_dmg "${ARM_APP}" arm64)"
 INTEL_DMG="$(create_dmg "${INTEL_APP}" x86_64)"
 UNIVERSAL_DMG="$(create_dmg "${UNIVERSAL_APP}" universal)"
@@ -177,20 +258,35 @@ if [ "${arm_status}" -ne 0 ] || [ "${intel_status}" -ne 0 ] || [ "${universal_st
   exit 1
 fi
 
-log "Staple and validate notarization tickets"
-for app in "${ARM_APP}" "${INTEL_APP}" "${UNIVERSAL_APP}"; do
-  xcrun stapler staple "${app}"
-  xcrun stapler validate "${app}"
-  spctl -a -vvv -t exec "${app}"
-done
+log "Staple and validate the DMG tickets"
 for dmg in "${ARM_DMG}" "${INTEL_DMG}" "${UNIVERSAL_DMG}"; do
   xcrun stapler staple "${dmg}"
   xcrun stapler validate "${dmg}"
 done
 
-log "Create the stapled Universal updater archive"
-tar -czf "${OUTPUT_DIR}/Sizqo_${RELEASE_TAG}_macos_universal.app.tar.gz" \
+log "Mount each DMG and verify the app inside it"
+for pair in "arm64:${ARM_DMG}" "x86_64:${INTEL_DMG}" "universal:${UNIVERSAL_DMG}"; do
+  arch="${pair%%:*}"
+  dmg="${pair#*:}"
+  mnt="$(mktemp -d "${TMPDIR:-/tmp}/sizqo-verify-${arch}.XXXXXX")"
+  hdiutil attach -readonly -nobrowse -mountpoint "${mnt}" "${dmg}" >/dev/null
+  assert_distributable "${mnt}/Sizqo.app" "DMG ${arch}"
+  spctl -a -vvv -t exec "${mnt}/Sizqo.app" || true
+  hdiutil detach "${mnt}" -quiet >/dev/null 2>&1 || true
+  rm -rf "${mnt}"
+done
+
+log "Create the updater archive from the ticketed Universal app"
+UPDATER_ARCHIVE="${OUTPUT_DIR}/Sizqo_${RELEASE_TAG}_macos_universal.app.tar.gz"
+tar -czf "${UPDATER_ARCHIVE}" \
   -C "$(dirname "${UNIVERSAL_APP}")" "$(basename "${UNIVERSAL_APP}")"
+
+# The signature step downstream signs these bytes, so the archive is checked here
+# rather than after it has been published.
+upcheck="$(mktemp -d "${TMPDIR:-/tmp}/sizqo-verify-updater.XXXXXX")"
+tar -xzf "${UPDATER_ARCHIVE}" -C "${upcheck}"
+assert_distributable "${upcheck}/Sizqo.app" "updater archive"
+rm -rf "${upcheck}"
 
 log "macOS release assets are signed, notarized, and stapled"
 ls -lh "${OUTPUT_DIR}"

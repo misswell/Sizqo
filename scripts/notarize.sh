@@ -50,16 +50,20 @@ trap cleanup EXIT
 # 只满足三条，却一路绿灯——因为验收验的是构建目录那份 app 和 dmg 外壳，而不是用户真正
 # 拿到的那两个对象。spctl 联网时对没有票据的包也报 accepted，分不开这两种情况。
 assert_distributable() {
-  local a="$1" label="$2"
+  local a="$1" label="$2" csinfo
   if [ ! -d "$a" ]; then
     fail "$label 里找不到 $APP_NAME.app：$a"
   fi
-  if codesign -dvv "$a" 2>&1 | grep -q 'Signature=adhoc'; then
-    fail "$label 里的 $APP_NAME.app 是 ad-hoc 签名（没走 Developer ID 签名这一步）"
-  fi
-  if ! codesign -dvv "$a" 2>&1 | grep -q '^Authority=Developer ID Application'; then
-    fail "$label 里的 $APP_NAME.app 没有 Developer ID 签名链"
-  fi
+  # 一律先取进变量再 case 匹配：这里开着 pipefail，`codesign | grep -q` 命中后
+  # grep 先退出会让 codesign 收到 SIGPIPE，整条管道以 141 失败——好包反被判成坏包。
+  csinfo="$(codesign -dvv "$a" 2>&1 || true)"
+  case "$csinfo" in
+    *'Signature=adhoc'*) fail "$label 里的 $APP_NAME.app 是 ad-hoc 签名（没走 Developer ID 签名这一步）" ;;
+  esac
+  case "$csinfo" in
+    *'Authority=Developer ID Application'*) ;;
+    *) fail "$label 里的 $APP_NAME.app 没有 Developer ID 签名链" ;;
+  esac
   if [ ! -d "$a/Contents/Resources/bin" ] || [ -z "$(ls -A "$a/Contents/Resources/bin" 2>/dev/null)" ]; then
     fail "$label 里的 $APP_NAME.app 缺 Resources/bin —— 内置引擎没进去，这个包装上就能用但压不了任何东西"
   fi

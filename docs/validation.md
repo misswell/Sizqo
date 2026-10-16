@@ -226,14 +226,41 @@ Mitigation applied on 2026-10-16:
   notarized Developer ID app passes; the live v0.2.0 in-image app fails on the ticket;
   the live v0.2.0 tar.gz app fails on ad-hoc; a missing path fails clean.
   A tar round-trip of a real stapled app was confirmed to preserve the ticket, so the
-  new order is what makes the update package carry one.
+  new order is what makes the update package carry one. The helper matches the
+  `codesign` output with `case` on a captured string instead of `codesign | grep -q`:
+  both scripts run under `pipefail`, and a `grep -q` that exits on its first match
+  SIGPIPEs `codesign`, so the pipeline returns 141 and a perfectly good bundle is
+  rejected. That was reproduced locally before it could burn a CI run.
+- `scripts/sign_notarize_macos_ci.sh` got the same treatment for the cloud route,
+  which had the identical inversion: `create_dmg` ran before any submission and only
+  the three DMGs went to Apple, so every CI image also carried an unticketed app. The
+  apps are now notarized and stapled first, the DMGs are built from the ticketed
+  apps, and each of the three images is mounted and checked, as is the updater archive.
 
 Still not proven: the reordered script has **not** been run end-to-end (no build, no
-submission to Apple), and the updater branch cannot be exercised at all right now —
-`security find-generic-password -s sizqo-updater-privkey` returns nothing on this
-machine, so every build from now on is updater-disabled until the key is recovered or
-rotated. Restoring `latest.json` is only correct after a release whose artifacts pass
-`assert_distributable`.
+submission to Apple). Two corrections found while rebasing onto the 2026-10-14 work:
+
+- The updater archive ordering was **already fixed** by `3537b66` (step 11 re-tars the
+  finished app and signs it). What was still open there, and is fixed here, is the
+  other inversion: `scripts/notarize.sh` and `scripts/sign_notarize_macos_ci.sh` both
+  create the DMG and the archive *before* any notarization happens and only ever
+  submit the **dmg** to Apple, so the `.app` inside every distributed image carries no
+  ticket even though the image itself validates. `3537b66`'s "DMG 不受影响" holds for
+  the engines, not for the ticket.
+- The updater key is **not lost for publishing purposes**. `gh secret list --repo
+  misswell/Sizqo` now returns nine secrets including `TAURI_SIGNING_PRIVATE_KEY`
+  (2026-10-14T01:58:44Z), matching the "CI release secrets" section below — the
+  private key lives in Actions secrets, so a cloud release does not depend on the
+  local keychain. It is genuinely gone locally, and this time the reason is visible in
+  the keychain itself: `login.keychain-db` is a fresh file created 2026-10-16 07:46,
+  24 KB instead of the 1,002,384-byte snapshot `login.keychain-db.sb-dbff1aa3-…-db`
+  from 2026-09-24. `security list-keychains` shows no custom keychain (only
+  `login.keychain-db` and the System one; `octoshrink-signing.keychain-db` exists on
+  disk but is not in the search list and does not hold the item), and
+  `find-generic-password -s sizqo-updater-privkey` returns "The specified item could
+  not be found in the keychain" — not an access-denied artifact. Any future *local*
+  updater build needs the key recovered or rotated; `latest.json` must only come back
+  once it is served by artifacts that pass `assert_distributable`.
 
 UI verification actually performed for this release:
 
