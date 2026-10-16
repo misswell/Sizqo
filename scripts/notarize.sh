@@ -50,7 +50,7 @@ trap cleanup EXIT
 # 只满足三条，却一路绿灯——因为验收验的是构建目录那份 app 和 dmg 外壳，而不是用户真正
 # 拿到的那两个对象。spctl 联网时对没有票据的包也报 accepted，分不开这两种情况。
 assert_distributable() {
-  local a="$1" label="$2" csinfo
+  local a="$1" label="$2" csinfo engines cand
   if [ ! -d "$a" ]; then
     fail "$label 里找不到 $APP_NAME.app：$a"
   fi
@@ -64,9 +64,14 @@ assert_distributable() {
     *'Authority=Developer ID Application'*) ;;
     *) fail "$label 里的 $APP_NAME.app 没有 Developer ID 签名链" ;;
   esac
-  if [ ! -d "$a/Contents/Resources/bin" ] || [ -z "$(ls -A "$a/Contents/Resources/bin" 2>/dev/null)" ]; then
-    fail "$label 里的 $APP_NAME.app 缺 Resources/bin —— 内置引擎没进去，这个包装上就能用但压不了任何东西"
-  fi
+  # 引擎位置接受两种布局，因为 src-tauri/src/engine.rs 的 find_tool 两种都认：
+  # 本脚本手工投递成扁平 Resources/bin，CI 用 bundle.resources 通配则是带前缀的
+  # Resources/resources/bin。只认一种会把自己那条路线的好包判成坏包。
+  engines=""
+  for cand in "$a/Contents/Resources/bin" "$a/Contents/Resources/resources/bin"; do
+    if [ -n "$(ls -A "$cand" 2>/dev/null)" ]; then engines="$cand"; break; fi
+  done
+  [ -n "$engines" ] || fail "$label 里的 $APP_NAME.app 缺内置引擎 —— 这个包装上就能用但压不了任何东西"
   if ! xcrun stapler validate "$a" >/dev/null 2>&1; then
     fail "$label 里的 $APP_NAME.app 没有公证票据（离线或被代理挡住时会被判已损坏）"
   fi

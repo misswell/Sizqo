@@ -47,8 +47,8 @@ mkdir -p "${OUTPUT_DIR}"
 log() { echo "==> $*"; }
 
 # Every artifact a user can actually receive must satisfy all four of these.
-# The shipped v0.2.0 updater archive failed all four and the app inside the DMG
-# failed the ticket check, while the pipeline stayed green — the old checks only
+# The shipped v0.2.0 updater archive failed every one of these and the app inside
+# the DMG failed the ticket check, while the pipeline stayed green — the old checks only
 # ever ran against the build-directory app and the dmg envelope. spctl cannot
 # stand in for the ticket check: online it reports "Notarized Developer ID" even
 # for a bundle with no ticket attached.
@@ -75,8 +75,25 @@ assert_distributable() {
       echo "${label}: no Developer ID signature chain" >&2
       exit 1 ;;
   esac
-  if [ -z "$(ls -A "${app}/Contents/Resources/bin" 2>/dev/null)" ]; then
-    echo "${label}: Contents/Resources/bin is empty — the compression engines did not make it in" >&2
+  # engine.rs resolves tools from either <Resources>/resources/bin or a flat
+  # <Resources>/bin, and each route uses one of them: the CI build ships the
+  # glob from bundle.resources (which keeps the resources/ prefix), while
+  # scripts/notarize.sh copies the tools into the flat layout itself. Requiring
+  # only the flat one failed a bundle that the app opens happily.
+  local engines=""
+  local candidate
+  for candidate in "${app}/Contents/Resources/resources/bin" "${app}/Contents/Resources/bin"; do
+    if [ -n "$(ls -A "${candidate}" 2>/dev/null)" ]; then
+      engines="${candidate}"
+      break
+    fi
+  done
+  if [ -z "${engines}" ]; then
+    echo "${label}: no compression engines under Resources/bin or Resources/resources/bin" >&2
+    exit 1
+  fi
+  if [ -z "$(ls -A "${app}/Contents/Resources/video/bin" 2>/dev/null)" ]; then
+    echo "${label}: Resources/video/bin is empty — the video engine did not make it in" >&2
     exit 1
   fi
   if ! xcrun stapler validate "${app}" >/dev/null 2>&1; then
