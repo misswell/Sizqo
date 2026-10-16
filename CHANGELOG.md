@@ -3,6 +3,30 @@
 Sizqo's versioning starts at 0.1.0. This file records user-visible changes;
 engineering rules live in [AGENTS.md](AGENTS.md).
 
+## 0.3.0 — 浅薄荷纸面工作台 + 分发链路倒正 (2026-10-16)
+
+### 视觉语言
+
+- 主窗口从深色工具软件气质改为浅色纸面工作台：`#f5f7f7` 纸面、220px 水印字标
+  （Compress / History / Settings）、薄荷模糊圆装饰、72px 左侧导航条。
+- 意图组改成无边框分组；能力芯片 32px 胶囊，选中态 `#bce9df`；更多参数折叠行 44px 描边。
+- 工作区 75%:25% 浮起白卡；320px 拖放区与 300px 详情列改用线描插画（不是 3D 渲染），
+  空状态居中、副标题按 `text-wrap: balance` 断行。
+- 底部运行条 64px 透明；主按钮薄荷 `#8ad5c7` 160×44 圆角 22。
+- 动效统一 Apple 缓动 `cubic-bezier(0.25,0.1,0.25,1)`，悬停 150ms、面板 250ms + 8px 位移。
+- 暗色模式保留，整套 token 重投为墨绿薄荷系；窄窗（≤720px 高）落区与 CTA 自动退让一档。
+
+### 分发链路（重要，影响已发布版本）
+
+- **在线更新包改在最终 app 上生成**：构建期 `createUpdaterArtifacts` 的 tar.gz 里没有
+  内置压缩引擎，此前 v0.1.3–v0.2.0 的 `latest.json` 一直把这份空壳发给用户。
+- **.app 先公证装订，再拿它造 DMG**；并新增"挂载 DMG 后验包内 app""解包更新包后验包内
+  app"两条断言。此前只有 dmg 外壳被提交公证，包内 app 没有票据。
+- 新增 `assert_distributable`：非 ad-hoc、Developer ID 签名链、`Resources/bin` 非空、
+  票据在——四条全过才算可分发。
+- v0.2.0 的 `latest.json` 已从 Release 资产撤下（更新通道返回 404），避免继续派发坏包；
+  原文件与哈希备份在 `/Users/guofeng/sizqo-release-archive/v0.2.0/`。
+
 ## 0.2.0 — intent-first redesign (2026-10-12)
 
 - **The main window is a two-column workspace**: left rail (本轮 / 历史 / 设置),
