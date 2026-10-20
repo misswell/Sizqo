@@ -591,6 +591,54 @@ sha256 d3430adcc2c26d2c57a512c50deaae99415d6b0674a6ed3f4cac5feda9133c3e  .app.ta
 仍未做的只有肉眼验收：新工作台在签名包里的点击通过、§11 视频矩阵、App Store 沙盒运行时、
 FFmpeg GPL 对应源码义务。
 
+### Release: v0.3.1（2026-10-20，run `39417008495`，completed/success）
+
+内容：图片与视频输出方式分开配置（`c543137`），版本提交 `e369506`。标签 `v0.3.1`
+推送即发布；Release `https://github.com/misswell/Sizqo/releases/tag/v0.3.1`
+于 2026-10-20T12:26:44Z 创建（非 draft / 非 prerelease，Latest）。
+
+本地门禁（全部 EXIT=0）：
+
+| 命令 | 结果 |
+| --- | --- |
+| `npm run test:frontend` | 18 个脚本全过，含新增 `tests/output-mode-split.cjs` |
+| `cargo test` | 6 个集成测试 + 单测/文档测试全过 |
+| `cargo test --features inproc-backends` | 全过 |
+| `cargo test --no-default-features --features inproc-backends` | 全过 |
+
+云端（`gh run view 39417008495 --log`）：
+
+- 8 个 job 全部 success；`SIZQO_UPDATER_CONFIGURED: 1`。
+- 6 次 notarytool 提交全部 `status: Accepted`；3 份 `.app` 与 3 份 DMG 的
+  staple/validate 均 worked。
+- 自检四行全过：`DMG arm64 / DMG x86_64 / DMG universal / updater archive: Developer ID + engines + ticket`。
+
+线上资产（`gh api repos/misswell/Sizqo/releases/latest`，单位 B）：
+universal DMG 66,738,662；arm64 30,499,972；x86_64 36,797,003；
+universal `.app.tar.gz` 59,990,809；`.sig` 432；`latest.json` 1,309；
+Linux AppImage 87,898,616；deb 5,094,136；Windows exe 2,949,501；msi 3,796,992。
+`latest.json` 的 `version` 为 `0.3.1`，两个 darwin 平台的 `url` 都指向
+`v0.3.1/Sizqo_v0.3.1_macos_universal.app.tar.gz`，`signature` 字段与 432 B
+的 `.sig` 资产逐字符相同（432 字符的 base64）。
+
+下载线上字节复核：
+
+| 对象 | 结果 |
+| --- | --- |
+| universal DMG（挂载） | 校验和通过；`Sizqo.app` 0.3.1、`x86_64 arm64`、Developer ID + runtime、`stapler validate` worked（DMG 自身也 worked） |
+| DMG 内引擎 | `Resources/resources/bin` 7 个图片 CLI；`Resources/video/bin` 2 个（ffmpeg/ffprobe） |
+| universal 更新包 | `tar -xzf` 后同样 0.3.1/universal/Developer ID + ticket + 9 个引擎 |
+| 更新签名 | `scripts/verify_updater_signature.sh <绝对路径>` → OK；改第 1000 字节后 → `Error: InvalidSignature` |
+
+```
+sha256 9b0ee8d4159256cd7283ec988155d39301ad6059e5fdc4cc9123736cb591feab  .app.tar.gz
+sha256 65074217eba733c45d1c425612fb210fe665400657b9bdcedd71305ae4d65481  .app.tar.gz.sig
+```
+
+仍未做（与 v0.3.0 相同）：签名包内新工作台的肉眼点击验收、§11 fixture 视频矩阵、
+App Store 沙盒运行时、FFmpeg GPL 对应源码义务。本轮按用户「做完就发版」的常驻规则
+发布补丁版本，未把上述未验证项标成已通过。
+
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
 Before any tag/Release: full three-track build, signed Direct runtime check,
