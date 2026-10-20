@@ -238,7 +238,12 @@ function videoRequestFromIntent() {
   var state = videoIntent.intent === 'videoCustom'
     ? { intent: 'videoCustom', options: currentVideoOptions }
     : { intent: videoIntent.intent, targetMiB: videoIntent.targetMiB };
-  return window.SizqoIntents.compileVideo(state, window.SizqoVideo.DEFAULT_OPTIONS, window.SizqoVideo);
+  var compiled = window.SizqoIntents.compileVideo(state, window.SizqoVideo.DEFAULT_OPTIONS, window.SizqoVideo);
+  // 输出方式是正交项（core/intent-model.md）：切意图只换编码参数，不重置独立配置的落盘位置。
+  compiled.options.outputMode = currentVideoOptions.outputMode;
+  compiled.options.outputDir = currentVideoOptions.outputDir;
+  compiled.options.outputSuffix = currentVideoOptions.outputSuffix;
+  return compiled;
 }
 
 function processingActionText(stage) {
@@ -592,8 +597,27 @@ document.querySelectorAll('input[name="outputMode"]').forEach(radio => {
   });
 });
 
+function currentVideoOutputMode() {
+  var selected = document.querySelector('input[name="videoOutputMode"]:checked');
+  return selected ? selected.value : 'suffix';
+}
+
+function updateVideoOutputModeControls() {
+  var mode = currentVideoOutputMode();
+  var suffixRow = document.getElementById('videoSuffixRow');
+  var directoryRow = document.getElementById('videoDirectoryRow');
+  if (suffixRow) suffixRow.hidden = mode !== 'suffix';
+  if (directoryRow) directoryRow.hidden = mode !== 'directory';
+}
+
 function getOutputSuffix() {
   var suffix = outputSuffixInput ? outputSuffixInput.value.trim() : '';
+  return suffix || '_compressed';
+}
+
+function getVideoOutputSuffix() {
+  var input = document.getElementById('videoOutputSuffix');
+  var suffix = input ? input.value.trim() : '';
   return suffix || '_compressed';
 }
 
@@ -610,6 +634,7 @@ function toggleVideoSettings() {
 
 function videoOptionsFromControls() {
   var resolutionValue = document.getElementById('videoResolution').value;
+  var outputMode = currentVideoOutputMode();
   return window.SizqoVideo.normalizeOptions({
     encoder: document.getElementById('videoEncoder').value || 'auto',
     mode: document.getElementById('videoMode').value || 'crf',
@@ -625,8 +650,8 @@ function videoOptionsFromControls() {
     audioPolicy: document.getElementById('videoAudioPolicy').value,
     subtitlePolicy: document.getElementById('videoSubtitlePolicy').value,
     metadataPolicy: document.getElementById('videoMetadataPolicy').value,
-    outputMode: document.getElementById('videoOutputMode').value,
-    outputDir: document.getElementById('videoOutputMode').value === 'directory' ? videoOutputDir : null,
+    outputMode: outputMode,
+    outputDir: outputMode === 'directory' ? videoOutputDir : null,
     outputSuffix: document.getElementById('videoOutputSuffix').value.trim() || '_compressed',
     allowLargerOutput: document.getElementById('videoAllowLarger').checked,
     container: document.getElementById('videoContainer').value,
@@ -652,7 +677,9 @@ function applyVideoOptions(options) {
   setValue('videoAudioPolicy', currentVideoOptions.audioPolicy);
   setValue('videoSubtitlePolicy', currentVideoOptions.subtitlePolicy);
   setValue('videoMetadataPolicy', currentVideoOptions.metadataPolicy);
-  setValue('videoOutputMode', currentVideoOptions.outputMode);
+  document.querySelectorAll('input[name="videoOutputMode"]').forEach(function(radio) {
+    radio.checked = radio.value === currentVideoOptions.outputMode;
+  });
   setValue('videoOutputSuffix', currentVideoOptions.outputSuffix);
   setValue('videoContainer', currentVideoOptions.container);
   setValue('videoThreads', currentVideoOptions.threads);
@@ -674,10 +701,10 @@ function syncVideoSettingsControls() {
   var customResolution = document.getElementById('videoResolutionCustom');
   if (customResolution) customResolution.hidden = document.getElementById('videoResolution').value !== 'custom';
   var outputMode = currentVideoOptions.outputMode;
-  var suffixRow = document.getElementById('videoSuffixRow');
-  var directoryRow = document.getElementById('videoDirectoryRow');
-  if (suffixRow) suffixRow.hidden = outputMode !== 'suffix';
-  if (directoryRow) directoryRow.hidden = outputMode !== 'directory';
+  document.querySelectorAll('input[name="videoOutputMode"]').forEach(function(radio) {
+    radio.checked = radio.value === outputMode;
+  });
+  updateVideoOutputModeControls();
 
   var modes = window.SizqoVideo.encoderModes(videoCapabilities, currentVideoOptions.encoder);
   var modeSelect = document.getElementById('videoMode');
@@ -858,7 +885,7 @@ function bindVideoSettings() {
   });
   ['videoEncoder', 'videoSpeed', 'videoMode', 'videoCrf', 'videoBitrate', 'videoTargetMiBInput',
     'videoResolution', 'videoResolutionCustom', 'videoFrameRate', 'videoAudioPolicy', 'videoSubtitlePolicy',
-    'videoMetadataPolicy', 'videoOutputMode', 'videoOutputSuffix', 'videoContainer', 'videoThreads', 'videoAllowLarger']
+    'videoMetadataPolicy', 'videoOutputSuffix', 'videoContainer', 'videoThreads', 'videoAllowLarger']
     .forEach(function(id) {
       var element = document.getElementById(id);
       if (!element) return;
@@ -867,6 +894,12 @@ function bindVideoSettings() {
         element.addEventListener('input', saveVideoSettings);
       }
     });
+  document.querySelectorAll('input[name="videoOutputMode"]').forEach(function(radio) {
+    radio.addEventListener('change', function() {
+      saveVideoSettings();
+      renderDetailPane();
+    });
+  });
 }
 
 async function validateVideoBatch(paths, options) {
@@ -2919,7 +2952,7 @@ function buildImageDetail(body, filePath, item) {
     detailText(body, 'detail-chain', localizeUiText(next.summary || ''));
     detailSpecs(body, [
       [localizeUiText('原始大小'), item.originalSize ? formatBytes(item.originalSize) : ''],
-      [localizeUiText('输出方式'), outputModeLabel()],
+      [localizeUiText('输出方式'), outputModeLabel('image')],
       [localizeUiText('元数据'), next.options.processingMode === 'system'
         ? (next.options.preserveMetadata !== false ? localizeUiText('尽量保留（系统转换）') : localizeUiText('不保留'))
         : localizeUiText('高级路径重编码后不保留')],
@@ -2935,11 +2968,14 @@ function buildImageDetail(body, filePath, item) {
   detailText(body, 'detail-path', dirname(filePath));
 }
 
-function outputModeLabel() {
-  var mode = currentOutputMode();
+function outputModeLabel(kind) {
+  var video = kind === 'video';
+  var mode = video ? currentVideoOutputMode() : currentOutputMode();
+  var dir = video ? videoOutputDir : outputDir;
+  var suffix = video ? getVideoOutputSuffix() : getOutputSuffix();
   if (mode === 'replace') return localizeUiText('覆盖原文件（保留可恢复的备份）');
-  if (mode === 'folder') return localizeUiText('输出到 ') + (outputDir || localizeUiText('（还没选目录）'));
-  return localizeUiText('同目录 · ') + getOutputSuffix() + localizeUiText(' 后缀');
+  if (mode === 'folder' || mode === 'directory') return localizeUiText('输出到 ') + (dir || localizeUiText('（还没选目录）'));
+  return localizeUiText('同目录 · ') + suffix + localizeUiText(' 后缀');
 }
 
 function buildVideoDetail(body, filePath, item) {
@@ -2999,6 +3035,7 @@ function buildVideoDetail(body, filePath, item) {
       [localizeUiText('编码'), summary.codec],
       [localizeUiText('音轨'), videoAudioSummary(probe)],
       [localizeUiText('原始大小'), item.originalSize ? formatBytes(item.originalSize) : ''],
+      [localizeUiText('输出方式'), outputModeLabel('video')],
     ]);
     var estimate = videoProgressNumbers(item);
     detailText(body, 'detail-chain', localizeUiText(requestForNext('video').summary || '')
@@ -4334,6 +4371,7 @@ function resetSettings() {
   // 启动一次画齐：chips、目标行、高级列、输出方式、运行条、详情列。
   updateMediaWorkspace();
   updateOutputModeControls();
+  updateVideoOutputModeControls();
   updateQueueSummary();
   renderDetailPane();
 

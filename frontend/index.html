@@ -120,6 +120,28 @@
             </div>
             <div class="intent-chips" id="imageIntentChips" role="group" aria-label="图片意图"></div>
             <p class="intent-note" id="imageIntentNote" role="status"></p>
+            <!-- 输出方式是正交项：图片与视频各配各的，切换意图不重置。 -->
+            <div class="intent-output" role="group" aria-label="图片输出">
+              <div class="output-mode-switch" role="radiogroup" aria-label="图片输出方式">
+                <label class="radio-label"><input type="radio" name="outputMode" value="replace" checked><span class="radio-custom"></span>覆盖原文件</label>
+                <label class="radio-label"><input type="radio" name="outputMode" value="suffix"><span class="radio-custom"></span>加后缀</label>
+                <label class="radio-label"><input type="radio" name="outputMode" value="folder"><span class="radio-custom"></span>输出到目录</label>
+              </div>
+              <div class="output-detail" id="outputSuffixRow" hidden>
+                <label for="outputSuffix">后缀</label>
+                <input type="text" id="outputSuffix" class="settings-text-input suffix-input" value="_compressed" placeholder="_compressed" maxlength="64" spellcheck="false" aria-describedby="outputSuffixHint">
+                <span class="settings-hint" id="outputSuffixHint">例如 _small</span>
+              </div>
+              <div class="output-detail" id="outputDirRow" hidden>
+                <span id="outputDirDisplay" class="dir-display">未选择</span>
+                <button class="btn btn-small" type="button" onclick="selectOutputDir()">
+                  <svg class="symbol-icon symbol-icon-small"><use href="#icon-folder-open"/></svg>浏览
+                </button>
+              </div>
+              <button class="btn btn-small btn-ghost" type="button" id="systemInfoBtn" onclick="openSystemConversionInfo()" hidden>
+                <svg class="symbol-icon symbol-icon-small"><use href="#icon-info"/></svg>系统转换说明
+              </button>
+            </div>
           </div>
 
           <div class="intent-group" id="videoIntentGroup" data-intent-kind="video">
@@ -134,6 +156,24 @@
             </div>
             <div class="intent-chips" id="videoIntentChips" role="group" aria-label="视频意图"></div>
             <p class="intent-note" id="videoIntentNote" role="status"></p>
+            <!-- 视频的落盘方式独立配置：默认同目录加后缀，不与图片共用。 -->
+            <div class="intent-output" role="group" aria-label="视频输出">
+              <div class="output-mode-switch" role="radiogroup" aria-label="视频输出方式">
+                <label class="radio-label"><input type="radio" name="videoOutputMode" value="replace"><span class="radio-custom"></span>覆盖原文件</label>
+                <label class="radio-label"><input type="radio" name="videoOutputMode" value="suffix" checked><span class="radio-custom"></span>加后缀</label>
+                <label class="radio-label"><input type="radio" name="videoOutputMode" value="directory"><span class="radio-custom"></span>输出到目录</label>
+              </div>
+              <div class="output-detail" id="videoSuffixRow">
+                <label for="videoOutputSuffix">后缀</label>
+                <input id="videoOutputSuffix" class="settings-text-input suffix-input" value="_compressed" maxlength="64" spellcheck="false">
+              </div>
+              <div class="output-detail" id="videoDirectoryRow" hidden>
+                <span id="videoOutputDirDisplay" class="dir-display">未选择</span>
+                <button class="btn btn-small" type="button" onclick="selectVideoOutputDir()">
+                  <svg class="symbol-icon symbol-icon-small"><use href="#icon-folder-open"/></svg>浏览
+                </button>
+              </div>
+            </div>
           </div>
 
           <!-- 目标值只在需要它的意图下出现：不做「看得见但按下去没用」的控件。 -->
@@ -164,23 +204,8 @@
             </div>
           </div>
 
-          <div class="intent-output">
-            <div class="output-mode-switch" role="radiogroup" aria-label="输出方式">
-              <label class="radio-label"><input type="radio" name="outputMode" value="replace" checked><span class="radio-custom"></span>覆盖原文件</label>
-              <label class="radio-label"><input type="radio" name="outputMode" value="suffix"><span class="radio-custom"></span>加后缀</label>
-              <label class="radio-label"><input type="radio" name="outputMode" value="folder"><span class="radio-custom"></span>输出到目录</label>
-            </div>
-            <div class="output-detail" id="outputSuffixRow">
-              <label for="outputSuffix">后缀</label>
-              <input type="text" id="outputSuffix" class="settings-text-input suffix-input" value="_compressed" placeholder="_compressed" maxlength="64" spellcheck="false" aria-describedby="outputSuffixHint">
-              <span class="settings-hint" id="outputSuffixHint">例如 _small</span>
-            </div>
-            <div class="output-detail" id="outputDirRow" hidden>
-              <span id="outputDirDisplay" class="dir-display">未选择</span>
-              <button class="btn btn-small" type="button" onclick="selectOutputDir()">
-                <svg class="symbol-icon symbol-icon-small"><use href="#icon-folder-open"/></svg>浏览
-              </button>
-            </div>
+          <!-- 自动开始是全局项；输出位置已分别归入图片 / 视频组，不再共用一个开关。 -->
+          <div class="intent-output intent-output-global">
             <div class="toggle-wrapper output-auto">
               <label class="toggle">
                 <input type="checkbox" id="autoCompress">
@@ -188,9 +213,6 @@
               </label>
               <span class="toggle-label" id="autoCompressLabel">拖入或选择后自动压缩</span>
             </div>
-            <button class="btn btn-small btn-ghost" type="button" id="systemInfoBtn" onclick="openSystemConversionInfo()" hidden>
-              <svg class="symbol-icon symbol-icon-small"><use href="#icon-info"/></svg>系统转换说明
-            </button>
           </div>
 
           <details class="intent-advanced" id="intentAdvanced">
@@ -284,9 +306,6 @@
                 </select></div></div>
                 <div class="settings-row"><label for="videoSubtitlePolicy">字幕</label><div class="select-wrapper"><select id="videoSubtitlePolicy" class="settings-select"><option value="copy">保留兼容字幕</option><option value="drop">移除字幕</option></select></div></div>
                 <div class="settings-row"><label for="videoMetadataPolicy">元数据</label><div class="select-wrapper"><select id="videoMetadataPolicy" class="settings-select"><option value="preserve">保留</option><option value="stripPrivate">移除隐私位置数据</option><option value="strip">全部移除</option></select></div></div>
-                <div class="settings-row"><label for="videoOutputMode">输出方式</label><div class="select-wrapper"><select id="videoOutputMode" class="settings-select"><option value="suffix">同目录添加后缀</option><option value="directory">指定目录</option><option value="replace">安全覆盖原文件</option></select></div></div>
-                <div class="settings-row video-output-field" id="videoSuffixRow"><label for="videoOutputSuffix">文件名后缀</label><input id="videoOutputSuffix" class="settings-text-input" value="_compressed" maxlength="64"></div>
-                <div class="settings-row video-output-field" id="videoDirectoryRow" hidden><label>输出目录</label><div class="dir-picker"><span id="videoOutputDirDisplay" class="dir-display">未选择</span><button class="btn btn-small" type="button" onclick="selectVideoOutputDir()">浏览</button></div></div>
                 <div class="settings-row"><label for="videoThreads">编码线程</label><div class="video-number-control"><input id="videoThreads" type="number" min="0" max="256" value="0"><span class="settings-hint">0 = 自动</span></div></div>
                 <div class="settings-row"><label for="videoAllowLarger">结果策略</label><div class="toggle-wrapper"><label class="toggle"><input type="checkbox" id="videoAllowLarger"><span class="toggle-slider"></span></label><span class="toggle-label">允许保留更大的输出</span></div></div>
                 <div class="video-capability-note" id="videoCapabilityNote" role="status"></div>

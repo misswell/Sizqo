@@ -501,9 +501,14 @@ body {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: flex-end;
-  gap: 12px;
+  gap: 8px 12px;
+  flex: 0 0 auto;
+  padding: 0;
+}
+/* 全局项（自动开始）单独占一行；输出方式已经分别归入图片 / 视频组。 */
+.intent-output-global {
   flex: 1 1 100%;
+  justify-content: flex-end;
   padding: 0 2px;
 }
 .output-mode-switch {
@@ -1241,7 +1246,7 @@ input[type="range"]::-moz-range-thumb {
 }
 .video-inline-number { margin-left: 8px; width: 80px; }
 .video-inline-number[hidden] { display: none; }
-.video-mode-field[hidden], .video-output-field[hidden] { display: none; }
+.video-mode-field[hidden] { display: none; }
 .video-capability-note {
   font-size: var(--fs-meta);
   line-height: 1.55;
