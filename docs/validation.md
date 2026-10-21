@@ -639,7 +639,7 @@ sha256 65074217eba733c45d1c425612fb210fe665400657b9bdcedd71305ae4d65481  .app.ta
 App Store 沙盒运行时、FFmpeg GPL 对应源码义务。本轮按用户「做完就发版」的常驻规则
 发布补丁版本，未把上述未验证项标成已通过。
 
-### Release: v0.3.2（2026-10-21，run `39536720265`）
+### Release: v0.3.4（2026-10-21）
 
 起因：用户提供的 `video-logs/1792550965656402000-0-21b3272905bf3349.log`。
 源 `录制于 2026-10-13 19.59.33.mp4`（10,002,379 B）探得 `duration=30.636667`、
@@ -669,10 +669,28 @@ VFR 时记录 `vfrRate`；argv 使用 `-fps_mode cfr -r <avg_frame_rate>`。显�
 | `cargo test --features inproc-backends` | 单测 114 + 集成 6 全过 |
 | `cargo test --no-default-features --features inproc-backends` | 单测 114 + 集成 6 全过 |
 | `bash scripts/test_swift_history.sh` | 全过 |
+| `bash scripts/test_sign_notarize_macos_ci.sh` | 桩环境成功/失败两路径全过 |
 
 新增回归：probe 的 VFR/CFR 识别两例；plan 的
 `variable_frame_rate_is_normalized_only_without_explicit_fps`
 （VFR→`cfr`+有理帧率、CFR→`passthrough`、显式 24 fps→仅 `-r`）。
+
+发布插曲（两次 macOS universal 作业失败，标签均不复用）：
+
+- v0.3.2（run `39536720265`）：x86_64 的 `hdiutil create` 瞬时返回 `Resource busy`，
+  而 `create_dmg` 的失败又被命令替换末尾的 `echo` 吞掉，脚本继续把不存在的 DMG 送公证。
+  `a2ac6c8` 增加三次重试、文件存在性检查和显式失败传播。
+- v0.3.3（run `39538762236`）：DMG 全部创建成功，但 `hdiutil create` 的
+  `created: …` 进度行写在 stdout，被 `ARM_DMG="$(create_dmg …)"` 一起捕获，路径变成
+  两行；公证前检查因此报
+  `Missing DMG before notarization: created: …/Sizqo_v0.3.3_macos_arm64.dmg`。
+  其余 6 个作业全绿，`release` 跳过。修复：`hdiutil create … >&2`，并新增
+  `scripts/test_sign_notarize_macos_ci.sh` 用桩命令跑完整发布脚本。
+  旧脚本（`a2ac6c8`）在该测试下稳定复现上述报错并以 1 退出；新脚本成功路径产出
+  三个 DMG 与更新包，失败路径（`hdiutil` 恒失败）在三次重试后以非零退出，日志含
+  `DMG was not created`，且不会进入公证。
+
+最终以 0.3.4 发布：`SHA_TBD`，run `RUN_TBD`。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
