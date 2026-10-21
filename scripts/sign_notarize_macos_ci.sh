@@ -174,13 +174,34 @@ create_dmg() {
   local arch="$2"
   local dmg="${OUTPUT_DIR}/Sizqo_${RELEASE_TAG}_macos_${arch}.dmg"
   local staging
+  local attempt
   staging="$(mktemp -d -t "sizqo-${arch}")"
 
   ditto "${app}" "${staging}/Sizqo.app"
   ln -s /Applications "${staging}/Applications"
-  hdiutil create -volname Sizqo -srcfolder "${staging}" -ov -format UDZO "${dmg}" >/dev/null
-  codesign --force --timestamp --sign "${SIGNING_IDENTITY}" "${dmg}"
-  rm -r "${staging}"
+  # hdiutil create can transiently fail with "Resource busy" on CI runners.
+  # This call runs inside a command substitution, where the shell's errexit is
+  # not reliable: without the explicit checks below a failure was swallowed by
+  # the final `echo`, and the missing DMG only surfaced at notary submission.
+  for attempt in 1 2 3; do
+    rm -f "${dmg}"
+    if hdiutil create -volname "Sizqo-${arch}" -srcfolder "${staging}" -ov -format UDZO "${dmg}"; then
+      break
+    fi
+    echo "hdiutil create failed for ${arch} (attempt ${attempt}/3)" >&2
+    sleep $((attempt * 2))
+  done
+  if [ ! -f "${dmg}" ]; then
+    echo "DMG was not created: ${dmg}" >&2
+    rm -rf "${staging}"
+    return 1
+  fi
+  if ! codesign --force --timestamp --sign "${SIGNING_IDENTITY}" "${dmg}"; then
+    echo "DMG signing failed: ${dmg}" >&2
+    rm -rf "${staging}"
+    return 1
+  fi
+  rm -rf "${staging}"
   echo "${dmg}"
 }
 
@@ -249,9 +270,13 @@ for app in "${ARM_APP}" "${INTEL_APP}" "${UNIVERSAL_APP}"; do
 done
 
 log "Create signed DMGs from the ticketed apps"
-ARM_DMG="$(create_dmg "${ARM_APP}" arm64)"
-INTEL_DMG="$(create_dmg "${INTEL_APP}" x86_64)"
-UNIVERSAL_DMG="$(create_dmg "${UNIVERSAL_APP}" universal)"
+ARM_DMG="$(create_dmg "${ARM_APP}" arm64)" || { echo "arm64 DMG creation failed" >&2; exit 1; }
+INTEL_DMG="$(create_dmg "${INTEL_APP}" x86_64)" || { echo "x86_64 DMG creation failed" >&2; exit 1; }
+UNIVERSAL_DMG="$(create_dmg "${UNIVERSAL_APP}" universal)" || { echo "universal DMG creation failed" >&2; exit 1; }
+
+for dmg in "${ARM_DMG}" "${INTEL_DMG}" "${UNIVERSAL_DMG}"; do
+  [ -f "${dmg}" ] || { echo "Missing DMG before notarization: ${dmg}" >&2; exit 1; }
+done
 
 log "Submit three DMGs to Apple notarization"
 notarize_dmg "${ARM_DMG}" &
