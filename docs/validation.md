@@ -639,6 +639,41 @@ sha256 65074217eba733c45d1c425612fb210fe665400657b9bdcedd71305ae4d65481  .app.ta
 App Store 沙盒运行时、FFmpeg GPL 对应源码义务。本轮按用户「做完就发版」的常驻规则
 发布补丁版本，未把上述未验证项标成已通过。
 
+### Release: v0.3.2（2026-10-21，run `39536720265`）
+
+起因：用户提供的 `video-logs/1792550965656402000-0-21b3272905bf3349.log`。
+源 `录制于 2026-10-13 19.59.33.mp4`（10,002,379 B）探得 `duration=30.636667`、
+`avg_frame_rate=130500/9191`（14.199 fps）、`r_frame_rate=89/6`（14.833 fps）、
+435 帧；最后一个视频包 PTS 30.010、duration 0.626667。FFmpeg 编码本身 exit 0，
+但 passthrough 输出止于 30.067 s；`validation.rs` 的时长容差是
+`max(1%, 250 ms)=306 ms`，差 569 ms 被拒，任务按失败清理临时文件。
+
+本地复现（bundled FFmpeg，libx265 CRF 28、4K、threads 3、音频 copy）：
+
+| 时间戳策略 | 输出 format duration | 帧数 | 与源差 |
+| --- | --- | --- | --- |
+| `-fps_mode passthrough` | 30.067416 | 435 | −0.569251（超 306 ms 容差） |
+| `-fps_mode cfr -r 130500/9191` | 30.636667 | 435 | 0 |
+| `hevc_videotoolbox` + 同一 CFR 参数 | 30.636667 | 435 | 0（dup=15/drop=15） |
+
+修复（`17e1ab8`）：probe 增加结构化 `variableFrameRate`；build 在用户未选帧率且源为
+VFR 时记录 `vfrRate`；argv 使用 `-fps_mode cfr -r <avg_frame_rate>`。显式帧率与 CFR 源
+仍走原路径（`-r` / passthrough）。前端选项改为「自动（保持时长）/ VFR」。
+
+本地门禁（全部 EXIT=0）：
+
+| 命令 | 结果 |
+| --- | --- |
+| `npm run test:frontend` | 18 个脚本全过 |
+| `cargo test` | 单测 114 + 集成 6 全过 |
+| `cargo test --features inproc-backends` | 单测 114 + 集成 6 全过 |
+| `cargo test --no-default-features --features inproc-backends` | 单测 114 + 集成 6 全过 |
+| `bash scripts/test_swift_history.sh` | 全过 |
+
+新增回归：probe 的 VFR/CFR 识别两例；plan 的
+`variable_frame_rate_is_normalized_only_without_explicit_fps`
+（VFR→`cfr`+有理帧率、CFR→`passthrough`、显式 24 fps→仅 `-r`）。
+
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
 Before any tag/Release: full three-track build, signed Direct runtime check,
