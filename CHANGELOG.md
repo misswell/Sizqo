@@ -3,7 +3,7 @@
 Sizqo's versioning starts at 0.1.0. This file records user-visible changes;
 engineering rules live in [AGENTS.md](AGENTS.md).
 
-## 0.3.2 — 可变帧率视频保住时长 (2026-10-21)
+## 0.3.3 — 可变帧率视频保住时长 (2026-10-21)
 
 - 未指定帧率时，VFR 源按源平均帧率做 CFR 归一化，输出时长与源一致；修复录屏类
   素材编码成功却被「输出时长与源不符」校验拒绝、临时文件被清理的问题。
