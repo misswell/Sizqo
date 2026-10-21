@@ -185,7 +185,9 @@ create_dmg() {
   # the final `echo`, and the missing DMG only surfaced at notary submission.
   for attempt in 1 2 3; do
     rm -f "${dmg}"
-    if hdiutil create -volname "Sizqo-${arch}" -srcfolder "${staging}" -ov -format UDZO "${dmg}"; then
+    # hdiutil prints "created: ..." on stdout. This function's stdout is the
+    # artifact path the callers use, so that progress line must go to stderr.
+    if hdiutil create -volname "Sizqo-${arch}" -srcfolder "${staging}" -ov -format UDZO "${dmg}" >&2; then
       break
     fi
     echo "hdiutil create failed for ${arch} (attempt ${attempt}/3)" >&2
