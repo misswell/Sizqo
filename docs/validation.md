@@ -665,7 +665,7 @@ VFR 时记录 `vfrRate`；argv 使用 `-fps_mode cfr -r <avg_frame_rate>`。显�
 | 命令 | 结果 |
 | --- | --- |
 | `npm run test:frontend` | 18 个脚本全过 |
-| `cargo test` | 单测 114 + 集成 6 全过 |
+| `cargo test` | 单测 113 + 集成 6 全过 |
 | `cargo test --features inproc-backends` | 单测 114 + 集成 6 全过 |
 | `cargo test --no-default-features --features inproc-backends` | 单测 114 + 集成 6 全过 |
 | `bash scripts/test_swift_history.sh` | 全过 |
@@ -690,7 +690,44 @@ VFR 时记录 `vfrRate`；argv 使用 `-fps_mode cfr -r <avg_frame_rate>`。显�
   三个 DMG 与更新包，失败路径（`hdiutil` 恒失败）在三次重试后以非零退出，日志含
   `DMG was not created`，且不会进入公证。
 
-最终以 0.3.4 发布：`SHA_TBD`，run `RUN_TBD`。
+最终以 0.3.4 发布：tag `v0.3.4`（annotated `bdfce9e`，peeled commit `b680892`），
+run `39541875940` 的 8 个作业全部 success。Release 于 2026-10-21T04:38:02Z 创建，
+非 draft / 非 prerelease，为 Latest。
+
+云端签名证据（`gh run view 39541875940 --log`）：
+
+- 6 次 notarytool 提交全部 `status: Accepted`：3 个 `.app` + 3 个 DMG。
+- 3 个 `.app` 与 3 个 DMG 的 staple/validate 均 worked。
+- 自检四行全过：`DMG arm64 / DMG x86_64 / DMG universal / updater archive:
+  Developer ID + engines + ticket`。
+- `Create signed DMGs from the ticketed apps` 之后出现三条 `created: …`，没有
+  `Missing DMG before notarization`，说明 `hdiutil` 进度行已与产物路径分离。
+
+线上资产（`gh api repos/misswell/Sizqo/releases/latest`，单位 B）：
+universal DMG 66,122,998；arm64 30,500,450；x86_64 36,798,031；
+universal `.app.tar.gz` 59,991,983；`.sig` 432；`latest.json` 1,309；
+Linux AppImage 87,902,712；deb 5,093,550；Windows exe 2,950,080；msi 3,796,992。
+`latest.json` 的 `version` 为 `0.3.4`，两个 darwin 平台的 `url` 都指向
+`v0.3.4/Sizqo_v0.3.4_macos_universal.app.tar.gz`，`signature` 字段与 432 B
+的 `.sig` 资产逐字符相同（432 字符的 base64）。
+
+下载线上字节复核：
+
+| 对象 | 结果 |
+| --- | --- |
+| universal DMG（挂载） | `hdiutil verify` 校验和 VALID；`Sizqo.app` 0.3.4、`x86_64 arm64`、Developer ID + runtime、`stapler validate` app 与 DMG 自身都 worked |
+| DMG 内引擎 | `Resources/resources/bin` 7 个图片 CLI；`Resources/video/bin` 2 个（ffmpeg/ffprobe） |
+| universal 更新包 | `tar -xzf` 后同样 0.3.4/universal/Developer ID + ticket + 9 个引擎 |
+| 更新签名 | `scripts/verify_updater_signature.sh <绝对路径>` → OK；翻转第 1000 字节后 → `Error: InvalidSignature` |
+
+```
+sha256 a6c080c31d7397994dd7068d411a44161824c19937769ac6f17de7bdef7fff92  .app.tar.gz
+sha256 92fa8ab358a71537e8f9b133cab5cdb6f358d0a1b7c96284a43921dc1ac4d6c2  .app.tar.gz.sig
+```
+
+仍未做（与 v0.3.1 相同）：签名包内新工作台的肉眼点击验收、§11 fixture 视频矩阵、
+App Store 沙盒运行时、FFmpeg GPL 对应源码义务。本轮按用户「做完就发版」的常驻规则
+发布补丁版本，未把上述未验证项标成已通过。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
