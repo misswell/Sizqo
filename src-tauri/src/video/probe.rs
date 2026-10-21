@@ -18,6 +18,7 @@ pub struct VideoProbe {
     pub size_bytes: u64, pub rotation: i32, pub hdr_kind: String,
     pub color_metadata: Value, pub chapters: Vec<Value>, pub warnings: Vec<String>,
     pub width: u32, pub height: u32, pub frame_rate: Option<f64>, pub bit_rate: Option<u64>,
+    pub variable_frame_rate: bool,
 }
 fn text(v:&Value,k:&str)->String {v[k].as_str().unwrap_or("").into()}
 fn uint(v:&Value,k:&str)->u64 { v[k].as_u64().or_else(||v[k].as_str()?.parse().ok()).unwrap_or(0) }
@@ -49,12 +50,13 @@ impl VideoProbe {
         let rotation=video.side_data.as_array().and_then(|a|a.iter().find_map(|d|d["rotation"].as_i64()))
             .or_else(||video.tags["rotate"].as_str()?.parse().ok()).unwrap_or(0) as i32;
         let mut warnings=vec![];
-        if rational(&text(&video.raw,"r_frame_rate"))!=video.frame_rate { warnings.push("Possible VFR; source timestamps will be preserved".into()); }
+        let variable_frame_rate=matches!((rational(&text(&video.raw,"r_frame_rate")),video.frame_rate),(Some(r),Some(a)) if r!=a);
+        if variable_frame_rate { warnings.push("Variable frame rate detected; duration is preserved by using the source average frame rate unless a frame rate is selected".into()); }
         let color_metadata=serde_json::json!({"transfer":video.color_transfer,"primaries":video.color_primaries,"space":video.color_space,"pixelFormat":video.pixel_format});
         let (width,height,frame_rate)=(video.width,video.height,video.frame_rate);
         Ok(Self {duration_us,streams,format:text(&root["format"],"format_name"),size_bytes:size,rotation,hdr_kind:hdr_kind.into(),color_metadata,
             chapters:root["chapters"].as_array().cloned().unwrap_or_default(),warnings,width,height,frame_rate,
-            bit_rate:Some(uint(&root["format"],"bit_rate")).filter(|n|*n>0)})
+            bit_rate:Some(uint(&root["format"],"bit_rate")).filter(|n|*n>0),variable_frame_rate})
     }
 }
 #[cfg(not(feature="inproc-backends"))]
@@ -72,4 +74,10 @@ pub fn probe(_path:&Path)->Result<VideoProbe,String> {Err(super::capabilities::N
 #[cfg(test)] mod tests { use super::*;
     #[test] fn hdr_rotation_tracks_are_not_lost() { let p=VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":1080,"height":1920,"pix_fmt":"yuv420p10le","color_transfer":"smpte2084","side_data_list":[{"rotation":90}]},{"index":1,"codec_type":"audio","codec_name":"aac","channels":6}],"format":{"duration":"4.5","format_name":"mov"}}),123).unwrap();assert_eq!(p.duration_us,Some(4500000));assert_eq!(p.hdr_kind,"hdr");assert_eq!(p.rotation,90);assert_eq!(p.audio().count(),1); }
     #[test] fn invalid_video_is_rejected() {assert!(VideoProbe::parse(serde_json::json!({"streams":[]}),0).is_err());assert_eq!(rational("0/0"),None);}
+    #[test] fn variable_frame_rate_is_detected() {
+        let p=VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":720,"height":1280,"pix_fmt":"yuv420p","avg_frame_rate":"130500/9191","r_frame_rate":"89/6"}],"format":{"duration":"30.636667","format_name":"mov"}}),1).unwrap();
+        assert!(p.variable_frame_rate);assert_eq!(p.frame_rate,rational("130500/9191"));
+        let cfr=VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":720,"height":1280,"pix_fmt":"yuv420p","avg_frame_rate":"30/1","r_frame_rate":"30/1"}],"format":{"duration":"10","format_name":"mp4"}}),1).unwrap();
+        assert!(!cfr.variable_frame_rate);
+    }
 }

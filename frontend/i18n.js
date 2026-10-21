@@ -105,7 +105,7 @@
     '转换为 MP3 160 kbps': 'Convert to MP3 160 kbps', '转换为 FLAC 无损': 'Convert to FLAC (lossless)',
     'kbps · 估算不保证最终体积': 'kbps · Estimated; the final size is not guaranteed', 'MiB · 音频与容器开销会影响结果': 'MiB · Audio and container overhead affect the result',
     '恒定质量（CRF）': 'Constant quality (CRF)', '目标码率（ABR）': 'Target bitrate (ABR)', '两遍码率': 'Two-pass bitrate',
-    '保持源分辨率': 'Keep source resolution', '保持源时间戳 / VFR': 'Keep source timestamps / VFR', '自定义最长边像素': 'Custom longest edge in pixels',
+    '保持源分辨率': 'Keep source resolution', '自动（保持时长）/ VFR': 'Auto (preserve duration) / VFR', '自定义最长边像素': 'Custom longest edge in pixels',
     '最高 4K': 'Up to 4K', '最高 1440p': 'Up to 1440p', '最高 1080p': 'Up to 1080p', '最高 720p': 'Up to 720p', '自定义最长边': 'Custom longest edge',
     '兼容音轨优先复制': 'Copy compatible audio first', '移除隐私位置数据': 'Remove privacy location data',
     '移除音频': 'Remove audio', '移除字幕': 'Remove subtitles', '保留兼容字幕': 'Keep compatible subtitles', '全部移除': 'Remove all',

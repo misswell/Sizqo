@@ -1,6 +1,6 @@
 {
   "name": "sizqo",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Sizqo media compression",
   "scripts": {
     "dev": "cargo tauri dev",

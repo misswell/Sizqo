@@ -3,7 +3,7 @@ use super::{VideoOptions,capabilities::CapabilityMatrix,probe::VideoProbe};
 use serde::Serialize;
 use std::path::Path;
 #[derive(Debug,Clone,Serialize)]#[serde(rename_all="camelCase")]
-pub struct EncodePlan {pub encoder:String,pub container:String,pub bitrate_kbps:Option<u64>,pub crf:Option<f64>,pub width:u32,pub height:u32,pub passes:u32,pub threads:usize,pub warnings:Vec<String>,pub options:VideoOptions}
+pub struct EncodePlan {pub encoder:String,pub container:String,pub bitrate_kbps:Option<u64>,pub crf:Option<f64>,pub width:u32,pub height:u32,pub passes:u32,pub threads:usize,pub warnings:Vec<String>,pub vfr_rate:Option<String>,pub options:VideoOptions}
 fn member(value:&str,allowed:&[&str],what:&str)->Result<(),String>{if allowed.contains(&value){Ok(())}else{Err(format!("Invalid {what}: {value}"))}}
 pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budget:usize)->Result<EncodePlan,String>{
     if !caps.available{return Err(caps.reason.clone().unwrap_or("Video unavailable".into()));}
@@ -25,6 +25,7 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
     if probe.streams.iter().any(|s|s.codec_type=="attachment")&&options.container!="mkv"{return Err("Attachments require MKV; no silent discarding".into());}
     if !probe.chapters.is_empty()&&options.metadata_policy=="preserve"&&["webm","ts"].contains(&options.container.as_str()){return Err("Chapter preservation in WebM/TS is unavailable; choose MKV".into());}
     let mut warnings=probe.warnings.clone();
+    let vfr_rate=if options.frame_rate.is_none()&&probe.variable_frame_rate {video.raw["avg_frame_rate"].as_str().map(str::to_string)}else{None};
     if options.metadata_policy=="stripPrivate" { warnings.push("Privacy mode removes optional metadata to avoid retaining unknown GPS tags; color and timing remain encoded in the video stream".into()); }
     let encoder=if options.encoder=="auto" {
         let preference=if options.container=="webm"{vec!["libsvtav1","libvpx-vp9"]}else if options.mode=="twoPass"||options.mode=="targetSize"{vec!["libx264"]}else if options.mode=="crf"{vec!["libx265","libx264","libvpx-vp9"]}else{vec!["hevc_videotoolbox","libx265","h264_videotoolbox","libx264"]};
@@ -74,7 +75,7 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
         let source=video.bit_rate.or(probe.bit_rate).unwrap_or(estimated*1000)/1000;
         let b=options.bitrate_kbps.unwrap_or(estimated.min(source*3/4).max(200));if !(32..=500000).contains(&b){return Err("Video bitrate range is 32…500000 kbps".into());}Some(b)
     }else{None};
-    Ok(EncodePlan {encoder,container:options.container.clone(),bitrate_kbps,crf,width,height,passes:if ["twoPass","targetSize"].contains(&options.mode.as_str()){2}else{1},threads:if options.threads==0{budget.max(1)}else{options.threads.max(1).min(budget.max(1))},warnings,options:options.clone()})
+    Ok(EncodePlan {encoder,container:options.container.clone(),bitrate_kbps,crf,width,height,passes:if ["twoPass","targetSize"].contains(&options.mode.as_str()){2}else{1},threads:if options.threads==0{budget.max(1)}else{options.threads.max(1).min(budget.max(1))},warnings,vfr_rate,options:options.clone()})
 }
 impl EncodePlan {
     pub fn argv(&self,input:&Path,output:&Path,pass:u32,passlog:&Path)->Vec<String>{
@@ -82,7 +83,7 @@ impl EncodePlan {
         let mut add=|k:&str,v:String|{a.push(k.into());a.push(v);};
         if self.encoder.ends_with("videotoolbox"){add("-allow_sw","0".into());}else if self.encoder=="libsvtav1"{let speed=match self.options.preset.as_str(){"ultrafast"=>12,"veryfast"=>10,"slow"=>4,_=>8};add("-preset",speed.to_string());add("-svtav1-params",format!("lp={}",self.threads));}else if self.encoder=="libvpx-vp9"{let cpu_used=match self.options.preset.as_str(){"ultrafast"=>"5","veryfast"=>"4","slow"=>"1",_=>"2"};add("-deadline","good".into());add("-cpu-used",cpu_used.into());add("-row-mt","1".into());}else{add("-preset",self.options.preset.clone());if self.encoder=="libx265"{add("-x265-params",format!("pools={}:frame-threads=1",self.threads));}}
         if let Some(c)=self.crf{add("-crf",c.to_string());if self.encoder=="libvpx-vp9"{add("-b:v","0".into());}}if let Some(b)=self.bitrate_kbps{add("-b:v",format!("{b}k"));}
-        if let Some(f)=self.options.frame_rate{add("-r",f.to_string());}else{add("-fps_mode","passthrough".into());}
+        if let Some(f)=self.options.frame_rate{add("-r",f.to_string());}else if let Some(rate)=&self.vfr_rate{add("-fps_mode","cfr".into());add("-r",rate.clone());}else{add("-fps_mode","passthrough".into());}
         if self.passes==2{add("-pass",pass.to_string());add("-passlogfile",passlog.to_string_lossy().into());}
         if self.encoder.contains("hevc")||self.encoder=="libx265"{if self.container=="mp4"||self.container=="mov"{add("-tag:v","hvc1".into());}}
         if self.passes==2&&pass==1{a.extend(["-an".into(),"-sn".into(),"-f".into(),"null".into(),"-progress".into(),"pipe:1".into(),"-nostats".into(),"-".into()]);return a;}
@@ -98,10 +99,22 @@ impl EncodePlan {
     use super::*; use crate::video::capabilities::EncoderCapability;
     pub fn caps()->CapabilityMatrix{CapabilityMatrix {backend:"ffmpeg".into(),available:true,reason:None,encoders:["libx264","libx265","libsvtav1","libvpx-vp9","hevc_videotoolbox"].iter().map(|id|EncoderCapability{id:id.to_string(),label:id.to_string(),modes:if id.ends_with("videotoolbox"){vec!["abr".into()]}else if *id=="libx264"||*id=="libvpx-vp9"{vec!["crf".into(),"abr".into(),"twoPass".into(),"targetSize".into()]}else{vec!["crf".into(),"abr".into()]},presets:vec![]}).collect(),muxers:vec!["mp4".into(),"mkv".into(),"webm".into(),"ts".into()],audio_encoders:vec!["aac".into(),"libopus".into(),"libmp3lame".into(),"flac".into()],diagnostics:vec![]}}
     pub fn probe()->VideoProbe{VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":720,"height":1280,"codec_name":"h264","pix_fmt":"yuv420p","avg_frame_rate":"30/1"}],"format":{"duration":"10","format_name":"mp4"}}),1234).unwrap()}
+    pub fn vfr_probe()->VideoProbe{VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":3840,"height":2160,"codec_name":"hevc","pix_fmt":"yuv420p","avg_frame_rate":"130500/9191","r_frame_rate":"89/6"}],"format":{"duration":"30.636667","format_name":"mov"}}),1234).unwrap()}
     #[test]fn combinations_are_checked(){let mut o=VideoOptions::default();o.encoder="libx264".into();o.container="webm".into();assert!(build(&o,&probe(),&caps(),3).is_err());o.container="mp4".into();o.encoder="hevc_videotoolbox".into();o.mode="crf".into();assert!(build(&o,&probe(),&caps(),3).is_err());}
     #[test]fn resolution_never_upscales_and_even(){let mut o=VideoOptions::default();o.resolution=1920;let p=build(&o,&probe(),&caps(),2).unwrap();assert_eq!((p.width,p.height),(720,1280));o.resolution=720;let p=build(&o,&probe(),&caps(),2).unwrap();assert_eq!(p.height,720);assert_eq!(p.width%2,0);assert_eq!(p.threads,2);}
     #[test]fn hdr_and_size_lower_bound_are_blocked(){let mut p=probe();p.hdr_kind="hdr".into();assert!(build(&VideoOptions::default(),&p,&caps(),3).is_err());let mut o=VideoOptions::default();o.encoder="libx264".into();o.mode="targetSize".into();o.target_mi_b=Some(0.0001);assert!(build(&o,&probe(),&caps(),3).is_err());}
     #[test]fn argv_preserves_paths_without_shell(){let mut o=VideoOptions::default();o.encoder="libx264".into();o.mode="crf".into();let p=build(&o,&probe(),&caps(),1).unwrap();let a=p.argv(Path::new("/tmp/a ' $().mov"),Path::new("/tmp/result.mp4"),1,Path::new("/tmp/stats"));assert!(a.contains(&"/tmp/a ' $().mov".into()));assert!(a.windows(2).any(|w|w==["-fps_mode","passthrough"]));assert!(!a.contains(&"-r".into()));}
+    #[test]fn variable_frame_rate_is_normalized_only_without_explicit_fps(){
+        let mut o=VideoOptions::default();o.encoder="libx265".into();
+        let p=build(&o,&vfr_probe(),&caps(),3).unwrap();
+        assert_eq!(p.vfr_rate.as_deref(),Some("130500/9191"));
+        let a=p.argv(Path::new("in.mov"),Path::new("out.mp4"),1,Path::new("stats"));
+        assert!(a.windows(2).any(|w|w==["-fps_mode","cfr"]));assert!(a.windows(2).any(|w|w==["-r","130500/9191"]));assert!(!a.contains(&"passthrough".into()));
+        let cfr=build(&o,&probe(),&caps(),3).unwrap();assert_eq!(cfr.vfr_rate,None);
+        assert!(cfr.argv(Path::new("in.mp4"),Path::new("out.mp4"),1,Path::new("stats")).windows(2).any(|w|w==["-fps_mode","passthrough"]));
+        o.frame_rate=Some(24.0);let explicit=build(&o,&vfr_probe(),&caps(),3).unwrap();assert_eq!(explicit.vfr_rate,None);
+        let a=explicit.argv(Path::new("in.mov"),Path::new("out.mp4"),1,Path::new("stats"));assert!(a.windows(2).any(|w|w==["-r","24"]));assert!(!a.contains(&"cfr".into()));
+    }
     #[test]fn target_mib_contract(){let v=serde_json::to_value(VideoOptions::default()).unwrap();assert!(v.get("targetMiB").is_some());}
     #[test]fn zero_threads_means_auto_budget(){let mut o=VideoOptions::default();o.threads=0;let p=build(&o,&probe(),&caps(),5).unwrap();assert_eq!(p.threads,5);o.threads=99;let p=build(&o,&probe(),&caps(),5).unwrap();assert_eq!(p.threads,5);}
     #[test]fn vp9_webm_and_ts_contract(){let mut o=VideoOptions::default();o.encoder="libvpx-vp9".into();o.container="webm".into();o.mode="crf".into();o.crf=Some(31.0);o.audio_policy="opus".into();let p=build(&o,&probe(),&caps(),3).unwrap();let a=p.argv(Path::new("in.mp4"),Path::new("out.webm"),1,Path::new("st"));assert!(a.windows(2).any(|w|w==["-b:v","0"]));assert!(a.windows(2).any(|w|w==["-cpu-used","2"]));assert!(a.windows(2).any(|w|w==["-row-mt","1"]));
