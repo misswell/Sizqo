@@ -113,15 +113,22 @@ final class CompressionScheduler: @unchecked Sendable {
         condition.unlock()
     }
 
-    /// 新一批永远从「未暂停、未停止」开始，不继承上一批的状态；同时按最新设置取上限。
-    func beginBatch(maxParallelism limit: Int? = nil) {
+    /// §37 占住这一轮 session —— 全场唯一的入口，没有「无条件开一批」这条路。
+    ///
+    /// 抢到的一轮从不暂停、从不停止开始，不继承上一轮遗留的位；抢不到（已经有一轮在跑）
+    /// 就返回 false 并且**一个状态都不改**：来抢的第二入口没有权利暂停、更没有权利解除
+    /// 正在跑那一轮的闸门。两轮并跑过一次的后果是先到那轮的 `endBatch` 把后一轮的
+    /// 暂停 / 停止 / 取消账本一起清零 —— 「点了暂停却还在压」就是这么来的。
+    func tryBeginBatch(maxParallelism limit: Int? = nil) -> Bool {
         condition.lock()
+        guard !batchRunning else { condition.unlock(); return false }
         if let limit { maxParallelism = max(Self.minParallelism, limit) }
         paused = false
         stopping = false
         batchRunning = true
         condition.broadcast()
         condition.unlock()
+        return true
     }
 
     func endBatch() {

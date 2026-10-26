@@ -82,7 +82,6 @@ struct CompressOptions {
     var outputMode: OutputMode = .replace
     var outputSuffix: String = "_compressed"
     var outputDir: String?
-    var sourceRoots: [String] = []
 
     /// 最长边上限（px，只缩不放大）；nil = 不限制。与 Rust 线 `max_dimension_px` 对齐。
     var maxDimensionPx: Int?

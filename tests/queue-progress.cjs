@@ -41,7 +41,11 @@ const context = vm.createContext({
   getCurrentCompressionConfig: () => ({ options: {} }),
   listen: async (_, handler) => { progress = payload => handler({payload}); return () => {}; },
   invoke: async (command, args) => {
-    if (command === 'probe_media') return args.paths.map(path => ({ path, mediaKind: 'image', size: 1024 }));
+    if (command === 'probe_media') return args.paths.map(path => ({
+      path, mediaKind: 'image', size: 1024,
+      sourceRoot: path.slice(0, path.lastIndexOf('/')),
+      relativePath: path.slice(path.lastIndexOf('/') + 1),
+    }));
     if (command === 'get_file_sizes') return args.filePaths.map(() => 1024);
     return new Promise(resolve => runs.push({ command, paths: args.filePaths, sessionId: args.sessionId, queueRevision: args.queueRevision, resolve }));
   },
@@ -85,7 +89,11 @@ const flush = async () => { for (let i=0;i<16;i++) await Promise.resolve(); };
 const run = () => runs[runs.length - 1];
 // 后端事件：payload 一定带着当前这一轮的 sessionId。
 const emit = payload => progress(Object.assign({ sessionId: run().sessionId, queueRevision: run().queueRevision }, payload));
-const settle = file => emit({ file, status: 'completed', result: {file, success:true, savings:10, originalSize: 100, compressedSize: 90} });
+const settle = file => emit({ file, status: 'completed', result: {
+  file, savings: 10, originalSize: 100, compressedSize: 90,
+  // 真的落了盘才有 outputPath；§43 的 committed 计数读的就是结论 + 这条真实判据。
+  outcome: 'committed', outputPath: `${file}_compressed.png`,
+} });
 const startSession = file => emit({ file, status: 'starting' });
 const defer = file => emit({ file, status: 'deferred' });
 
@@ -176,6 +184,28 @@ const defer = file => emit({ file, status: 'deferred' });
   await resumed;
   assert.equal(summary.textContent, '28 / 28 已处理');
   assert.equal(context.getQueueProgress().total, 28, '分母始终是整个队列');
+
+  // ── §43 进度拆分：completed 必须能被 committed / skipped 完整解释 ──
+  const finalProgress = context.getQueueProgress();
+  assert.equal(finalProgress.completed, 28, 'completed = 走完的生命周期');
+  assert.equal(finalProgress.committed, 28, '落了产物的记在 committed');
+  assert.equal(finalProgress.committed + finalProgress.skipped, finalProgress.completed,
+    'completed 必须能被 committed / skipped 完整解释');
+  assert.equal(finalProgress.active + finalProgress.pending + finalProgress.failed, 0,
+    '收尾后不存在没结束的任务');
+  assert.equal(finalProgress.retrying, 0, '没有任务在重试时不许报重试数');
+
+  // skipped：处理完了但没有产物（跳过 / 未落盘）也是 completed 的一半。
+  context.files = ['/skip.png'];
+  context.queueItems = new Map([['/skip.png', {
+    id: 'skip', taskId: 'skip', path: '/skip.png', state: 'done',
+    result: { file: '/skip.png', outcome: 'skipped_no_benefit' }, everProcessed: true,
+  }]]);
+  const skippedProgress = context.getQueueProgress();
+  assert.equal(skippedProgress.completed, 1);
+  assert.equal(skippedProgress.skipped, 1, '没有产物的 completed 记在 skipped');
+  assert.equal(skippedProgress.committed, 0);
+  assert.equal(skippedProgress.processed, 1);
 
   context.files = [];
   context.queueItems = new Map();

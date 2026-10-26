@@ -6,7 +6,10 @@ use std::path::Path;
 pub struct VideoStream {
     pub index: u32, pub codec_type: String, pub codec_name: String,
     pub width: u32, pub height: u32, pub pixel_format: String,
-    pub bit_rate: Option<u64>, pub channels: u32, pub frame_rate: Option<f64>,
+    pub bit_rate: Option<u64>, pub channels: u32,
+    /// §56 采样率：音频转换后必须与原轨一致，不能只看声道数。
+    #[serde(default)] pub sample_rate: u32,
+    pub frame_rate: Option<f64>,
     pub time_base: String, pub color_transfer: String, pub color_primaries: String,
     pub color_space: String, pub field_order: String, pub tags: Value,
     pub disposition: Value, pub side_data: Value, pub raw: Value,
@@ -15,6 +18,8 @@ pub struct VideoStream {
 #[serde(rename_all="camelCase")]
 pub struct VideoProbe {
     pub duration_us: Option<u64>, pub streams: Vec<VideoStream>, pub format: String,
+    /// §55 全局 metadata：校验 StripPrivate / StripAll 是否真的去了该去的东西。
+    #[serde(default)] pub format_tags: Value,
     pub size_bytes: u64, pub rotation: i32, pub hdr_kind: String,
     pub color_metadata: Value, pub chapters: Vec<Value>, pub warnings: Vec<String>,
     pub width: u32, pub height: u32, pub frame_rate: Option<f64>, pub bit_rate: Option<u64>,
@@ -24,6 +29,13 @@ fn text(v:&Value,k:&str)->String {v[k].as_str().unwrap_or("").into()}
 fn uint(v:&Value,k:&str)->u64 { v[k].as_u64().or_else(||v[k].as_str()?.parse().ok()).unwrap_or(0) }
 pub fn rational(s:&str)->Option<f64> { let (a,b)=s.split_once('/')?; let n=a.parse::<f64>().ok()?;let d=b.parse::<f64>().ok()?;
     let r=n/d; if r.is_finite()&&r>0.0 {Some(r)}else{None} }
+impl VideoStream {
+    /// MP4/MOV 的章节轨道在 ffprobe 里是 `data` 流，样本项标签是 `text`。
+    /// 它是 `-map_chapters` 的载体，不是需要独立保留的数据轨；时间码（`tmcd`）等其它 data 流仍要拒绝。
+    pub fn is_chapter_carrier(&self)->bool {
+        self.codec_type=="data"&&self.raw["codec_tag_string"].as_str().is_some_and(|tag|tag.eq_ignore_ascii_case("text"))
+    }
+}
 impl VideoProbe {
     pub fn video(&self)->Option<&VideoStream> { self.streams.iter().find(|s|s.codec_type=="video"&&s.disposition["attached_pic"].as_u64()!=Some(1)) }
     pub fn audio(&self)->impl Iterator<Item=&VideoStream> {self.streams.iter().filter(|s|s.codec_type=="audio")}
@@ -34,6 +46,7 @@ impl VideoProbe {
             streams.push(VideoStream {index:uint(s,"index") as u32,codec_type:text(s,"codec_type"),codec_name:text(s,"codec_name"),
                 width:uint(s,"width") as u32,height:uint(s,"height") as u32,pixel_format:text(s,"pix_fmt"),
                 bit_rate:Some(uint(s,"bit_rate")).filter(|n|*n>0),channels:uint(s,"channels") as u32,
+                sample_rate:uint(s,"sample_rate") as u32,
                 frame_rate:rational(&text(s,"avg_frame_rate")),time_base:text(s,"time_base"),color_transfer:text(s,"color_transfer"),
                 color_primaries:text(s,"color_primaries"),color_space:text(s,"color_space"),field_order:text(s,"field_order"),
                 tags:s["tags"].clone(),disposition:s["disposition"].clone(),side_data:s["side_data_list"].clone(),raw:s.clone() });
@@ -54,23 +67,30 @@ impl VideoProbe {
         if variable_frame_rate { warnings.push("Variable frame rate detected; duration is preserved by using the source average frame rate unless a frame rate is selected".into()); }
         let color_metadata=serde_json::json!({"transfer":video.color_transfer,"primaries":video.color_primaries,"space":video.color_space,"pixelFormat":video.pixel_format});
         let (width,height,frame_rate)=(video.width,video.height,video.frame_rate);
-        Ok(Self {duration_us,streams,format:text(&root["format"],"format_name"),size_bytes:size,rotation,hdr_kind:hdr_kind.into(),color_metadata,
+        Ok(Self {duration_us,streams,format:text(&root["format"],"format_name"),format_tags:root["format"]["tags"].clone(),size_bytes:size,rotation,hdr_kind:hdr_kind.into(),color_metadata,
             chapters:root["chapters"].as_array().cloned().unwrap_or_default(),warnings,width,height,frame_rate,
             bit_rate:Some(uint(&root["format"],"bit_rate")).filter(|n|*n>0),variable_frame_rate})
     }
 }
 #[cfg(not(feature="inproc-backends"))]
-pub fn probe(path:&Path)->Result<VideoProbe,String> {
+#[cfg(not(feature="inproc-backends"))]
+pub fn probe(path:&Path)->Result<VideoProbe,String>{probe_with_timeout(path,std::time::Duration::from_secs(45))}
+/// 编码产物的复探走这里：编码本身可能刚跑了几分钟，慢卷上对同一份大文件再探一遍
+/// 不该被导入档的 45 秒掐死 —— 超时会把一次完整成功的编码整体作废。
+#[cfg(not(feature="inproc-backends"))]
+pub fn probe_with_timeout(path:&Path,timeout:std::time::Duration)->Result<VideoProbe,String>{
     let path=path.canonicalize().map_err(|e|e.to_string())?;
     let size=std::fs::metadata(&path).map_err(|e|e.to_string())?.len();
     if size==0 {return Err("Empty file".into());}
     let mut cmd=super::process::command("ffprobe")?;
     cmd.args(["-v","error","-protocol_whitelist","file,pipe","-show_format","-show_streams","-show_chapters","-of","json"]).arg(path);
-    let out=super::process::capture(cmd,std::time::Duration::from_secs(45),8*1024*1024)?;
+    let out=super::process::capture(cmd,timeout,8*1024*1024)?;
     VideoProbe::parse(serde_json::from_slice(&out).map_err(|e|e.to_string())?,size)
 }
 #[cfg(feature="inproc-backends")]
 pub fn probe(_path:&Path)->Result<VideoProbe,String> {Err(super::capabilities::NATIVE_UNAVAILABLE.into())}
+#[cfg(feature="inproc-backends")]
+pub fn probe_with_timeout(_path:&Path,_timeout:std::time::Duration)->Result<VideoProbe,String> {Err(super::capabilities::NATIVE_UNAVAILABLE.into())}
 #[cfg(test)] mod tests { use super::*;
     #[test] fn hdr_rotation_tracks_are_not_lost() { let p=VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":1080,"height":1920,"pix_fmt":"yuv420p10le","color_transfer":"smpte2084","side_data_list":[{"rotation":90}]},{"index":1,"codec_type":"audio","codec_name":"aac","channels":6}],"format":{"duration":"4.5","format_name":"mov"}}),123).unwrap();assert_eq!(p.duration_us,Some(4500000));assert_eq!(p.hdr_kind,"hdr");assert_eq!(p.rotation,90);assert_eq!(p.audio().count(),1); }
     #[test] fn invalid_video_is_rejected() {assert!(VideoProbe::parse(serde_json::json!({"streams":[]}),0).is_err());assert_eq!(rational("0/0"),None);}

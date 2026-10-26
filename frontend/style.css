@@ -367,14 +367,25 @@ body {
 .pane-settings { padding: 0; }
 
 /* ─── Intent bar：意图优先，原始参数收在后面 ──────────────── */
+/* 允许收缩：写死 flex-shrink:0 时，参数一展开就把清单整块挤出视口，而 body 是
+   overflow:hidden，挤出去的部分永远回不来。收起态保持 overflow: visible，
+   否则卡片向下的投影会被滚动框裁掉——只有展开那一档才需要内滚。 */
 .intent-bar {
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  min-height: 0;
   display: flex;
   flex-wrap: wrap;
   align-items: stretch;
   gap: 10px 14px;
   padding: 0;
   background: transparent;
+}
+.intent-bar:has(> .intent-advanced[open]) {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: 10px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(123,133,131,0.22) transparent;
 }
 /* 每种媒体一组：压在纸面上不描边，让水印能从后面透出来；卡片只留给真正要操作的东西。 */
 .intent-group {
@@ -548,6 +559,16 @@ body {
 .output-detail > label { font-size: var(--fs-meta); color: var(--text-secondary); white-space: nowrap; }
 .suffix-input { width: 130px; }
 
+/* 落盘方式摆在每种媒体自己的意图组里：图片一组、视频一组，切意图不改它。 */
+.intent-dest { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; }
+.intent-dest-label {
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  letter-spacing: .02em;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
 /* 更多参数：折叠的是原始参数，不是功能。 */
 .intent-advanced {
   width: 100%;
@@ -584,7 +605,17 @@ body {
   border: 1px solid var(--border);
   background: var(--bg-content);
   box-shadow: var(--shadow);
+  /* 参数区自己滚：它是一张有边有角的卡，滚动条落在卡内读起来才像"这一格在滚"，
+     而不是整块顶栏在晃。上限按清单的 200px 存活线倒推，保证两头都不被挤出视口。 */
+  max-height: clamp(40px, calc(100vh - 606px), 420px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(123,133,131,0.22) transparent;
 }
+.advanced-body::-webkit-scrollbar { width: 6px; }
+.advanced-body::-webkit-scrollbar-track { background: transparent; }
+.advanced-body::-webkit-scrollbar-thumb { background: rgba(123,133,131,0.22); border-radius: 8px; }
 .intent-advanced[open] .advanced-body { animation: panelIn var(--dur-panel) var(--ease); }
 .advanced-col { flex: 1 1 340px; min-width: 0; }
 .advanced-col[hidden] { display: none; }
@@ -593,12 +624,15 @@ body {
 
 /* ─── Work split：清单 + 详情 ─────────────────────────────── */
 /* 两块白色面板浮在纸面上：清单约 75%、详情固定 300px，中间留一条缝让装饰透出来。 */
-.work-split { flex: 1; min-height: 0; display: flex; gap: var(--gutter); }
+/* 200px 是清单的存活线：上面再挤也不许把正在跑的东西整块挤没。 */
+.work-split { flex: 1; min-height: 200px; display: flex; gap: var(--gutter); }
 .list-column {
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
+  container-type: size;
+  container-name: list-col;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--bg-content);
@@ -652,6 +686,7 @@ body {
   padding: 8px 10px 12px;
   scrollbar-width: thin;
   scrollbar-color: rgba(123,133,131,0.22) transparent;
+  transition: background var(--dur-hover) var(--ease), box-shadow var(--dur-hover) var(--ease);
 }
 .list-scroll::-webkit-scrollbar { width: 6px; }
 .list-scroll::-webkit-scrollbar-track { background: transparent; }
@@ -660,6 +695,9 @@ body {
   border-radius: 8px;
 }
 .list-scroll::-webkit-scrollbar-thumb:hover { background: rgba(123,133,131,0.4); }
+/* 空队列时清单本身就是落区：让它铺满可用高度。写死 320px 两头都错——
+   窗口矮一档顶出滚动条，高一档又在下面留一条随高度增长的死白。 */
+.list-scroll:has(> .dropzone:not([hidden])) { display: flex; flex-direction: column; }
 .list-filter-empty, .list-empty-inline {
   padding: 32px 12px;
   text-align: center;
@@ -673,7 +711,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 320px;
+  flex: 1 1 auto;
   margin: 4px;
   border: 1px dashed var(--border-strong);
   border-radius: 24px;
@@ -686,6 +724,12 @@ body {
   background: var(--brand-wash);
 }
 .dropzone[hidden] { display: none; }
+/* 拖放事件覆盖整个 webview，不只那块画框：清单非空时画框收着了，
+   落点要在原处留下痕迹，否则成了「能拖进来但看不见地方」。 */
+body.dropping .list-scroll {
+  background: var(--brand-wash);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
 .dropzone-content {
   display: flex;
   flex-direction: column;
@@ -705,16 +749,20 @@ body {
 .dropzone-buttons .btn { min-width: 160px; height: 44px; padding: 0 20px; font-size: var(--fs-body); }
 .dropzone-buttons .btn-secondary { font-weight: 600; }
 
-/* 320px 落区和 44px 按钮是按 780 高的窗口定的；最小窗（640 高）里这两个数字
-   会把 CTA 顶到折叠线以下，所以短窗口整体退让一档，保证按钮始终可见。 */
-@media (max-height: 720px) {
-  .dropzone { min-height: 0; }
+/* 退让的判据是这块面板自己的高度，不是窗口高度：展开「更多参数」时窗口哪怕 800 高，
+   清单也只剩 200px——按视口量一定会错，按容器量才准。 */
+@container list-col (max-height: 340px) {
   .dropzone-content { padding: 14px 20px; gap: 4px; }
   .dropzone-art { width: 76px; height: 57px; }
   .dropzone-content h2 { font-size: var(--fs-module); margin-top: 2px; }
   .dropzone-buttons { margin-top: 6px; }
   .dropzone-buttons .btn { min-width: 140px; height: 36px; }
-  .detail-empty { padding: 24px 12px; }
+}
+/* 再挤一档：插画是这一屏里最没用的那块高度，让给它。两个 CTA 任何情况下都留在屏内。
+   阈值 = 上一档内容真正装得下的最小栏高（内容 181 + 头 48 + 边框 2 + 内边距 20 + 外边距 8）。 */
+@container list-col (max-height: 258px) {
+  .dropzone-art { display: none; }
+  .dropzone-content { padding: 10px 16px; }
 }
 
 /* ─── 清单行：缩略图 / 名称 / 度量 / 状态 ──────────────────── */
@@ -795,6 +843,9 @@ body {
 .media-state-icon.failed { color: var(--danger); }
 .media-state-icon.running { color: var(--accent); }
 .media-state-icon.restored { color: var(--text-secondary); }
+/* 「未产出文件」既不是失败也不是完成：它说的是这一项在盘上什么都没发生。
+   没有这一条，行上的三角只能借用 tertiary 的灰，读起来像没渲染出来。 */
+.media-state-icon.warning { color: var(--warning); }
 /* 转圈的圆环：真的在干活的那一行/那颗按钮才挂它。
    半透明底轨 + 匀速：四边同色会只剩一个硬缺口，ease-in-out 看着像卡顿。 */
 .progress-file-spinner {
@@ -864,6 +915,8 @@ body {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  container-type: size;
+  container-name: detail-col;
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--bg-content);
@@ -902,8 +955,19 @@ body {
   text-wrap: balance;
 }
 .detail-empty-sub { font-size: var(--fs-meta); color: var(--text-tertiary); line-height: 1.5; }
-/* 详情列只有空状态时，把它推到栏位正中；一旦有真实条目就回到顶部堆叠。 */
-.detail-inner:has(> .detail-empty:only-child) { justify-content: center; }
+/* 详情列只有空状态时，把它推到栏位正中；一旦有真实条目就回到顶部堆叠。
+   用 auto 外边距而不是 justify-content: center——内容一旦高过栏位，居中会把上半截推到
+   滚动区之外且再也滚不回来；auto 边距在同情况下自动归零，退化成从顶部可滚。 */
+.detail-inner > .detail-empty:only-child { margin: auto 0; }
+/* 同上：详情栏被挤矮时先收插画与留白，句子本身不许被裁。写在基础规则之后才压得住。 */
+@container detail-col (max-height: 260px) {
+  .detail-empty { padding: 20px 12px; }
+  .detail-empty-art { width: 72px; height: 62px; }
+}
+@container detail-col (max-height: 200px) {
+  .detail-empty-art { display: none; }
+  .detail-empty { padding: 12px 10px; }
+}
 .detail-eyebrow {
   display: flex;
   align-items: center;
@@ -1129,7 +1193,6 @@ body {
   box-shadow: 0 0 0 3px var(--accent-tint);
 }
 .target-number:focus { box-shadow: none; }
-.dir-picker { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
 .dir-display {
   flex: 1;
   min-width: 0;

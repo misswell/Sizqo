@@ -4,8 +4,13 @@ mod video_commands;
 mod commands;
 pub mod engine;
 mod history;
+pub mod image_capabilities;
+pub mod image_memory;
 mod output_transaction;
+pub mod result_model;
 mod sandbox_access;
+mod source_identity;
+mod source_root;
 mod system_info;
 #[cfg(target_os = "macos")]
 mod system_image;
@@ -561,6 +566,7 @@ pub fn run() {
             commands::open_in_finder,
             commands::read_image_dataurl,
             commands::get_app_version,
+            commands::get_image_capabilities,
             commands::restore_original,
             commands::restore_history_entry,
             commands::export_all,
@@ -697,6 +703,16 @@ pub fn run() {
                             "/" | "/index.html" => "index.html",
                             p => p.trim_start_matches('/'),
                         };
+                        // `Path::starts_with` 只做逐组件前缀比较、不解析 ".."：
+                        // 请求行里的 /../x 拼出的路径仍以资源目录开头，检查通过后
+                        // 由 OS 在读取时解析到目录之外。含 ".." 组件的请求一律拒绝。
+                        if Path::new(file)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                        {
+                            let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                            continue;
+                        }
                         let full_path = dir.join(file);
                         if !full_path.starts_with(&dir) {
                             let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");

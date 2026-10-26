@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tokio::process::Command;
 use serde::{Deserialize, Serialize};
+use crate::result_model::{EncodeVerdict, ReasonCode, ResultOutcome};
 
 #[cfg(feature = "inproc-backends")]
 #[path = "engine_inproc.rs"]
@@ -136,7 +137,7 @@ pub struct CompressOptions {
     pub system_image_size: String,
     #[serde(default = "default_true")]
     pub preserve_metadata: bool,
-    #[serde(default = "default_quality")]
+    #[serde(default = "default_quality", deserialize_with = "deserialize_quality")]
     pub quality: u32,
     #[serde(default = "default_format")]
     pub output_format: String,
@@ -162,6 +163,21 @@ pub struct CompressOptions {
 }
 
 fn default_quality() -> u32 { 75 }
+
+/// IPC 边界就把 quality 拦在 0..=100：放进来再 `as u8` 截断（300 → 44），
+/// 用户得到的是一份从未请求过的质量，还没有任何报错。
+fn deserialize_quality<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u32::deserialize(deserializer)?;
+    if value > 100 {
+        return Err(serde::de::Error::custom(format!(
+            "quality must be within 0..=100, got {value}"
+        )));
+    }
+    Ok(value)
+}
 fn default_processing_mode() -> String { "advanced".into() }
 fn default_system_image_size() -> String { "actual".into() }
 fn default_true() -> bool { true }
@@ -197,6 +213,10 @@ pub struct EngineResult {
     /// 预算搜索的真实结论：命中 true / 阶梯用尽 false / 未请求 None。
     /// 与 `success` 是两件事 —— "压出了有效文件"和"达到了你要的体积"不是同一个承诺。
     pub target_met: Option<bool>,
+    /// §10 Encode 阶段只回答这一件事：交回的是候选、原图字节，还是什么都没交出来。
+    pub encode: EncodeVerdict,
+    /// 引擎这一轮失败或跳过的判据。由知道事实的那个 helper 赋值，调用方不再猜。
+    pub reason: ReasonCode,
 }
 
 impl EngineResult {
@@ -214,7 +234,6 @@ impl EngineResult {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CompressResult {
-    pub success: bool,
     pub file: String,
     pub original_size: u64,
     pub compressed_size: u64,
@@ -248,6 +267,32 @@ pub struct CompressResult {
     /// 空告警序列化为 None，前端可以据此区分"确实没有告警"和"这一版引擎没上报"。
     #[serde(default)]
     pub warnings: Option<Vec<String>>,
+    /// §3 这次任务对用户的最终结论。§139 第四阶段后它是唯一结论，
+    /// 不再有 `success` 旗标与它并存。
+    #[serde(default)]
+    pub outcome: Option<ResultOutcome>,
+    /// §4 结论的理由。前端只读它，不再解析 `error` 文案（§59）。
+    #[serde(default)]
+    pub reason_code: Option<ReasonCode>,
+    /// §73 §77 这次提交对应的历史记录。恢复全部 / 导出历史产物优先按它对齐，
+    /// 不再靠源路径去猜"这条结果对应哪次提交"。
+    #[serde(default)]
+    pub history_id: Option<String>,
+}
+
+/// §6.1 §68 「这一项在磁盘上到底有没有产物」只由结论回答一次。
+///
+/// `output_path` 只是路径字符串：拿它判"有没有文件"，就会出现引擎压出了字节却没落盘、
+/// 事务回滚把产物清掉但路径还在这一类假象。恢复、导出、对比都从这里取判据，
+/// 前端 `result_state.js` 与 Swift `ResultContract` 是同一份规则。
+impl CompressResult {
+    pub fn has_product(&self) -> bool {
+        match self.outcome {
+            Some(outcome) => outcome.carries_output(),
+            // §139 第四阶段：success 已删除，没有结论就不许拿路径猜一个产物。
+            None => false,
+        }
+    }
 }
 
 // ─── Utilities ──────────────────────────────────────────────────
@@ -266,32 +311,74 @@ pub fn get_file_size(path: &Path) -> u64 {
     fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+/// 只读文件头 4 KiB 判定格式。过去这里 `fs::read` 整张图，仅仅为了看前 12 字节：
+/// 一张 200 MB 的 TIFF 会因此被完整读进内存，而结论和 12 字节时一模一样（§63 §64）。
 pub fn detect_image_type(path: &Path) -> String {
-    let buf = match fs::read(path) {
-        Ok(b) => b,
+    use std::io::Read;
+    let mut head = [0u8; 4096];
+    let read = match fs::File::open(path).and_then(|mut file| file.read(&mut head)) {
+        Ok(read) => read,
         Err(_) => return "unknown".into(),
     };
-    let b = if buf.len() >= 12 { &buf[..12] } else { &buf };
-    if b.len() >= 4 && b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47 {
-        "png".into()
-    } else if b.len() >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF {
-        "jpg".into()
-    } else if b.len() >= 3 && b[0] == 0x47 && b[1] == 0x49 && b[2] == 0x46 {
-        "gif".into()
-    } else if b.len() >= 4 && b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46 {
-        "webp".into()
-    } else if b.len() >= 2 && b[0] == 0x42 && b[1] == 0x4D {
-        "bmp".into()
-    } else {
-        // HEIC/HEIF: ftyp box at offset 4
-        if b.len() >= 12 && &b[4..8] == b"ftyp" {
-            let brand = &b[8..12];
-            if brand == b"heic" || brand == b"heix" || brand == b"mif1" || brand == b"hevc" {
-                return "heic".into();
-            }
-        }
-        "unknown".into()
+    detect_image_format(&head[..read]).into()
+}
+
+/// 字节层面的格式判定。编码结果落盘前也要过这一道（§20）：扩展名和 `out_type`
+/// 都是我们自己写的字符串，只有文件头才是字节自己说的话。
+pub fn detect_image_format(bytes: &[u8]) -> &'static str {
+    if bytes.len() >= 8 && bytes[..8] == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
+        return "png";
     }
+    if bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        return "jpg";
+    }
+    if bytes.len() >= 6 && (&bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a") {
+        return "gif";
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return "webp";
+    }
+    if bytes.len() >= 2 && bytes[0] == b'B' && bytes[1] == b'M' {
+        return "bmp";
+    }
+    if bytes.len() >= 4 && (&bytes[..4] == b"II*\0" || &bytes[..4] == b"MM\0*") {
+        return "tiff";
+    }
+    if is_jxl_bytes(bytes) {
+        return "jxl";
+    }
+    if let Some(family) = isobmff_family(bytes) {
+        return family;
+    }
+    "unknown"
+}
+
+fn is_jxl_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0x0A {
+        return true;
+    }
+    const CONTAINER: [u8; 12] = [0, 0, 0, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A];
+    bytes.len() >= 12 && bytes[..12] == CONTAINER
+}
+
+/// AVIF 与 HEIC 都住在 `ftyp` 盒子里，只看主品牌会把带 avif 兼容品牌的 HEIF 判成 HEIC。
+/// 先看主品牌，再扫全部兼容品牌；`mif1` 这种通用主品牌按 HEIC 处理（历史行为）。
+fn isobmff_family(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return None;
+    }
+    let box_size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let end = box_size.clamp(12, bytes.len());
+    let mut brands: Vec<&[u8]> = vec![&bytes[8..12]];
+    brands.extend(bytes[16..end].chunks_exact(4));
+    let has = |ids: &[&[u8]]| brands.iter().any(|brand| ids.contains(brand));
+    if has(&[b"avif", b"avis"]) {
+        return Some("avif");
+    }
+    if has(&[b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs", b"mif1", b"msf1"]) {
+        return Some("heic");
+    }
+    None
 }
 
 fn analyze_quality(path: &Path) -> u32 {
@@ -301,6 +388,11 @@ fn analyze_quality(path: &Path) -> u32 {
     else if size > 1024 * 1024 { 70 }
     else if size > 500 * 1024 { 75 }
     else { 80 }
+}
+
+/// 能力矩阵要如实报告「这台机器此刻有没有这个编码器」。
+pub(crate) fn tool_available(name: &str) -> bool {
+    find_tool(name).is_some()
 }
 
 /// Locate a CLI tool: first from bundled resources, then system PATH.
@@ -381,6 +473,57 @@ fn find_tool(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// 一次编码想要的结果规则。
+///
+/// §18.1 压缩：只有比源文件小才算赢；§18.2 转换：只要产出的是目标格式就提交。
+/// 同一个差异必须写在**编码器内部**，不能交给上层猜 —— 编码器此前自己把大结果丢掉，
+/// 上层再怎么判断都拿不到那份字节。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputRule {
+    /// 只交回比源文件小的候选；否则交回原图字节（KeptOriginal）。
+    BenefitOnly,
+    /// 显式转换：交回目标格式的候选，不再问大小。
+    Convert,
+}
+
+/// 读源文件失败时，绝不许退化成 `Vec::new()`（§58）。
+///
+/// 空字节会让 `original_size = 0`，于是任何输出都"不比原图小"、甚至"已达标"，
+/// 把一次读盘失败伪装成一次成功的判断。这里返回的失败带精确 reasonCode（§59）。
+fn read_source(file: &Path, out_type: &str) -> Result<Vec<u8>, EngineResult> {
+    fs::read(file).map_err(|error| {
+        let reason = match error.kind() {
+            std::io::ErrorKind::NotFound => ReasonCode::SourceNotFound,
+            std::io::ErrorKind::PermissionDenied => ReasonCode::PermissionDenied,
+            _ => ReasonCode::SourceReadFailed,
+        };
+        let mut result = rejected(
+            Vec::new(),
+            out_type,
+            "none",
+            reason,
+            format!("读不到源文件：{error}"),
+        );
+        result.encode = EncodeVerdict::Failed;
+        result.success = false;
+        result
+    })
+}
+
+/// 显式转换拿不到目标格式时的失败。它不能落回 `KeptOriginal`：
+/// "没换成"是一条失败，不是"没收益"，更不是"转换成功"。
+fn conversion_failed(original: Vec<u8>, out_type: &str, detail: impl Into<String>) -> EngineResult {
+    let mut result = rejected(
+        original,
+        out_type,
+        "none",
+        ReasonCode::EncodeFailed,
+        detail,
+    );
+    result.encode = EncodeVerdict::Failed;
+    result
+}
+
 fn make_engine_result(
     _original_size: u64,
     data: Vec<u8>,
@@ -394,17 +537,23 @@ fn make_engine_result(
         out_type: out_type.into(),
         algorithm: algorithm.into(),
         error: None,
+        encode: EncodeVerdict::Candidate,
         ..Default::default()
     }
 }
 
-fn fallback_engine(original: Vec<u8>, out_type: &str, algorithm: &str, error: &str) -> EngineResult {
+/// 这一轮**没有交出行得过的候选**：格式不支持、输入认不出来。
+/// 它和"编码时坏了"（`EncodeVerdict::Failed`，见 `system_image::fail`）是两件事：
+/// 前者是"这件事我们不做"，后者是"做的时候坏了"。
+fn rejected(original: Vec<u8>, out_type: &str, algorithm: &str, reason: ReasonCode, error: impl Into<String>) -> EngineResult {
     EngineResult {
         success: false,
         compressed: original,
         out_type: out_type.into(),
         algorithm: algorithm.into(),
         error: Some(error.into()),
+        encode: EncodeVerdict::Rejected,
+        reason,
         ..Default::default()
     }
 }
@@ -417,20 +566,148 @@ fn no_improvement(original: Vec<u8>, out_type: &str, algorithm: &str, orig_size:
         "压缩后体积未减小".into()
     };
     EngineResult {
-        success: true,  // 不算失败，只是没有优化空间
+        // 「没有优化空间」从来不是压缩成功：交回的是原图字节，判据必须说清是哪一种。
+        // `success` 迁移期保持 true（旧调用方拿它当"没坏"读），最终结论只看 outcome。
+        success: true,
         compressed: original,
         out_type: out_type.into(),
         algorithm: algorithm.into(),
         error: Some(msg),
+        encode: EncodeVerdict::KeptOriginal,
+        reason: if comp_size > orig_size {
+            ReasonCode::OutputLargerThanSource
+        } else {
+            ReasonCode::NoSizeReduction
+        },
         ..Default::default()
     }
 }
 
 /// 「保留原图」这一支交回的字节就是**源文件本身**，所以 out_type 必须写源格式。
 /// 写目标格式会让落盘按 `.avif` 之类的扩展名存下 PNG 字节 —— 文件打不开，历史也救不回来。
-fn kept_original(file: &Path, original: Vec<u8>, algorithm: &str, orig_size: u64, comp_size: u64) -> EngineResult {
-    let source_type = detect_image_type(file);
-    no_improvement(original, &source_type, algorithm, orig_size, comp_size)
+fn kept_original(original: Vec<u8>, algorithm: &str, orig_size: u64, comp_size: u64) -> EngineResult {
+    // 标签只能跟着**交回的字节**走。working file 可能是 PNG 中间文件，按路径猜格式
+    // 会让一张缩放过的 WebP 被标成 PNG，落盘时扩展名跟着错。
+    let source_type = detect_image_format(&original);
+    no_improvement(original, source_type, algorithm, orig_size, comp_size)
+}
+
+// ─── 动画保护（§23） ────────────────────────────────────────────
+
+/// 源文件是否是动画，以及是哪一种。`None` = 可以按单帧处理。
+fn animated_source(bytes: &[u8], source_type: &str) -> Option<&'static str> {
+    match source_type {
+        "gif" => {
+            // 解析失败时按动画处理：宁可拒绝一次转换，也不静默丢掉后面的帧。
+            if gif_frame_count(bytes).map(|count| count > 1).unwrap_or(true) {
+                Some("GIF 动画")
+            } else {
+                None
+            }
+        }
+        "png" => {
+            if apng_is_animated(bytes) {
+                Some("APNG 动画")
+            } else {
+                None
+            }
+        }
+        "webp" => {
+            if webp_is_animated(bytes) {
+                Some("动画 WebP")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 静态目标格式遇到动画输入时的拒收原话。调用方负责把原图字节原样交回。
+fn animation_rejection(bytes: &[u8], target_label: &str) -> Option<String> {
+    let source_type = detect_image_format(bytes);
+    animated_source(bytes, source_type).map(|kind| {
+        format!(
+            "{kind} 不能输出为 {target_label}（只能保留第一帧）。已拒绝这次降级，原文件未改动"
+        )
+    })
+}
+
+fn apng_is_animated(bytes: &[u8]) -> bool {
+    let Some(actl) = bytes.windows(4).position(|window| window == b"acTL") else {
+        return false;
+    };
+    let idat = bytes
+        .windows(4)
+        .position(|window| window == b"IDAT")
+        .unwrap_or(bytes.len());
+    if actl >= idat || actl + 12 > bytes.len() {
+        return false;
+    }
+    let frames = u32::from_be_bytes([
+        bytes[actl + 4],
+        bytes[actl + 5],
+        bytes[actl + 6],
+        bytes[actl + 7],
+    ]);
+    frames > 1
+}
+
+fn webp_is_animated(bytes: &[u8]) -> bool {
+    if bytes.len() >= 21 && &bytes[12..16] == b"VP8X" && (bytes[20] & 0x02) != 0 {
+        return true;
+    }
+    let keep = bytes.len().min(1024 * 1024);
+    bytes[..keep]
+        .windows(4)
+        .any(|tag| tag == b"ANIM" || tag == b"ANMF")
+}
+
+/// 只解析块结构、不解码像素：GIF 的帧数在文件头里，没必要为它解一张大图。
+fn gif_frame_count(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 13 || &bytes[..3] != b"GIF" {
+        return None;
+    }
+    let mut pos = 13usize;
+    let global_flags = bytes[10];
+    if global_flags & 0x80 != 0 {
+        pos = pos.checked_add(3 * (1usize << ((global_flags & 0x07) + 1)))?;
+    }
+    let skip_sub_blocks = |mut cursor: usize| -> Option<usize> {
+        loop {
+            let size = *bytes.get(cursor)? as usize;
+            cursor = cursor.checked_add(1)?;
+            if size == 0 {
+                return Some(cursor);
+            }
+            cursor = cursor.checked_add(size)?;
+        }
+    };
+    let mut frames = 0usize;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            0x3B => return Some(frames),
+            0x21 => {
+                // extension: block label + sub-blocks
+                pos = skip_sub_blocks(pos.checked_add(2)?)?;
+            }
+            0x2C => {
+                frames += 1;
+                if pos + 10 > bytes.len() {
+                    return None;
+                }
+                let local_flags = bytes[pos + 9];
+                pos += 10;
+                if local_flags & 0x80 != 0 {
+                    pos = pos.checked_add(3 * (1usize << ((local_flags & 0x07) + 1)))?;
+                }
+                pos = pos.checked_add(1)?; // LZW minimum code size
+                pos = skip_sub_blocks(pos)?;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Run a CLI tool that writes to an output file, then read the output.
@@ -454,10 +731,17 @@ async fn cli_to_file(
 
 // ─── PNG ────────────────────────────────────────────────────────
 
-async fn compress_png(file: &Path, options: &CompressOptions) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
+async fn compress_png(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "png") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
+    if let Some(message) = animation_rejection(&original, "PNG") {
+        return rejected(original, "png", "none", ReasonCode::UnsupportedFormat, message);
+    }
     let quality = options.quality;
+    let acceptable = |size: usize| rule == OutputRule::Convert || (size as u64) < original_size;
 
     // 1. pngquant (lossy)
     if let Some(tool) = find_tool("pngquant") {
@@ -476,7 +760,7 @@ async fn compress_png(file: &Path, options: &CompressOptions) -> EngineResult {
                 file.to_string_lossy().into(),
             ];
             if let Some(data) = cli_to_file(&tool, &args, &out).await {
-                if (data.len() as u64) < original_size {
+                if acceptable(data.len()) {
                     return make_engine_result(original_size, data, "png", "pngquant");
                 }
             }
@@ -499,7 +783,7 @@ async fn compress_png(file: &Path, options: &CompressOptions) -> EngineResult {
             let _ = make_command(&tool).args(&args).stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null()).status().await;
             if let Ok(data) = fs::read(&out) {
-                if !data.is_empty() && (data.len() as u64) < original_size {
+                if !data.is_empty() && acceptable(data.len()) {
                     return make_engine_result(original_size, data, "png", "oxipng");
                 }
             }
@@ -508,12 +792,17 @@ async fn compress_png(file: &Path, options: &CompressOptions) -> EngineResult {
 
     // 3. image crate fallback (lossless re-encode, best compression)
     if let Some(data) = compress_png_with_image(file) {
-        if (data.len() as u64) < original_size {
+        if acceptable(data.len()) {
             return make_engine_result(original_size, data, "png", "image-png");
         }
     }
 
-    kept_original(file, original, "pngquant", original_size, original_size)
+    match rule {
+        OutputRule::BenefitOnly => kept_original(original, "pngquant", original_size, original_size),
+        OutputRule::Convert => {
+            conversion_failed(original, "png", "没能产出 PNG：所有编码器都没有交回有效字节")
+        }
+    }
 }
 
 fn compress_png_with_image(file: &Path) -> Option<Vec<u8>> {
@@ -534,10 +823,17 @@ fn compress_png_with_image(file: &Path) -> Option<Vec<u8>> {
 
 // ─── JPEG ───────────────────────────────────────────────────────
 
-async fn compress_jpg(file: &Path, options: &CompressOptions) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
+async fn compress_jpg(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "jpg") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
+    if let Some(message) = animation_rejection(&original, "JPEG") {
+        return rejected(original, "jpg", "none", ReasonCode::UnsupportedFormat, message);
+    }
     let quality = options.quality;
+    let acceptable = |size: usize| rule == OutputRule::Convert || (size as u64) < original_size;
 
     // 1. cjpeg (mozjpeg) via PPM pipe: decode with image crate, encode with mozjpeg
     if let Some(tool) = find_tool("cjpeg") {
@@ -565,7 +861,7 @@ async fn compress_jpg(file: &Path, options: &CompressOptions) -> EngineResult {
                     let _ = stdin.write_all(&ppm).await;
                 }
                 if let Ok(output) = child.wait_with_output().await {
-                    if !output.stdout.is_empty() && (output.stdout.len() as u64) < original_size {
+                    if !output.stdout.is_empty() && acceptable(output.stdout.len()) {
                         return make_engine_result(original_size, output.stdout, "jpg", "mozjpeg");
                     }
                 }
@@ -575,12 +871,17 @@ async fn compress_jpg(file: &Path, options: &CompressOptions) -> EngineResult {
 
     // 2. image crate fallback (decode + re-encode)
     if let Some(data) = compress_jpg_with_image(file, quality as u8) {
-        if (data.len() as u64) < original_size {
+        if acceptable(data.len()) {
             return make_engine_result(original_size, data, "jpg", "image-jpeg");
         }
     }
 
-    kept_original(file, original, "mozjpeg", original_size, original_size)
+    match rule {
+        OutputRule::BenefitOnly => kept_original(original, "mozjpeg", original_size, original_size),
+        OutputRule::Convert => {
+            conversion_failed(original, "jpg", "没能产出 JPEG：所有编码器都没有交回有效字节")
+        }
+    }
 }
 
 fn compress_jpg_with_image(file: &Path, quality: u8) -> Option<Vec<u8>> {
@@ -597,10 +898,14 @@ fn compress_jpg_with_image(file: &Path, quality: u8) -> Option<Vec<u8>> {
 
 // ─── GIF ────────────────────────────────────────────────────────
 
-async fn compress_gif(file: &Path, options: &CompressOptions) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
+async fn compress_gif(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "gif") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
     let quality = options.quality;
+    let acceptable = |size: usize| rule == OutputRule::Convert || (size as u64) < original_size;
 
     if let Some(tool) = find_tool("gifsicle") {
         let tmp = tempfile::tempdir().ok();
@@ -616,23 +921,36 @@ async fn compress_gif(file: &Path, options: &CompressOptions) -> EngineResult {
                 file.to_string_lossy().into(),
             ];
             if let Some(data) = cli_to_file(&tool, &args, &out).await {
-                if (data.len() as u64) < original_size {
+                if acceptable(data.len()) {
                     return make_engine_result(original_size, data, "gif", "gifsicle");
                 }
             }
         }
     }
 
-    // No good image-crate fallback for GIF animation; return original
-    kept_original(file, original, "gifsicle", original_size, original_size)
+    // 没有 gifsicle 时进程内重编码只会取第一帧；这里宁可保留原图，
+    // 也不产出一个"看起来成功、其实动画没了"的 GIF（§23）。
+    match rule {
+        OutputRule::BenefitOnly => kept_original(original, "gifsicle", original_size, original_size),
+        OutputRule::Convert => {
+            conversion_failed(original, "gif", "没有可用的 GIF 编码器，无法在保留动画的前提下转换")
+        }
+    }
 }
 
 // ─── WebP ───────────────────────────────────────────────────────
 
-async fn compress_to_webp(file: &Path, options: &CompressOptions) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
+async fn compress_to_webp(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "webp") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
+    if let Some(message) = animation_rejection(&original, "WebP") {
+        return rejected(original, "webp", "none", ReasonCode::UnsupportedFormat, message);
+    }
     let quality = options.quality;
+    let acceptable = |size: usize| rule == OutputRule::Convert || (size as u64) < original_size;
 
     if let Some(tool) = find_tool("cwebp") {
         let tmp = tempfile::tempdir().ok();
@@ -647,22 +965,34 @@ async fn compress_to_webp(file: &Path, options: &CompressOptions) -> EngineResul
                 file.to_string_lossy().into(),
             ];
             if let Some(data) = cli_to_file(&tool, &args, &out).await {
-                if (data.len() as u64) < original_size {
+                if acceptable(data.len()) {
                     return make_engine_result(original_size, data, "webp", "cwebp");
                 }
             }
         }
     }
 
-    kept_original(file, original, "cwebp", original_size, original_size)
+    match rule {
+        OutputRule::BenefitOnly => kept_original(original, "cwebp", original_size, original_size),
+        OutputRule::Convert => {
+            conversion_failed(original, "webp", "没能产出 WebP：cwebp 没有交回有效字节")
+        }
+    }
 }
 
 // ─── AVIF ───────────────────────────────────────────────────────
 
-async fn compress_to_avif(file: &Path, options: &CompressOptions) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
+async fn compress_to_avif(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "avif") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
+    if let Some(message) = animation_rejection(&original, "AVIF") {
+        return rejected(original, "avif", "none", ReasonCode::UnsupportedFormat, message);
+    }
     let quality = options.quality;
+    let acceptable = |size: usize| rule == OutputRule::Convert || (size as u64) < original_size;
 
     if let Some(tool) = find_tool("avifenc") {
         let tmp = tempfile::tempdir().ok();
@@ -677,66 +1007,95 @@ async fn compress_to_avif(file: &Path, options: &CompressOptions) -> EngineResul
                 file.to_string_lossy().into(),
             ];
             if let Some(data) = cli_to_file(&tool, &args, &out).await {
-                // Format conversion: return AVIF data even if larger than original
-                return make_engine_result(original_size, data, "avif", "avifenc");
+                if acceptable(data.len()) {
+                    return make_engine_result(original_size, data, "avif", "avifenc");
+                }
             }
         }
     }
 
-    kept_original(file, original, "avifenc", original_size, original_size)
+    match rule {
+        OutputRule::BenefitOnly => kept_original(original, "avifenc", original_size, original_size),
+        OutputRule::Convert => {
+            conversion_failed(original, "avif", "没能产出 AVIF：avifenc 没有交回有效字节")
+        }
+    }
 }
 
 // ─── HEIC ───────────────────────────────────────────────────────
 
-async fn compress_heic(file: &Path, options: &CompressOptions) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
-    let original_size = original.len() as u64;
+/// 用 macOS 自带的 sips 直接写 HEIC。
+///
+/// 旧实现先把 HEIF 转成 JPEG 再"当作压缩结果"，于是用户请求 HEIF 却拿到一张 JPEG：
+/// 扩展名写着 .heic、字节是 JFIF —— 两边都打不开（§19）。sips 能写 `public.heic`，
+/// 这里只接受**字节真的是 HEIC** 的结果，JPEG 冒充一律不认。
+async fn sips_heic_bytes(file: &Path, quality: u32) -> Option<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        let tmp = tempfile::tempdir().ok()?;
+        let out = tmp.path().join("out.heic");
+        let quality = quality.to_string();
+        let output = tokio::process::Command::new("/usr/bin/sips")
+            .args(["-s", "format", "heic", "-s", "formatOptions", &quality])
+            .arg(file)
+            .arg("--out")
+            .arg(&out)
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let data = fs::read(&out).ok().filter(|bytes| !bytes.is_empty())?;
+        (detect_image_format(&data) == "heic").then_some(data)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (file, quality);
+        None
+    }
+}
 
-    let tmp = tempfile::tempdir().ok();
-    if let Some(ref td) = tmp {
-        let jpeg_path = td.path().join("converted.jpg");
-        let output = tokio::process::Command::new("sips")
-            .arg("-s").arg("format").arg("jpeg")
-            .arg(file).arg("--out").arg(&jpeg_path)
-            .output().await;
-        if let Ok(out) = output {
-            if out.status.success() && jpeg_path.exists() {
-                let mut opts = options.clone();
-                opts.output_format = "original".into();
-                // If target format specified, convert the JPEG intermediate directly
-                match options.output_format.as_str() {
-                    "webp" => return compress_to_webp(&jpeg_path, &opts).await,
-                    "avif" => return compress_to_avif(&jpeg_path, &opts).await,
-                    "png" => return compress_png(&jpeg_path, &opts).await,
-                    "jpg" | "jpeg" => return compress_jpg(&jpeg_path, &opts).await,
-                    _ => {}
-                }
-                // No specific format: compress as JPEG
-                let r = compress_jpg(&jpeg_path, &opts).await;
-                if r.success {
-                    return EngineResult {
-                        success: true, compressed: r.compressed,
-                        out_type: "jpg".into(), algorithm: format!("sips+{}", r.algorithm),
-                        error: r.error, warnings: r.warnings,
-                        ..Default::default()
-                    };
-                }
-                let data = fs::read(&jpeg_path).unwrap_or_default();
-                if !data.is_empty() {
-                    return make_engine_result(original_size, data, "jpg", "sips");
-                }
-            }
+async fn compress_heic(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "heic") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
+    let original_size = original.len() as u64;
+    if let Some(message) = animation_rejection(&original, "HEIC") {
+        return rejected(original, "heic", "none", ReasonCode::UnsupportedFormat, message);
+    }
+    // quality 0 是"由引擎推测"的旧约定；HEIC 编码器没有推测档，给一个稳妥的 75。
+    let quality = if options.quality == 0 { 75 } else { options.quality.min(100) };
+    let acceptable = |size: usize| rule == OutputRule::Convert || (size as u64) < original_size;
+
+    if let Some(data) = sips_heic_bytes(file, quality).await {
+        if acceptable(data.len()) {
+            return make_engine_result(original_size, data, "heic", "sips-heic");
         }
     }
-    kept_original(file, original, "sips", original_size, original_size)
+
+    match rule {
+        OutputRule::BenefitOnly => kept_original(original, "sips-heic", original_size, original_size),
+        OutputRule::Convert => {
+            conversion_failed(original, "heic", "没能产出 HEIC：sips 没有交回有效的 HEIC 字节")
+        }
+    }
 }
 
 // ─── JPEG XL ────────────────────────────────────────────────────
 
-async fn compress_to_jxl(file: &Path, options: &CompressOptions) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
+async fn compress_to_jxl(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "jxl") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
+    if let Some(message) = animation_rejection(&original, "JPEG XL") {
+        return rejected(original, "jxl", "none", ReasonCode::UnsupportedFormat, message);
+    }
     let quality = options.quality;
+    let acceptable = |size: usize| rule == OutputRule::Convert || (size as u64) < original_size;
 
     if let Some(tool) = find_tool("cjxl") {
         let tmp = tempfile::tempdir().ok();
@@ -752,14 +1111,19 @@ async fn compress_to_jxl(file: &Path, options: &CompressOptions) -> EngineResult
                 out.to_string_lossy().into(),
             ];
             if let Some(data) = cli_to_file(&tool, &args, &out).await {
-                if (data.len() as u64) < original_size {
+                if acceptable(data.len()) {
                     return make_engine_result(original_size, data, "jxl", "cjxl");
                 }
             }
         }
     }
 
-    kept_original(file, original, "cjxl", original_size, original_size)
+    match rule {
+        OutputRule::BenefitOnly => kept_original(original, "cjxl", original_size, original_size),
+        OutputRule::Convert => {
+            conversion_failed(original, "jxl", "没能产出 JPEG XL：cjxl 没有交回有效字节")
+        }
+    }
 }
 
 // ─── Dimension cap (maxDimensionPx) ─────────────────────────────
@@ -990,19 +1354,29 @@ fn flatten_onto_white(rgba: &image::RgbaImage) -> image::RgbImage {
 }
 
 /// 同一格式的不同写法（jpeg/jpg、heif/heic）不能被判成"格式转换"。
-fn same_kind(a: &str, b: &str) -> bool {
-    fn normalize(s: &str) -> &str {
-        match s {
-            "jpeg" => "jpg",
-            "heif" => "heic",
-            other => other,
-        }
+fn canonical_format(s: &str) -> &str {
+    match s {
+        "jpeg" => "jpg",
+        "heif" => "heic",
+        other => other,
     }
-    normalize(a) == normalize(b)
+}
+
+pub(crate) fn same_kind(a: &str, b: &str) -> bool {
+    canonical_format(a) == canonical_format(b)
+}
+
+/// 用户明确要求的容器（`original` 解析成本次源文件的格式）。
+pub(crate) fn requested_format<'a>(source_type: &'a str, options: &'a CompressOptions) -> &'a str {
+    if options.output_format == "original" || options.output_format.is_empty() {
+        source_type
+    } else {
+        canonical_format(&options.output_format)
+    }
 }
 
 /// 用户是否明确要求换一个容器 —— 只有非转换才适用"不比原图小就不是赢"（规则 7）。
-fn is_format_conversion(file: &Path, options: &CompressOptions) -> bool {
+pub(crate) fn is_format_conversion(file: &Path, options: &CompressOptions) -> bool {
     options.output_format != "original" && !same_kind(&options.output_format, &detect_image_type(file))
 }
 
@@ -1022,12 +1396,32 @@ fn settle_working_file(
     if working.resized {
         let encoded_size = result.compressed.len() as u64;
         let conversion = is_format_conversion(original_file, options);
-        let not_a_win = !result.success
-            || result.error.is_some()
+        // §140：编码器明确失败或不接这个格式时，失败必须原样上报。把它改写成
+        // "已保留原图"就是把一次真实的坏掉上报成一次成功的处理。
+        if matches!(
+            result.encode,
+            EncodeVerdict::Rejected | EncodeVerdict::Failed | EncodeVerdict::Cancelled
+        ) {
+            return result;
+        }
+        // 判据读的是引擎交回的字节属于哪一种事实，不是读 error 文案有没有值 ——
+        // 后者会让"一句提示"和"一次失败"在同一个 if 里长得一模一样。
+        let not_a_win = result.encode == EncodeVerdict::KeptOriginal
             || (!conversion && encoded_size >= get_file_size(original_file));
         if not_a_win {
             // 编码器没产出有意义的结果时，交回的是**用户原图**，不是我那个缩放中间文件。
-            let original = fs::read(original_file).unwrap_or_default();
+            // §58：读不到原图就是读不到，绝不能拿"0 字节的原图"往下判"没收益"。
+            let original = match fs::read(original_file) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    result.encode = EncodeVerdict::Failed;
+                    result.reason = ReasonCode::SourceReadFailed;
+                    result.success = false;
+                    result.compressed = Vec::new();
+                    result.error = Some(format!("保留原图时读不到源文件：{error}"));
+                    return result;
+                }
+            };
             let original_size = original.len() as u64;
             let cap = options.max_dimension_px.unwrap_or_default();
             let algorithm = std::mem::take(&mut result.algorithm);
@@ -1044,8 +1438,7 @@ fn settle_working_file(
     // 规则 11：重编码像素的通路必须说明元数据去向。系统转换是唯一保留元数据的路径。
     if options.preserve_metadata
         && options.processing_mode != "system"
-        && result.success
-        && result.error.is_none()
+        && result.encode == EncodeVerdict::Candidate
     {
         result.warnings.push(METADATA_WARNING.to_string());
     }
@@ -1067,9 +1460,16 @@ pub(crate) fn budget_ladder(user_cap: Option<u32>) -> Vec<(Option<u32>, u32)> {
         (Some(1920), 60),
         (Some(1280), 55),
     ];
-    RAW.into_iter()
-        .map(|(cap, quality)| (merge_cap(user_cap, cap), quality))
-        .collect()
+    let mut rungs: Vec<(Option<u32>, u32)> = Vec::with_capacity(RAW.len());
+    for (cap, quality) in RAW {
+        let merged = (merge_cap(user_cap, cap), quality);
+        // §60：用户上限把不同档位压成同一组参数后，只编码一次。
+        // 去重按**完整参数对**——同一尺寸下 65/60/55 仍是三次不同的尝试。
+        if !rungs.contains(&merged) {
+            rungs.push(merged);
+        }
+    }
+    rungs
 }
 
 fn merge_cap(user: Option<u32>, rung: Option<u32>) -> Option<u32> {
@@ -1080,23 +1480,47 @@ fn merge_cap(user: Option<u32>, rung: Option<u32>) -> Option<u32> {
     }
 }
 
+fn cancelled_result(out_type: &str) -> EngineResult {
+    EngineResult {
+        success: false,
+        compressed: Vec::new(),
+        out_type: canonical_format(out_type).into(),
+        algorithm: "指定体积".into(),
+        error: Some("指定体积搜索在两次编码之间被取消，没有交回任何候选".into()),
+        encode: EncodeVerdict::Cancelled,
+        reason: ReasonCode::Cancelled,
+        ..Default::default()
+    }
+}
+
 /// 有界的指定体积搜索。
 ///
-/// 三条硬规则：**原图已在预算内就不重编码**；**命中即停**；
-/// **没命中时返回全程最小的有效候选 + targetMet=false + 把实际达到的体积和预算都说出去**。
-/// 比原图还大的输出永远不算赢（规则 7），它只会被记录下来、不会进结果。
+/// 三条硬规则：**压缩时原图已在预算内就不重编码**；**命中即停**；
+/// **没命中时交回全程最小的有效候选 + targetMet=false + 把实际达到的体积和预算都说出去**。
+///
+/// 显式转换（`OutputRule::Convert`）不适用规则 7：用户要的是容器，即使更大也提交；
+/// 但预算仍然是一份真承诺，没达到就如实标 `target_met=false`。
+///
+/// §61 §62：失败不再伪装成"没收益"；取消不再是"最接近的结果"——
+/// 两次编码之间一看到取消就丢下所有候选返回 `Cancelled`，一个字节都不许落盘。
 async fn solve_to_budget(
     file: &Path,
     options: &CompressOptions,
     budget: u64,
+    rule: OutputRule,
+    source_type: &str,
     cancel: &(dyn Fn() -> bool + Send + Sync),
 ) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
+    let original = match read_source(file, source_type) {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
-    let source_type = detect_image_type(file);
 
-    if original_size <= budget {
-        let mut result = no_improvement(original.clone(), &source_type, "指定体积", original_size, original_size);
+    if rule == OutputRule::BenefitOnly && original_size <= budget {
+        let mut result = no_improvement(original, source_type, "指定体积", original_size, original_size);
+        // 这一支压根没进编码：原图已经在用户要的体积之内。它不是"压完没收益"。
+        result.reason = ReasonCode::AlreadyUnderTarget;
         result.target_bytes = Some(budget);
         result.target_met = Some(true);
         result.warnings.push(format!(
@@ -1108,14 +1532,15 @@ async fn solve_to_budget(
     let rungs = budget_ladder(options.max_dimension_px);
     let mut attempts = 0usize;
     let mut best: Option<EngineResult> = None;
-    let mut aborted = false;
+    // 引擎明确失败/拒收时留住最后一次事实：全部失败不能降级成"没有收益"（§61）。
+    let mut last_failure: Option<EngineResult> = None;
+    let mut produced_unusable = false;
 
     for (cap, quality) in rungs.into_iter().take(BUDGET_ATTEMPT_LIMIT) {
         // 取消/停止落在两次编码之间：已经开跑的那一次让它做完（中途 kill 会留下
-        // 半成品临时文件和悬空事务），但绝不再启动新的 —— 6 次搜索因此仍可中断。
+        // 半成品临时文件和悬空事务），但绝不再启动新的 —— 搜索因此仍可中断。
         if cancel() {
-            aborted = true;
-            break;
+            return cancelled_result(source_type);
         }
         let mut rung = options.clone();
         rung.max_output_bytes = None; // 递归闸门：搜索内部只许走一次编码
@@ -1123,13 +1548,27 @@ async fn solve_to_budget(
         rung.max_dimension_px = cap;
         attempts += 1;
 
-        let candidate = compress_core(file, &rung).await;
-        if !candidate.success || candidate.compressed.is_empty() {
-            continue;
+        let candidate = compress_core(file, &rung, rule, source_type).await;
+        // 候选之间也要问一次：编码可能跑了几十秒，期间用户完全可能已经取消。
+        if cancel() {
+            return cancelled_result(source_type);
+        }
+        match candidate.encode {
+            EncodeVerdict::Candidate if !candidate.compressed.is_empty() => {}
+            EncodeVerdict::Rejected | EncodeVerdict::Failed => {
+                last_failure = Some(candidate);
+                continue;
+            }
+            _ => {
+                produced_unusable = true;
+                continue;
+            }
         }
         let size = candidate.compressed.len() as u64;
-        if size >= original_size {
-            continue; // 规则 7：比原图大的输出不是赢，不能当候选交给用户
+        if rule == OutputRule::BenefitOnly && size >= original_size {
+            // 规则 7：比原图大的输出不是赢。但"产出过、只是不划算"和"根本没产出"不同。
+            produced_unusable = true;
+            continue;
         }
         let is_improvement = best
             .as_ref()
@@ -1145,14 +1584,30 @@ async fn solve_to_budget(
 
     let mut result = match best {
         Some(candidate) => candidate,
-        None => {
-            let mut kept = no_improvement(original, &source_type, "指定体积", original_size, original_size);
-            kept.warnings.push(format!(
-                "指定体积 {budget} 未达到：{attempts} 次尝试里没有任何一档产出比原图 {original} 更小的有效文件，已保留原图",
-                budget = format_bytes(budget), original = format_bytes(original_size)
-            ));
-            kept
-        }
+        None => match last_failure {
+            // 没有任何一档交回字节：把引擎的真实失败原样上报，不写成"已保留原图"。
+            Some(mut failure) => {
+                failure.target_bytes = Some(budget);
+                failure.target_met = Some(false);
+                failure.warnings.push(format!(
+                    "指定体积搜索的 {attempts} 次尝试全部失败，没有可以交回的文件"
+                ));
+                failure
+            }
+            None => {
+                let mut kept = no_improvement(original, source_type, "指定体积", original_size, original_size);
+                kept.warnings.push(format!(
+                    "指定体积 {want} 未达到：{attempts} 次尝试里没有任何一档产出比原图 {original} 更小、且可用的文件，已保留原图",
+                    want = format_bytes(budget), original = format_bytes(original_size)
+                ));
+                if produced_unusable {
+                    kept.warnings.push(
+                        "这些尝试确实产出过文件，但都不比原图小（或没有交回有效字节），因此没有提交".into(),
+                    );
+                }
+                kept
+            }
+        },
     };
     let achieved = result.compressed.len() as u64;
     result.target_bytes = Some(budget);
@@ -1162,12 +1617,6 @@ async fn solve_to_budget(
             "指定体积 {want} 未达到：最激进的一档也只压到 {got}（已给出这次真正产出的最小文件，不能当作达成目标）",
             want = format_bytes(budget), got = format_bytes(achieved)
         ));
-    }
-    if aborted {
-        result.warnings.push(format!(
-            "指定体积搜索被取消/停止中断：只做完了 {attempts}/{} 档", BUDGET_ATTEMPT_LIMIT
-        ));
-        result.target_met = Some(false);
     }
     result
 }
@@ -1183,8 +1632,12 @@ fn convert_with_system(file: &Path, options: &CompressOptions, target: &str) -> 
 
 #[cfg(not(target_os = "macos"))]
 fn convert_with_system(file: &Path, _options: &CompressOptions, target: &str) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
-    fallback_engine(original, target, "system", "系统转换仅支持 macOS")
+    // 读源失败要报 source_read_failed，不能把空字节当成"格式不支持"的证据。
+    let original = match read_source(file, target) {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
+    rejected(original, target, "system", ReasonCode::UnsupportedFormat, "系统转换仅支持 macOS")
 }
 
 /// 系统转换（macOS ImageIO）路径。
@@ -1224,50 +1677,87 @@ fn budget_request(options: &CompressOptions) -> Option<u64> {
 /// （见 AGENTS.md 强制规则 1-3）。`allow` 挂在 fn 上而不是语句上，cfg 消除 return 时
 /// 属性不会跟着消失。
 #[allow(unreachable_code)]
-async fn encode_source(file: &Path, options: &CompressOptions) -> EngineResult {
+async fn encode_source(
+    file: &Path,
+    options: &CompressOptions,
+    rule: OutputRule,
+    source_type: &str,
+) -> EngineResult {
     // App Store 产物线：路由到进程内实现（尺寸上限已经在 prepare_working_file 里兑现，
     // 传进来的就是那个已经处理好的工作文件）。
     #[cfg(feature = "inproc-backends")]
-    return engine_inproc::compress_image(file, options).await;
+    return engine_inproc::compress_image(file, options, rule, source_type).await;
 
     if options.output_format != "original" {
-        return route_to_format(file, &options.output_format, options).await;
+        return route_to_format(file, &options.output_format, options, rule).await;
     }
-    let img_type = detect_image_type(file);
-    match img_type.as_str() {
-        "png" => compress_png(file, options).await,
-        "jpg" => compress_jpg(file, options).await,
-        "gif" => compress_gif(file, options).await,
-        "webp" => compress_to_webp(file, options).await,
-        "heic" => compress_heic(file, options).await,
+    match source_type {
+        "png" => compress_png(file, options, rule).await,
+        "jpg" => compress_jpg(file, options, rule).await,
+        "gif" => compress_gif(file, options, rule).await,
+        "webp" => compress_to_webp(file, options, rule).await,
+        "heic" => compress_heic(file, options, rule).await,
         _ => {
-            let original = fs::read(file).unwrap_or_default();
-            fallback_engine(original, &img_type, "none", &format!("Unsupported image type: {}", img_type))
+            // 读源文件失败必须说"读不到"，不能把它伪装成"不支持这个格式"（§58 §59）。
+            let original = match read_source(file, source_type) {
+                Ok(bytes) => bytes,
+                Err(failure) => return failure,
+            };
+            rejected(
+                original,
+                source_type,
+                "none",
+                ReasonCode::UnsupportedFormat,
+                format!("这个格式暂不支持原地压缩：{source_type}"),
+            )
         }
     }
 }
 
 /// 显式目标格式的路由（原先写在 `compress_to_format` 里的那个 match）。
-async fn route_to_format(file: &Path, target: &str, options: &CompressOptions) -> EngineResult {
+async fn route_to_format(
+    file: &Path,
+    target: &str,
+    options: &CompressOptions,
+    rule: OutputRule,
+) -> EngineResult {
     match target {
-        "webp" => compress_to_webp(file, options).await,
-        "avif" => compress_to_avif(file, options).await,
-        "jxl" => compress_to_jxl(file, options).await,
-        "jpg" | "jpeg" => compress_jpg(file, options).await,
-        "png" => compress_png(file, options).await,
-        "heic" | "heif" => compress_heic(file, options).await,
+        "webp" => compress_to_webp(file, options, rule).await,
+        "avif" => compress_to_avif(file, options, rule).await,
+        "jxl" => compress_to_jxl(file, options, rule).await,
+        "jpg" | "jpeg" => compress_jpg(file, options, rule).await,
+        "png" => compress_png(file, options, rule).await,
+        "heic" | "heif" => compress_heic(file, options, rule).await,
+        "gif" => compress_gif(file, options, rule).await,
         _ => {
-            let original = fs::read(file).unwrap_or_default();
-            fallback_engine(original, target, "none", &format!("Unsupported target format: {}", target))
+            let original = match read_source(file, target) {
+                Ok(bytes) => bytes,
+                Err(failure) => return failure,
+            };
+            rejected(
+                original,
+                target,
+                "none",
+                ReasonCode::UnsupportedFormat,
+                format!("不支持的目标格式：{target}"),
+            )
         }
     }
 }
 
 /// 单文件的一次完整压缩：尺寸上限 → 编码器 → 用**原图**复核结果。
-async fn compress_core(file: &Path, options: &CompressOptions) -> EngineResult {
+///
+/// `source_type` 是**用户原图**的逻辑格式。工作文件为了缩放可能被写成 PNG，
+/// 但最终输出必须仍按原格式路由 —— 否则 WebP 会被悄悄变成 PNG（§21）。
+async fn compress_core(
+    file: &Path,
+    options: &CompressOptions,
+    rule: OutputRule,
+    source_type: &str,
+) -> EngineResult {
     let working = prepare_working_file(file, options);
     let src = working.path.clone();
-    let result = encode_source(&src, options).await;
+    let result = encode_source(&src, options, rule, source_type).await;
     settle_working_file(file, options, working, result)
 }
 
@@ -1275,42 +1765,65 @@ pub async fn compress_image(file: &Path, options: &CompressOptions) -> EngineRes
     compress_image_with_cancel(file, options, || false).await
 }
 
-/// 带取消判据的入口。
-///
-/// `cancelled` 在**每一次编码启动之前**问一次，语义与批次闸门完全一致（取消 = 这个文件
-/// 被移出队列；停止 = 整轮不再启动新工作）；绝不中途 kill 正在跑的编码。指定体积的阶梯
-/// 最多 6 次编码，正因为有这个判据才不会变成"停不下来"的长任务。
+/// 压缩（§18.1）：只有结果有收益才提交。`cancel` 在**每一次编码启动之前**问一次，
+/// 语义与批次闸门完全一致；绝不中途 kill 正在跑的编码。
 pub async fn compress_image_with_cancel(
     file: &Path,
     options: &CompressOptions,
     cancelled: impl Fn() -> bool + Send + Sync,
 ) -> EngineResult {
-    match budget_request(options) {
-        Some(budget) => solve_to_budget(file, options, budget, &cancelled).await,
-        None => compress_image_entry(file, options).await,
-    }
+    let source_type = detect_image_type(file);
+    compress_entry(file, options, OutputRule::BenefitOnly, &source_type, &cancelled).await
 }
 
-async fn compress_image_entry(file: &Path, options: &CompressOptions) -> EngineResult {
+/// 压缩到指定格式（§18.1）：仍然只有变小才提交。
+pub async fn compress_to_format_with_cancel(
+    file: &Path,
+    target: &str,
+    options: &CompressOptions,
+    cancelled: impl Fn() -> bool + Send + Sync,
+) -> EngineResult {
+    let source_type = detect_image_type(file);
+    let mut opts = options.clone();
+    opts.output_format = target.into();
+    compress_entry(file, &opts, OutputRule::BenefitOnly, &source_type, &cancelled).await
+}
+
+/// 显式格式转换（§18.2）：用户选的是容器，不是"必须更小"。
+/// 只要编码和最终格式验证通过就提交，即使产物比原文件大。
+pub async fn convert_to_format_with_cancel(
+    file: &Path,
+    target: &str,
+    options: &CompressOptions,
+    cancelled: impl Fn() -> bool + Send + Sync,
+) -> EngineResult {
+    let source_type = detect_image_type(file);
+    let mut opts = options.clone();
+    opts.output_format = target.into();
+    compress_entry(file, &opts, OutputRule::Convert, &source_type, &cancelled).await
+}
+
+async fn compress_entry(
+    file: &Path,
+    options: &CompressOptions,
+    rule: OutputRule,
+    source_type: &str,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> EngineResult {
+    // 系统模式先于预算：ImageIO 没有质量档可搜，这条事实由 system_mode_result 说明。
     if options.processing_mode == "system" {
         return system_mode_result(file, options);
     }
-    compress_core(file, options).await
-}
-
-pub async fn compress_to_format(file: &Path, target: &str, options: &CompressOptions) -> EngineResult {
-    // 只把目标格式并进请求，其余（系统模式 / 尺寸上限 / 预算）交给同一个顶层入口，
-    // 避免"从格式转换进来就忘了上限"。
-    let mut opts = options.clone();
-    opts.output_format = target.into();
-    compress_image(&file, &opts).await
+    match budget_request(options) {
+        Some(budget) => solve_to_budget(file, options, budget, rule, source_type, cancelled).await,
+        None => compress_core(file, options, rule, source_type).await,
+    }
 }
 
 /// Smart mode: try the natural compressor; if smart, also try alternatives and pick best.
 ///
-/// 语义与改动前一致（智能路由 = 候选集里挑最小）；新增的只有两件事：
 /// 指定体积优先于候选搜索（上限承诺比"多试一个格式"更重要，且它自带 6 次上限，
-/// 不会退化成 候选 × 阶梯 的组合爆炸），以及尺寸上限同样要生效。
+/// 不会退化成 候选 × 阶梯 的组合爆炸），尺寸上限同样要生效。
 pub async fn compress_smart(file: &Path, options: &CompressOptions) -> EngineResult {
     compress_smart_with_cancel(file, options, || false).await
 }
@@ -1320,72 +1833,73 @@ pub async fn compress_smart_with_cancel(
     options: &CompressOptions,
     cancelled: impl Fn() -> bool + Send + Sync,
 ) -> EngineResult {
-    if let Some(budget) = budget_request(options) {
-        return solve_to_budget(file, options, budget, &cancelled).await;
-    }
+    let source_type = detect_image_type(file);
     if options.processing_mode == "system" {
         return system_mode_result(file, options);
+    }
+    if let Some(budget) = budget_request(options) {
+        return solve_to_budget(
+            file, options, budget, OutputRule::BenefitOnly, &source_type, &cancelled,
+        )
+        .await;
     }
 
     let working = prepare_working_file(file, options);
     let src = working.path.clone();
-    let result = smart_candidates(&src, options).await;
+    let result = smart_candidates(&src, options, &source_type).await;
     settle_working_file(file, options, working, result)
 }
 
 /// smart 的候选搜索本体；Direct 与 App Store 各走自己的编码器，候选集与挑选规则一致。
+///
+/// §61：`KeptOriginal` 不是候选 —— 它的字节是原图，拿它参与"挑最小"只会让
+/// 一张没压小的图冒充赢家。候选集为空时回到普通压缩路径，由它给出真实结论。
 #[allow(unreachable_code)]
-async fn smart_candidates(file: &Path, options: &CompressOptions) -> EngineResult {
+async fn smart_candidates(
+    file: &Path,
+    options: &CompressOptions,
+    source_type: &str,
+) -> EngineResult {
     #[cfg(feature = "inproc-backends")]
-    return engine_inproc::compress_smart(file, options).await;
+    return engine_inproc::compress_smart(file, options, OutputRule::BenefitOnly, source_type).await;
 
-    let img_type = detect_image_type(file);
     let quality = if options.quality > 0 { options.quality } else { analyze_quality(file) };
 
     let mut opts = options.clone();
     opts.quality = quality;
 
-    // If a specific output format is requested, use format conversion path
+    // 显式目标格式不是一个"候选"：只许产那个格式，不许拿另一种更小的格式顶替。
     if opts.output_format != "original" {
-        return route_to_format(file, &opts.output_format, &opts).await;
+        return route_to_format(file, &opts.output_format, &opts, OutputRule::BenefitOnly).await;
     }
 
     let mut candidates: Vec<EngineResult> = Vec::new();
+    let mut push = |result: EngineResult| {
+        if result.encode == EncodeVerdict::Candidate && !result.compressed.is_empty() {
+            candidates.push(result);
+        }
+    };
 
-    match img_type.as_str() {
+    match source_type {
         "png" => {
-            let r = compress_png(file, &opts).await;
-            if r.success { candidates.push(r); }
-            // Also try webp as an alternative for potentially smaller size
-            let w = compress_to_webp(file, &opts).await;
-            if w.success { candidates.push(w); }
+            push(compress_png(file, &opts, OutputRule::BenefitOnly).await);
+            // PNG → WebP 是智能模式的既定候选（见 frontend/intents.js 的意图说明）。
+            push(compress_to_webp(file, &opts, OutputRule::BenefitOnly).await);
         }
-        "jpg" => {
-            let r = compress_jpg(file, &opts).await;
-            if r.success { candidates.push(r); }
-        }
-        "gif" => {
-            let r = compress_gif(file, &opts).await;
-            if r.success { candidates.push(r); }
-        }
-        "webp" => {
-            let r = compress_to_webp(file, &opts).await;
-            if r.success { candidates.push(r); }
-        }
-        "heic" => {
-            let r = compress_heic(file, &opts).await;
-            if r.success { candidates.push(r); }
-        }
+        "jpg" => push(compress_jpg(file, &opts, OutputRule::BenefitOnly).await),
+        "gif" => push(compress_gif(file, &opts, OutputRule::BenefitOnly).await),
+        "webp" => push(compress_to_webp(file, &opts, OutputRule::BenefitOnly).await),
+        "heic" => push(compress_heic(file, &opts, OutputRule::BenefitOnly).await),
         _ => {}
     }
+    drop(push);
 
-    // Pick the smallest result
-    if let Some(best) = candidates.into_iter().min_by_key(|r| r.compressed.len()) {
+    if let Some(best) = candidates.into_iter().min_by_key(|result| result.compressed.len()) {
         return best;
     }
 
-    // Fallback
-    encode_source(file, &opts).await
+    // 没有候选：走普通压缩，让"没收益 / 失败 / 不支持"由同一个地方给出。
+    encode_source(file, &opts, OutputRule::BenefitOnly, source_type).await
 }
 
 #[cfg(test)]
@@ -1546,13 +2060,13 @@ mod intent_tests {
         );
         assert_eq!(budget_ladder(None).len(), BUDGET_ATTEMPT_LIMIT, "承诺过的是最多 6 次编码");
         // 用户自己的上限压在每一档之上：搜索永远不能把图放大到用户要求之上。
+        // §60：2560 档被压成与 65 档相同的 (1500,65)，只编码一次，所以只剩 5 档。
         assert_eq!(
             budget_ladder(Some(1500)),
             vec![
                 (Some(1500), 80),
                 (Some(1500), 65),
                 (Some(1500), 50),
-                (Some(1500), 65),
                 (Some(1500), 60),
                 (Some(1280), 55),
             ]
@@ -1650,6 +2164,43 @@ mod intent_tests {
     }
 
     #[test]
+    fn animated_sources_are_named_before_a_single_frame_encoder_sees_them() {
+        // 最小 APNG 头：acTL 帧数 2，且出现在 IDAT 之前。
+        let mut apng = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        apng.extend_from_slice(b"\x00\x00\x00\x08acTL\x00\x00\x00\x02");
+        apng.extend_from_slice(b"\x00\x00\x00\x00IDAT");
+        assert_eq!(animated_source(&apng, "png"), Some("APNG 动画"));
+
+        // 最小动画 WebP 头：VP8X 的 ANIM 标志位。
+        let mut webp = b"RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00".to_vec();
+        webp.resize(21, 0);
+        webp[20] = 0x02;
+        assert_eq!(animated_source(&webp, "webp"), Some("动画 WebP"));
+
+        // 拒绝原话必须点名来源格式、目标格式和「原文件未改动」。
+        let rejection = animation_rejection(&webp, "JPEG").expect("动画 WebP 必须被拦下");
+        assert!(rejection.contains("动画 WebP"), "{rejection}");
+        assert!(rejection.contains("JPEG"), "{rejection}");
+        assert!(rejection.contains("原文件未改动"), "{rejection}");
+    }
+
+    #[test]
+    fn a_static_gif_is_not_mistaken_for_an_animation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("still.gif");
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([10, 20, 30, 255]),
+        ))
+        .save(&file)
+        .unwrap();
+        let bytes = fs::read(&file).unwrap();
+        assert_eq!(detect_image_format(&bytes), "gif");
+        assert_eq!(animated_source(&bytes, "gif"), None, "单帧 GIF 不该被当成动图");
+    }
+
+    #[test]
     fn an_unreadable_source_degrades_to_the_original_with_a_warning() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("broken.jpg");
@@ -1675,7 +2226,7 @@ mod intent_tests {
         let file = write_png(dir.path(), "photo.png", &alpha_canvas(64, 64));
         let original = fs::read(&file).unwrap();
 
-        let result = kept_original(&file, original.clone(), "avifenc", original.len() as u64, u64::MAX);
+        let result = kept_original(original.clone(), "avifenc", original.len() as u64, u64::MAX);
 
         assert_eq!(result.out_type, "png", "没压小回来时不许带着目标格式的标签");
         assert_eq!(result.compressed, original, "交回的必须是源文件本身");
@@ -1699,13 +2250,16 @@ mod intent_tests {
             resized: true,
             warnings: Vec::new(),
         };
-        // 上游自己标注了失败结论（error 有值），交回的是原图字节，标签却是目标格式。
+        // 上游交回的是原图字节，标签却是目标格式。判据现在由 `encode` 说，
+        // 不再靠"error 有没有值"猜 —— 一句提示和一次失败在旧判据下长得一模一样。
         let encoded = EngineResult {
             success: true,
             compressed: original.clone(),
             out_type: "avif".into(),
             algorithm: "avifenc".into(),
             error: Some("编码未产出有效结果".into()),
+            encode: EncodeVerdict::KeptOriginal,
+            reason: ReasonCode::NoSizeReduction,
             ..Default::default()
         };
 
@@ -1872,29 +2426,27 @@ mod intent_tests {
     }
 
     #[tokio::test]
-    async fn a_stopped_scheduler_never_starts_the_next_ladder_rung() {
+    async fn a_stopped_scheduler_cancels_instead_of_faking_a_result() {
         let dir = tempfile::tempdir().unwrap();
         let file = write_jpeg(dir.path(), "big.jpg", &noise_rgb(2400, 1600, 9), 95);
-        let original = fs::read(&file).unwrap();
 
         let mut opts = CompressOptions::default();
         opts.max_output_bytes = Some(4_000);
         opts.preserve_metadata = false;
 
-        // 判据一上来就是"已取消"：一次编码都不许启动，交回的必须是原图。
+        // 判据一上来就是"已取消"：一次编码都不许启动，也不许把原图当成搜索结果交回去。
         let result = compress_image_with_cancel(&file, &opts, || true).await;
-        assert_eq!(result.compressed, original, "取消后不能留下半成品的重编码");
-        assert_eq!(result.target_met, Some(false), "被中断的搜索不算达成");
-        let text = warn_text(&result);
-        assert!(text.contains("中断"), "{text}");
-        assert!(text.contains(&format!("只做完了 0/{BUDGET_ATTEMPT_LIMIT} 档")), "{text}");
+        assert_eq!(result.encode, EncodeVerdict::Cancelled);
+        assert_eq!(result.reason, ReasonCode::Cancelled);
+        assert!(result.compressed.is_empty(), "取消不是产出一个文件");
+        assert_eq!(result.target_met, None, "搜索没跑完，不能替用户断言达成与否");
 
         // 第一档允许跑完、第二档不许启动：证明判据落在两次编码之间（不中途 kill 编码器）。
         let calls = AtomicUsize::new(0);
         let probe = || calls.fetch_add(1, Ordering::SeqCst) >= 1;
         let result = compress_image_with_cancel(&file, &opts, probe).await;
-        let text = warn_text(&result);
-        assert!(text.contains(&format!("只做完了 1/{BUDGET_ATTEMPT_LIMIT} 档")), "{text}");
+        assert_eq!(result.encode, EncodeVerdict::Cancelled);
+        assert!(result.compressed.is_empty());
         assert_eq!(calls.load(Ordering::SeqCst), 2, "第二档查询后就必须停");
     }
 
@@ -1968,11 +2520,14 @@ mod intent_tests {
             assert!(keys.iter().any(|k| k == key), "前端要读的键 {key} 不存在：{keys:?}");
         }
         assert!(!keys.iter().any(|k| k.starts_with("max")), "结果里不该回流请求字段：{keys:?}");
+        // §139 第四阶段：旧 success 旗标已删除，不再序列化到前端。
+        assert!(!keys.iter().any(|k| k == "success"), "success 旗标已删除：{keys:?}");
 
         // 已经落盘的老历史没有这些键，必须仍能反序列化（规则 10）。
+        // 老载荷里若还带着 success，它只是被忽略的未知字段 —— 没有 outcome 就没有产物。
         let legacy = r#"{"success":true,"file":"/tmp/a.jpg","originalSize":10,"compressedSize":8,
             "savings":20.0,"originalSizeFormatted":"10.0B","compressedSizeFormatted":"8.0B",
-            "type":"jpg","algorithm":"mozjpeg","error":null,"outputPath":null,
+            "type":"jpg","algorithm":"mozjpeg","error":null,"outputPath":"/tmp/a_c.jpg",
             "backupPath":null,"outputMode":null}"#;
         let parsed: CompressResult = serde_json::from_str(legacy).unwrap();
         assert_eq!(parsed.out_type, "jpg");
@@ -1981,5 +2536,6 @@ mod intent_tests {
         assert_eq!(parsed.target_bytes, None, "没跑过搜索的历史不能凭空有个 true");
         assert_eq!(parsed.target_met, None);
         assert_eq!(parsed.warnings, None);
+        assert!(!parsed.has_product(), "没有结论的旧载荷不许拿 outputPath 猜产物");
     }
 }

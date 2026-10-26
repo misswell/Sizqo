@@ -14,7 +14,11 @@ use std::fs;
 use std::path::Path;
 
 // engine_inproc 是 engine 模块的子模块，super 就是 engine 自身
-use super::{CompressOptions, EngineResult, detect_image_type};
+use super::{
+    animation_rejection, conversion_failed, detect_image_format, read_source, rejected,
+    CompressOptions, EngineResult, OutputRule,
+};
+use crate::result_model::{EncodeVerdict, ReasonCode};
 
 fn ok(data: Vec<u8>, out_type: &str, algorithm: &str) -> EngineResult {
     EngineResult {
@@ -23,6 +27,7 @@ fn ok(data: Vec<u8>, out_type: &str, algorithm: &str) -> EngineResult {
         out_type: out_type.into(),
         algorithm: algorithm.into(),
         error: None,
+        encode: EncodeVerdict::Candidate,
         ..Default::default()
     }
 }
@@ -30,9 +35,26 @@ fn ok(data: Vec<u8>, out_type: &str, algorithm: &str) -> EngineResult {
 /// 「保留原图」这一支交回的字节就是**源文件本身**，所以 out_type 必须写源格式。
 /// 与 CLI 线（`engine::kept_original`）同一条规则：格式转换没压小回来时，
 /// 落盘拿到的标签必须和字节内容一致，否则会得到一个扩展名骗人的文件。
-fn kept_original(file: &Path, original: Vec<u8>, algorithm: &str, orig_size: u64, comp_size: u64) -> EngineResult {
-    let source_type = detect_image_type(file);
-    no_improvement(original, &source_type, algorithm, orig_size, comp_size)
+fn kept_original(original: Vec<u8>, algorithm: &str, orig_size: u64, comp_size: u64) -> EngineResult {
+    let source_type = detect_image_format(&original);
+    no_improvement(original, source_type, algorithm, orig_size, comp_size)
+}
+
+/// 各编码器的统一出口：转换只要格式对就收，压缩只有变小才收。
+fn acceptable(rule: OutputRule, size: usize, original_size: u64) -> bool {
+    rule == OutputRule::Convert || (size as u64) < original_size
+}
+
+fn no_candidate(original: Vec<u8>, out_type: &str, algorithm: &str, rule: OutputRule) -> EngineResult {
+    let size = original.len() as u64;
+    match rule {
+        OutputRule::BenefitOnly => kept_original(original, algorithm, size, size),
+        OutputRule::Convert => conversion_failed(
+            original,
+            out_type,
+            format!("没能产出 {out_type}：进程内编码器没有交回有效字节"),
+        ),
+    }
 }
 
 /// 压缩后体积未减小：返回原始数据，标记为"无优化空间"（不算失败）
@@ -48,47 +70,53 @@ fn no_improvement(original: Vec<u8>, out_type: &str, algorithm: &str, orig_size:
         out_type: out_type.into(),
         algorithm: algorithm.into(),
         error: Some(msg),
+        encode: EncodeVerdict::KeptOriginal,
+        reason: if comp_size > orig_size {
+            ReasonCode::OutputLargerThanSource
+        } else {
+            ReasonCode::NoSizeReduction
+        },
         ..Default::default()
     }
 }
 
+/// 与 CLI 线共用同一个构造器：两条产物线对"这件事我们不做"必须给出同一个判据（§65）。
 fn unsupported(original: Vec<u8>, out_type: &str, reason: &str) -> EngineResult {
-    EngineResult {
-        success: false,
-        compressed: original,
-        out_type: out_type.into(),
-        algorithm: "none".into(),
-        error: Some(reason.into()),
-        ..Default::default()
-    }
+    rejected(original, out_type, "none", ReasonCode::UnsupportedFormat, reason)
 }
 
 /// PNG：imagequant 量化（与 pngquant 同源算法）→ oxipng 库版 → image crate 兜底。
-async fn compress_png(file: &Path, options: &CompressOptions) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
+async fn compress_png(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "png") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
+    if let Some(message) = animation_rejection(&original, "PNG") {
+        return rejected(original, "png", "none", ReasonCode::UnsupportedFormat, message);
+    }
     let quality = options.quality;
 
     if let Some(data) = compress_png_with_imagequant(file, quality) {
-        if (data.len() as u64) < original_size {
+        if acceptable(rule, data.len(), original_size) {
             return ok(data, "png", "pngquant (inproc)");
         }
     }
 
     if let Some(data) = compress_png_with_oxipng(file, quality) {
-        if (data.len() as u64) < original_size {
+        if acceptable(rule, data.len(), original_size) {
             return ok(data, "png", "oxipng (inproc)");
         }
     }
 
     // 兜底：无损重编码。前两条都不适用时才轮到它。
     if let Some(data) = compress_png_with_image(file) {
-        if (data.len() as u64) < original_size {
+        if acceptable(rule, data.len(), original_size) {
             return ok(data, "png", "image-png");
         }
     }
 
-    kept_original(file, original, "pngquant (inproc)", original_size, original_size)
+    no_candidate(original, "png", "pngquant (inproc)", rule)
 }
 
 /// image crate 兜底：PNG 无损重编码，保留原色型（RGB→RGB8，RGBA→RGBA8）。
@@ -225,21 +253,27 @@ fn compress_jpg_with_mozjpeg(file: &Path, quality: u32) -> Option<Vec<u8>> {
 
 /// JPEG：两级 fallback（对齐 cli 版 engine.rs），成功判定 data.len() < original_size。
 /// mozjpeg crate 量化（同源 cjpeg trellis quant）→ image crate 兜底。
-async fn compress_jpg(file: &Path, options: &CompressOptions) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
+async fn compress_jpg(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "jpg") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
+    if let Some(message) = animation_rejection(&original, "JPEG") {
+        return rejected(original, "jpg", "none", ReasonCode::UnsupportedFormat, message);
+    }
     let quality = options.quality;
     if let Some(data) = compress_jpg_with_mozjpeg(file, quality) {
-        if (data.len() as u64) < original_size {
+        if acceptable(rule, data.len(), original_size) {
             return ok(data, "jpg", "mozjpeg (inproc)");
         }
     }
     if let Some(data) = compress_jpg_with_image(file, quality as u8) {
-        if (data.len() as u64) < original_size {
+        if acceptable(rule, data.len(), original_size) {
             return ok(data, "jpg", "image-jpeg (inproc)");
         }
     }
-    kept_original(file, original, "mozjpeg (inproc)", original_size, original_size)
+    no_candidate(original, "jpg", "mozjpeg (inproc)", rule)
 }
 
 /// webp crate 编码（同源 cwebp/libwebp）：from_rgba + encode(quality)。
@@ -253,16 +287,22 @@ fn compress_to_webp_with_cwebp(file: &Path, quality: u32) -> Option<Vec<u8>> {
 }
 
 /// WebP：进程内 webp crate 编码（对齐 cli 版 cwebp）。成功判定 < original_size。
-async fn compress_to_webp(file: &Path, options: &CompressOptions) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
+async fn compress_to_webp(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "webp") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
+    if let Some(message) = animation_rejection(&original, "WebP") {
+        return rejected(original, "webp", "none", ReasonCode::UnsupportedFormat, message);
+    }
     let quality = options.quality;
     if let Some(data) = compress_to_webp_with_cwebp(file, quality) {
-        if (data.len() as u64) < original_size {
+        if acceptable(rule, data.len(), original_size) {
             return ok(data, "webp", "cwebp (inproc)");
         }
     }
-    kept_original(file, original, "cwebp (inproc)", original_size, original_size)
+    no_candidate(original, "webp", "cwebp (inproc)", rule)
 }
 
 /// image crate 重编码 GIF（保留所有帧，无 gifsicle 减色优化，功能降级但可用）。
@@ -280,18 +320,22 @@ fn compress_gif_with_image(file: &Path) -> Option<Vec<u8>> {
 }
 
 /// GIF：image crate 逐帧重编码（无 gifsicle 减色，属已记录的质量降级，非功能缺失）。
-async fn compress_gif(file: &Path, options: &CompressOptions) -> EngineResult {
+async fn compress_gif(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
     let _ = options;
-    let original = fs::read(file).unwrap_or_default();
+    let original = match read_source(file, "gif") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
 
+    // 进程内的 GifDecoder/GifEncoder 逐帧处理，动画不会丢；因此这里不拒收动画输入。
     if let Some(data) = compress_gif_with_image(file) {
-        if (data.len() as u64) < original_size {
+        if acceptable(rule, data.len(), original_size) {
             return ok(data, "gif", "gifsicle (inproc)");
         }
     }
 
-    kept_original(file, original, "gifsicle (inproc)", original_size, original_size)
+    no_candidate(original, "gif", "gifsicle (inproc)", rule)
 }
 
 /// ravif crate 编码（同源 AV1/rav1e，对齐 avifenc）：with_quality + with_speed(6)。
@@ -312,108 +356,186 @@ fn compress_to_avif_with_avifenc(file: &Path, quality: u32) -> Option<Vec<u8>> {
 }
 
 /// AVIF：进程内 ravif 编码（对齐 cli 版 avifenc）。成功判定 < original_size。
-async fn compress_to_avif(file: &Path, options: &CompressOptions) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
+async fn compress_to_avif(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "avif") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
+    if let Some(message) = animation_rejection(&original, "AVIF") {
+        return rejected(original, "avif", "none", ReasonCode::UnsupportedFormat, message);
+    }
+    // ravif 只接受解码后的像素，而进程内没有 AVIF 解码器。AVIF 输入（原地压缩或
+    // 再转 AVIF）必须明说"读不了"，不能让它走到 image::open 失败后被报成"没有收益"。
+    if detect_image_format(&original) == "avif" {
+        return unsupported(
+            original,
+            "avif",
+            "App Store 版没有 AVIF 解码器：可以输出 AVIF，但不能读取或原地压缩 AVIF",
+        );
+    }
     let quality = options.quality;
     if let Some(data) = compress_to_avif_with_avifenc(file, quality) {
-        if (data.len() as u64) < original_size {
+        if acceptable(rule, data.len(), original_size) {
             return ok(data, "avif", "avifenc (inproc)");
         }
     }
-    kept_original(file, original, "avifenc (inproc)", original_size, original_size)
+    no_candidate(original, "avif", "avifenc (inproc)", rule)
 }
 
-/// JPEG XL：App Store 版暂未接入 libjxl（编译链重），友好降级保留原图不崩。
-async fn compress_to_jxl(file: &Path, _options: &CompressOptions) -> EngineResult {
-    let original = fs::read(file).unwrap_or_default();
+/// JPEG XL：App Store 版暂未接入 libjxl（编译链重）。
+/// 不能退回 `KeptOriginal` —— 那会把"没有编码器"说成"已经没有优化空间"。
+async fn compress_to_jxl(file: &Path, _options: &CompressOptions, _rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "jxl") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
+    rejected(
+        original,
+        "jxl",
+        "none",
+        ReasonCode::UnsupportedFormat,
+        "App Store 版暂未接入 JPEG XL 编码",
+    )
+}
+
+/// HEIC：ImageIO 能真正写 `public.heic`，而且不 spawn 任何进程（沙盒允许）。
+/// 旧路径把 HEIF 存成 JPEG 的 bug 在这里同样不存在：只收字节确实是 HEIC 的结果。
+#[cfg(target_os = "macos")]
+async fn compress_heic(file: &Path, options: &CompressOptions, rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "heic") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
     let original_size = original.len() as u64;
-    kept_original(file, original, "cjxl (inproc, 暂未接入)", original_size, original_size)
+    if let Some(message) = animation_rejection(&original, "HEIC") {
+        return rejected(original, "heic", "none", ReasonCode::UnsupportedFormat, message);
+    }
+    let mut opts = options.clone();
+    opts.output_format = "heic".into();
+    // 高级路径的尺寸已经在工作文件里兑现；这里的尺寸档只允许"实际大小"，
+    // 不然一套参数会同时被两条缩放路径各改一次。
+    opts.system_image_size = "actual".into();
+    let converted = crate::system_image::convert(file, &opts);
+    if converted.encode == EncodeVerdict::Candidate && !converted.compressed.is_empty() {
+        if acceptable(rule, converted.compressed.len(), original_size) {
+            return EngineResult {
+                out_type: "heic".into(),
+                algorithm: "ImageIO (inproc)".into(),
+                ..converted
+            };
+        }
+    }
+    if matches!(converted.encode, EncodeVerdict::Failed | EncodeVerdict::Rejected) {
+        return converted;
+    }
+    no_candidate(original, "heic", "ImageIO (inproc)", rule)
 }
 
-pub async fn compress_image(file: &Path, options: &CompressOptions) -> EngineResult {
+#[cfg(not(target_os = "macos"))]
+async fn compress_heic(file: &Path, _options: &CompressOptions, _rule: OutputRule) -> EngineResult {
+    let original = match read_source(file, "heic") {
+        Ok(bytes) => bytes,
+        Err(failure) => return failure,
+    };
+    rejected(original, "heic", "none", ReasonCode::UnsupportedFormat, "HEIC 输出仅支持 macOS")
+}
+
+pub async fn compress_image(
+    file: &Path,
+    options: &CompressOptions,
+    rule: OutputRule,
+    source_type: &str,
+) -> EngineResult {
     if options.output_format != "original" {
-        return compress_to_format(file, &options.output_format, options).await;
+        return compress_to_format(file, &options.output_format, options, rule).await;
     }
-    let img_type = detect_image_type(file);
-    eprintln!("[DEBUG] inproc compress_image: {:?} type={}", file, img_type);
-    match img_type.as_str() {
-        "png" => compress_png(file, options).await,
-        "jpg" => compress_jpg(file, options).await,
-        "webp" => compress_to_webp(file, options).await,
-        "gif" => compress_gif(file, options).await,
-        "avif" => compress_to_avif(file, options).await,
-        "jxl" => compress_to_jxl(file, options).await,
-        "" | "unknown" => {
-            let original = fs::read(file).unwrap_or_default();
-            unsupported(original, &img_type, "未识别的图片类型")
-        }
-        other => {
-            let original = fs::read(file).unwrap_or_default();
-            unsupported(original, &img_type, &format!("App Store 版暂不支持: {}", other))
+    match source_type {
+        "png" => compress_png(file, options, rule).await,
+        "jpg" => compress_jpg(file, options, rule).await,
+        "webp" => compress_to_webp(file, options, rule).await,
+        "gif" => compress_gif(file, options, rule).await,
+        "avif" => compress_to_avif(file, options, rule).await,
+        "heic" => compress_heic(file, options, rule).await,
+        "jxl" => compress_to_jxl(file, options, rule).await,
+        _ => {
+            let original = match read_source(file, source_type) {
+                Ok(bytes) => bytes,
+                Err(failure) => return failure,
+            };
+            unsupported(original, source_type, "未识别的图片类型")
         }
     }
 }
 
-pub async fn compress_to_format(file: &Path, target: &str, options: &CompressOptions) -> EngineResult {
+pub async fn compress_to_format(
+    file: &Path,
+    target: &str,
+    options: &CompressOptions,
+    rule: OutputRule,
+) -> EngineResult {
     match target {
-        "png" => compress_png(file, options).await,
-        "jpg" | "jpeg" => compress_jpg(file, options).await,
-        "webp" => compress_to_webp(file, options).await,
-        "avif" => compress_to_avif(file, options).await,
-        "jxl" => compress_to_jxl(file, options).await,
+        "png" => compress_png(file, options, rule).await,
+        "jpg" | "jpeg" => compress_jpg(file, options, rule).await,
+        "webp" => compress_to_webp(file, options, rule).await,
+        "avif" => compress_to_avif(file, options, rule).await,
+        "jxl" => compress_to_jxl(file, options, rule).await,
+        "heic" | "heif" => compress_heic(file, options, rule).await,
+        "gif" => compress_gif(file, options, rule).await,
         other => {
-            let original = fs::read(file).unwrap_or_default();
+            let original = match read_source(file, other) {
+                Ok(bytes) => bytes,
+                Err(failure) => return failure,
+            };
             unsupported(original, other, &format!("App Store 版暂未接入 {} 输出", other))
         }
     }
 }
 
-pub async fn compress_smart(file: &Path, options: &CompressOptions) -> EngineResult {
+pub async fn compress_smart(
+    file: &Path,
+    options: &CompressOptions,
+    rule: OutputRule,
+    source_type: &str,
+) -> EngineResult {
     // 多格式候选挑选（与 Direct 版 engine.rs compress_smart 逻辑一致）
-    let img_type = detect_image_type(file);
     let quality = options.quality;
-
     let mut opts = options.clone();
     opts.quality = quality;
 
     // 如果指定了输出格式，走格式转换路径
     if opts.output_format != "original" {
-        return compress_to_format(file, &opts.output_format, &opts).await;
+        return compress_to_format(file, &opts.output_format, &opts, rule).await;
     }
 
     let mut candidates: Vec<EngineResult> = Vec::new();
+    let mut push = |result: EngineResult| {
+        if result.encode == EncodeVerdict::Candidate && !result.compressed.is_empty() {
+            candidates.push(result);
+        }
+    };
 
-    match img_type.as_str() {
+    match source_type {
         "png" => {
             // PNG 同时尝试原格式 + WebP，选最小
-            let r = compress_png(file, &opts).await;
-            if r.success { candidates.push(r); }
-            let w = compress_to_webp(file, &opts).await;
-            if w.success { candidates.push(w); }
+            push(compress_png(file, &opts, rule).await);
+            push(compress_to_webp(file, &opts, rule).await);
         }
-        "jpg" => {
-            let r = compress_jpg(file, &opts).await;
-            if r.success { candidates.push(r); }
-        }
-        "gif" => {
-            let r = compress_gif(file, &opts).await;
-            if r.success { candidates.push(r); }
-        }
-        "webp" => {
-            let r = compress_to_webp(file, &opts).await;
-            if r.success { candidates.push(r); }
-        }
+        "jpg" => push(compress_jpg(file, &opts, rule).await),
+        "gif" => push(compress_gif(file, &opts, rule).await),
+        "webp" => push(compress_to_webp(file, &opts, rule).await),
+        "avif" => push(compress_to_avif(file, &opts, rule).await),
+        "heic" => push(compress_heic(file, &opts, rule).await),
         _ => {}
     }
+    drop(push);
 
-    // 选最小的结果
-    if let Some(best) = candidates.into_iter().min_by_key(|r| r.compressed.len()) {
+    if let Some(best) = candidates.into_iter().min_by_key(|result| result.compressed.len()) {
         return best;
     }
 
     // 兜底
-    compress_image(file, &opts).await
+    compress_image(file, &opts, rule, source_type).await
 }
 
 #[cfg(test)]
@@ -455,7 +577,7 @@ mod tests {
         img.save(&file).unwrap();
         let original = image::open(&file).unwrap().to_rgb8();
 
-        let result = compress_image(&file, &inproc_options(80)).await;
+        let result = compress_image(&file, &inproc_options(80), OutputRule::BenefitOnly, "png").await;
         assert!(result.success, "压缩失败：{:?}", result.error);
         assert!(!result.compressed.is_empty());
         fs::write(&file, &result.compressed).unwrap();
@@ -478,6 +600,31 @@ mod tests {
 
     /// 只覆盖真正被引擎读到的字段；其余走 Default（旧的 backend/effort/smartMode/
     /// convertToWebp/lossless 已删除，没有任何一条路径读过它们）。
+    /// §22/§59：没有 AVIF 解码器时，AVIF 输入必须报"不支持"，
+    /// 不能走到 image::open 失败后被说成"没有优化空间"。
+    #[tokio::test]
+    async fn an_avif_source_is_reported_unsupported_instead_of_no_improvement() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.avif");
+        // 判定发生在解码之前，这里只需要一个合法的 ftyp/avif 头。
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&24u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftypavif");
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"avifmif1");
+        fs::write(&file, &bytes).unwrap();
+
+        let result =
+            compress_image(&file, &inproc_options(75), OutputRule::BenefitOnly, "avif").await;
+        assert_eq!(result.encode, EncodeVerdict::Rejected);
+        assert_eq!(result.reason, ReasonCode::UnsupportedFormat);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("AVIF 解码器"),
+            "拒绝理由必须说清楚是没有解码器：{:?}",
+            result.error
+        );
+    }
+
     fn inproc_options(quality: u32) -> CompressOptions {
         CompressOptions {
             quality,

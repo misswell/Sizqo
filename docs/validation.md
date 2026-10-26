@@ -5,17 +5,18 @@ tracks. Rules: a feature is "supported" only with a command and its real
 outcome recorded here; pending or blocked work is never reported as passed.
 Update this file whenever a track's capability changes.
 
-Last updated: 2026-10-12
+Last updated: 2026-10-22
 
 ## Automated checks
 
 | Check | Command | Result |
 |-------|---------|--------|
-| Rust unit tests, Direct features | `cargo test --lib` (in `src-tauri`) | ✅ 111 unit passed (2026-10-12, v0.2.0 change set) |
-| Rust unit tests, shared in-process engines | `cargo test --lib --features inproc-backends` | ✅ 112 unit passed (2026-10-12) |
-| Rust unit tests, App Store feature set | `cargo test --lib --no-default-features --features inproc-backends` | ✅ 112 unit passed (2026-10-12) |
-| Frontend suites (queue, sessions, media import, video contract, i18n, history, CPU limit, settings, compare, update panel, parity, intent model) | `npm run test:frontend` (17 suites, incl. `tests/intent-model.cjs`, `tests/app-slices.cjs`) | ✅ all pass (2026-10-12) |
-| Swift history / backup / pause / queue / settings self-checks | `bash scripts/test_swift_history.sh` | ✅ all pass |
+| Rust tests, Direct features | `cargo test` (in `src-tauri`) | ✅ 196 unit + 6 integration passed (2026-10-22; 1 ignored) |
+| Rust tests, shared in-process engines | `cargo test --features inproc-backends` | ✅ 198 unit + 6 integration passed (2026-10-22) |
+| Rust tests, App Store feature set | `cargo test --no-default-features --features inproc-backends` | ✅ 198 unit + 6 integration passed (2026-10-22) |
+| Frontend suites (queue, sessions, media import, video contract, i18n, history, CPU limit, settings, compare, update panel, parity, intent model, result contract, output destinations, bulk operations, UI contract) | `npm run test:frontend` (25 suites) | ✅ all pass (2026-10-22) |
+| Swift history / backup / pause / queue / settings / result-contract self-checks | `bash scripts/test_swift_history.sh` | ✅ all pass, checks [1]–[44] (2026-10-22) |
+| Swift full-source typecheck | `xcrun swiftc -typecheck -parse-as-library -target arm64-apple-macos13.0 -module-name SizqoSwift` over every `swift/Sources/SizqoSwift/**/*.swift` (24 files) | ✅ EXIT=0, zero diagnostics (2026-10-22) |
 
 ## Track: Direct (`com.misswell.sizqo`)
 
@@ -728,6 +729,287 @@ sha256 92fa8ab358a71537e8f9b133cab5cdb6f358d0a1b7c96284a43921dc1ac4d6c2  .app.ta
 仍未做（与 v0.3.1 相同）：签名包内新工作台的肉眼点击验收、§11 fixture 视频矩阵、
 App Store 沙盒运行时、FFmpeg GPL 对应源码义务。本轮按用户「做完就发版」的常驻规则
 发布补丁版本，未把上述未验证项标成已通过。
+## 压缩事务重构：结果契约与提交边界（2026-10-21，Phase 1–4.5）
+
+按「全链路状态、压缩事务与处理逻辑重构方案」（§138/§139）执行到第四阶段。
+本轮只动结果契约、提交事务与会话语义；视频、历史/恢复、UI 与集成阶段尚未开始。
+
+### 这一轮改了什么
+
+- **结果契约唯一化**：Rust / Swift / 前端都只读 `outcome` + `reasonCode`；
+  「有没有产物」只由 `has_product()` / `hasProduct` 一处回答。
+  `CompressResult.success` 已删除（§139 第四阶段）：历史从未持久化它、三轨同包发布，
+  不存在跨版本兼容需求。`EngineResult.success` 保留为引擎内部判据，
+  恢复命令的 `RestoreOutcome.success` 是命令响应旗标，二者都不属于结果契约。
+- **四步分离**：Encode → Evaluate → Commit → Publish。`Evaluation::evaluate`
+  是唯一回答「这些字节值不值得落盘」的地方；没有落盘就不许预先写结论。
+- **提交事务**：随机临时文件名；统一 `OutputNameAllocator`（后缀/目录/转换共用，
+  绝不覆盖既有文件）；`SourceIdentity` 提前备份 + 改名前 SHA-256 复核；
+  取消在 Encode 前与 Commit 前两处阻断；失败回滚保留日志与备份。
+- **会话语义**：图片/视频/混合入口统一 `try_begin_batch`；`sourceRoot` /
+  `relativePath` 在入队时定死；重试保持队列项身份且进度不倒退；
+  会话期间禁用恢复/删除历史产物。
+- **收紧后的缺省读法**：没有 `outcome` 的载荷 = 没有产物、队列生命周期 `failed`、
+  日志状态 `unknown`。不再按 `outputPath` 反推成功（同时满足 §140 的禁令）。
+
+### 本轮实测（全部 EXIT=0，2026-10-21）
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test`（`src-tauri`，Direct 默认特性） | ✅ 157 个单测 + 6 个集成测试 |
+| `cargo test --features inproc-backends` | ✅ 158 个单测 + 6 个集成测试 |
+| `cargo test --no-default-features --features inproc-backends` | ✅ 158 个单测 + 6 个集成测试 |
+| `npm run test:frontend` | ✅ 23 个脚本全过 |
+| `bash scripts/test_swift_history.sh` | ✅ 自检 [1]–[44] 全过，含结果契约 [33]–[36]、随机临时名 [37]、输出命名/事务 [38]–[39]、源身份 [40]、会话唯一 [41]、来源根 [42]、重试 [43]、会话期恢复禁令 [44] |
+
+新增/强化的关键回归：
+
+- Rust `new_result_fields_are_camel_case_and_optional`：序列化不再出现 `success`，
+  旧载荷缺少 `outcome` 时 `has_product() == false`。
+- 前端 `tests/no-product-status.cjs`：六种结论的呈现、无结论不当完成，
+  并加源码守卫禁止契约文件再读 `result.success` 或保留 `legacyHasProduct`。
+- Swift 自检 [34]–[36]：无结论的载荷不产出、不冒充完成；
+  三轨字面量必须同源；视图不得另立 `success` 判据。
+
+### 变异验证（故意改坏，确认测试真的会响）
+
+- Rust：把 `CompressResult::has_product` 的 `None => false` 改成
+  `None => self.output_path.is_some()`，
+  `new_result_fields_are_camel_case_and_optional` 失败并报出
+  「没有结论的旧载荷不许拿 outputPath 猜产物」；恢复后 `diff` 字节一致。
+- JS / Swift：同样把「没有结论」分支改成按 `outputPath` 猜产物，
+  各自触发对应断言失败；恢复后 `diff` 字节一致。
+
+### 仍未跑的门禁
+
+三轨真实构建与签名运行时、App Store 沙盒运行时、AGENTS.md §11 的 fixture 视频矩阵、
+FFmpeg GPL 对应源码义务均未在本轮执行，不能据此认为发布门禁已通过。
+本轮改动未提交、未推送、未发版。
+
+## 压缩事务重构：历史 / 恢复 / UI / 集成（2026-10-22，Phase 5–9）
+
+按同一份方案执行完 Phase 5–9：图片能力与 IO 错误、视频元数据与校验、
+历史/恢复/批量、UI 契约、全量回归。本轮仍**未提交、未推送、未发版**。
+
+### A. 修改文件（按层）
+
+- **Rust 结果与提交**：`result_model.rs`、`engine.rs`、`engine_inproc.rs`、
+  `commands.rs`、`output_transaction.rs`、`source_identity.rs`、`history.rs`、
+  `image_capabilities.rs`、`image_memory.rs`、`source_root.rs`、`system_image.rs`、
+  `video/{mod,plan,probe,validation,transaction,ffmpeg_backend}.rs`、
+  `video_commands.rs`、`lib.rs`。
+- **前端**：`app.js`、`result_state.js`（新增，结果契约唯一解释器）、`i18n.js`、
+  `intents.js`、`video-settings.js`、`compare_window.js`、`index.html`、
+  `compare.html`、`style.css`。
+- **Swift**：`ResultContract.swift`、`ImageCapabilities.swift`、
+  `SourceIdentity.swift`、`ReplaceBaseline.swift`（新增），以及
+  `CompressionEngine`、`SystemImageConverter`、`CompressOptions`、`CompressResult`、
+  `CompressionScheduler`、`HistoryStore`、`OutputTransactionStore`、`AppState`、
+  `CompareView`、`ContentView`、`HistoryView`。
+- **测试**：新增 `tests/bulk-operations.cjs`、`tests/ui-contract.cjs`、
+  `tests/round-exit.cjs`、`tests/source-root.cjs`、`tests/output-dest.cjs`；
+  强化 history / no-product-status / compression-session / video-contract 等既有套件。
+
+### B. 状态机
+
+| 状态 | 进入条件 | 允许的下一步 |
+| --- | --- | --- |
+| `pending` | 导入成功、或从 `restored` 重新压缩 | 会话开始 → `running`；移出队列 → `removed` |
+| `running` | 后端 `starting` 事件（同一 `sessionId` + `queueRevision` + 队列对象身份） | `completed` / `failed` 事件 → `done` 或 `failed` |
+| `done` | 结论是 `Committed` / `TargetUnmet` / `Skipped*` / `Cancelled` | 恢复成功 → `restored`；重试 → `running`（`attemptCount++`） |
+| `failed` | 结论是 `Failed` | 重试 → `running`；`attemptCount++`，`everProcessed` 不回退 |
+| `restored` | 后端确认恢复/删除成功 | 重新压缩 → `pending`（新的一次尝试） |
+| `removed` | 用户移出队列（取消） | 无；不写历史 |
+
+压缩控制状态独立于行状态：`idle → running ↔ paused → stopping → idle`。
+暂停只拦尚未开工的任务，在跑的任务结束；停止不可逆，未开工项保持 `pending`；
+取消当前视频是单独动作。`idle` 之外任何会话状态都禁用恢复/删除历史产物。
+重试复用同一个队列项与 `taskId`，不删旧行/不新建身份；进度分子不倒退。
+
+### C. ResultOutcome
+
+| 结论 | 产物 | 历史 | 语义与按钮 |
+| --- | --- | --- | --- |
+| `Committed` | 有 | 有 | 已完成；保存 / 对比 / 恢复 / 访达 / 日志 |
+| `TargetUnmet` | 有 | 有 | 已完成 · 未达到目标；在 Committed 基础上多一个「重试」 |
+| `SkippedNoBenefit` | 无 | 无 | 已跳过；只给重试 / 日志，不出现任何指向产物的按钮 |
+| `SkippedAlreadyUnderTarget` | 无 | 无 | 原文件已经小于目标体积；同上 |
+| `Cancelled` | 无 | 无 | 已取消；只给重试 / 日志 |
+| `Failed` | 无 | 无 | 处理失败；按 `reasonCode` 说明原因，给重试 / 日志 |
+
+「有没有产物」只由 `has_product()` / `hasProduct` 回答；前端不再读 `success`、
+不再按 `outputPath` 反推。产物被外部删除时结论不变，但 `outputMissing` 收走
+保存/对比/访达/重试，只留恢复与日志。
+
+### D. Transaction
+
+| 场景 | 保证 |
+| --- | --- |
+| Replace | 备份 → 持久化预提交日志 → 临时文件写满 fsync → 源指纹与备份 SHA-256 复核 → 原子 rename → 历史落盘 → 销账。历史写失败用备份回滚；任何一步失败都不在目标位置留半份文件 |
+| Suffix / Folder | `OutputNameAllocator` 独占一个不存在的新名字，绝不覆盖既有文件；不产生备份；历史在 publish 之后才写；撤销 = 只删这次产物 |
+| Export | 重新检查产物在盘 → `OutputNameAllocator` 领名 → `StagedOutput::copy_from` 原子复制；失败释放占位名；上次同名导出不会被覆盖 |
+| Save As | 单文件另存为同样走暂存：目标同目录临时文件 → fsync → 原子改名；复制失败不留下半个文件，也不先删用户原来的目标文件（Rust `StagedOutput::copy_from` / Swift `atomicCopyFile`） |
+| Restore | 只接受 `historyId`，统一走 `HistoryStore::restore`；SHA-256 冲突需明确 force；重复恢复返回 `AlreadyRestored`；产物清理失败返回 warning 而恢复仍算成功；备份也不在则 `BackupGone` |
+| 取消 / 停止 | Encode 前与 Commit 前两处闸门；取消不会产生 `Committed`，也不会留下 orphan |
+
+### E. 实测结果（2026-10-22，§144 审计修复后重跑，全部 EXIT=0）
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test`（Direct） | ✅ 196 unit + 6 integration，1 ignored |
+| `cargo test --features inproc-backends` | ✅ 198 unit + 6 integration |
+| `cargo test --no-default-features --features inproc-backends` | ✅ 198 unit + 6 integration |
+| `npm run test:frontend` | ✅ 25 个脚本全过，含 `bulk-operations` / `ui-contract` |
+| `bash scripts/test_swift_history.sh` | ✅ [1]–[44] 全过 |
+| Swift 全源码 typecheck（24 文件） | ✅ EXIT=0，无诊断 |
+| `node --check frontend/*.js tests/*.cjs` | ✅ 无语法错误 |
+
+新增回归重点：`an_externally_deleted_output_still_restores_from_the_backup`（§76）、
+`a_missing_backup_with_a_missing_output_reports_an_incomplete_record`（§76）、
+`a_committed_result_and_its_history_point_at_a_file_that_really_exists`（§71/§72）、
+`tests/bulk-operations.cjs`（§49/§52/§75/§77/§78/§79）、
+`tests/ui-contract.cjs`（§67–§69/§87/§88）。
+
+### §144 遗留模式审计与修复（2026-10-22）
+
+对 `success` / `skippedLarger` / `outputPath` / 被吞掉的 IO 错误 / `fs::copy` /
+`File::create` 做了一次全仓审计，逐条核实后修掉这些真实遗留：
+
+- **已恢复 / 重建的历史记录不再冒充产物**：`historyRowActionDefs` 与 Swift
+  `historyRowActions` 现在只在 `compressed` / `missing` 状态且产物在盘时给
+  「另存为 / 对比 / 播放输出」；已恢复记录里 `outputPath` 指向的是写回后的原图，
+  重建条目没有压缩明细，都不能再被当成压缩结果。历史行同时识别 Rust 的
+  `restoredWithWarning`，文案写着「已恢复 · 压缩结果未能删除」。
+- **fsync 失败不再被忽略**：Swift `syncFile` 返回成功与否；备份暂存、写回原图、
+  暂存写入、覆盖事务日志的目录 fsync 全部检查结果，失败按"没落盘"处理。
+- **跨格式恢复的清理失败可见**：Swift `removeGeneratedOutput` 失败时返回 warning，
+  `RestoreOutcome.warning` 进入 toast / 恢复全部摘要；恢复本身仍是成功（§48）。
+- **视频非覆盖提交的失败清理由吞变报**：删不掉未提交产物时，错误里写明目标路径，
+  不再留下一个没人认领的文件。
+- **非 macOS 转换读源失败归因正确**：改用 `read_source`，报 `source_read_failed`，
+  不再把空字节当成"格式不支持"。
+- **另存为原子化**：Rust `save_file` 改用 `StagedOutput::copy_from` + `settle`；
+  Swift 新增 `atomicCopyFile`，两个"另存为"入口都改走它。
+- 另核实：Swift `recompressForCompare` 的 `success` 只表示"引擎交回了可用字节"
+  （`keptOriginal` 分支也是 `success = true`），没有把"跳过"误判成失败，无需改动；
+  `skippedLarger` 已无任何运行时消费方。
+
+### F. 手工验收路径（真实 GUI 点击，待执行）
+
+当前环境未启动 Tauri GUI，以下路径是发布前的点击清单；自动化已覆盖其判据。
+
+1. **正常图片压缩**：导入一张 JPG → 均衡意图 → 开始 → 行从等待到完成，
+   大小列写「原 → 新」，详情省率 `-xx%`，保存/对比/恢复/访达都可用。
+2. **压缩后更大**：选一张已优化的小图，输出 WebP 高质量 → 行显示「已跳过」，
+   无产物大小、保存/对比/恢复按钮不出现，重试可见；历史页新增 0 条。
+3. **target-size 达标**：设定一个可达预算 → 结论 `Committed`，体积 ≤ 预算。
+4. **target-size 未达标**：设定不可达预算 → 结论「已完成 · 未达到目标」，
+   仍有产物与保存/对比/恢复，并出现「重试」；日志里 `reasonCode=target_unmet`。
+5. **原图已小于目标**：预算高于原图 → 「已跳过」+ 原文件已经小于目标体积，无历史。
+6. **格式转换**：PNG → JPG 显式转换 → 即使更大也提交，最终磁盘文件格式必须是 JPG；
+   覆盖率与轨道不被静默丢弃。
+7. **视频压缩**：导入 MP4 → 目标体积 → 进度到完成；播放结果、同帧对比可用；
+   产物能完整解码，音轨策略与界面一致。
+8. **Stop**：混合队列运行中点停止 → 在跑项完成，未开工项保持 `pending`；
+   继续只处理 `pending`，已完成/已跳过不被重跑。
+9. **Cancel（视频）**：运行中取消当前视频 → 该项 `removed`，下一项不自动开始，
+   没有 orphan 临时文件。
+10. **Clear**：清空历史 → 历史行与备份清理，原图/已导出产物不受影响；
+    压缩进行中清空按钮被拒绝。
+11. **Retry**：让一项失败（如源文件不可读）→ 修复后点重试 → 同一行、`attemptCount`
+    加一、进度不倒退；重试成功后写一条新历史。
+12. **Restore**：覆盖模式下恢复 → 原图字节写回、行变 `restored`、历史 `Restored`；
+    再点一次不重复改动（`AlreadyRestored`）；压缩后手改过的文件先弹冲突确认。
+13. **Restore All / Export All（混合图片视频）**：只提交有产物的项；
+    成功/失败/文件不存在/跳过分别计数；产物被外部删掉的项标回 `outputMissing`。
+14. **外部删除产物**：在访达里删掉压缩结果 → 历史行显示「输出文件不存在」，
+    保存/对比/访达/重试消失；备份还在时恢复仍可把原图写回；备份也没了显示记录不完整。
+15. **恢复后重新压缩**：恢复后点重新压缩 → 回到 `pending`、旧产物路径与旧
+    `historyId` 不被复用，完成后产生新的历史 id。
+16. **压缩中退出并重启**：在覆盖提交窗口内强退 → 重启后事务恢复要么完成历史、
+    要么用备份回滚，不留下半写的目标文件或 orphan 临时文件。
+
+## 审查方案落地：恢复身份门 / 调度竞态 / 批次隔离 / 队列与扫描（2026-10-26）
+
+基线：本地 HEAD `97af890`（v0.3.1）+ 未提交工作区改动。外部审查基线 fd68b35
+（GitHub v0.3.4）在本仓库不是有效对象，无法直接 diff。本轮先逐项复核八阶段
+实施方案在当前工作区的真实状态，再只修确认缺口。
+
+### 复核结论（未在本轮重复实现的条目）
+
+以下条目经代码核实**已在工作区（未提交）实现**：输出不覆盖认领（§28/§54）、
+临时文件唯一（§30）、恢复会话闸门、Swift 跨格式扩展名、Alpha 判定补全、
+元数据三策略分立、指定体积停止语义（§61/§62）、事务日志持久化与临时路径
+先记账（§2.4）、历史写入失败处理与创建型事务（§2.6）、移除/重试/清空事件
+隔离（§3.3）、Swift 历史失败处理与 Rust 一致（§4.2）、视频编码前磁盘空间
+分项检查（§7.3）。这些修复随工作区一并提交前不得丢弃。
+
+### 本轮新修复
+
+1. **§3.4 调度器暂停/上限竞态（Rust）**：`pause()` 与 `set_max_parallelism()`
+   改为持有 usage 锁置位，`try_acquire_with_memory` 在同一临界区内读
+   `paused`；`acquire_with_memory` 拿到 permit 后补一次暂停复核（还回名额
+   继续等，不误当停止）。Swift 侧经核实本就同临界区（`acquireOutcome`），
+   无改动。
+2. **§5.3 视频批次单文件错误隔离**：后端 `resolve_video_tasks` 把
+   canonicalize 失败就地记成 failed（`SourceNotFound`）并当场播事件，不再用
+   `?` 让一张坏卡没收整批；前端 `validateVideoBatch` 逐项收集 `failures`
+   （不再第一个就短路），`markVideoPreflightFailures` 只标记坏行，其余视频
+   照常进入会话；能力级失效仍是会话级失败。
+3. **§2.5 启动恢复身份门（Rust + Swift 同构）**：`ReplaceTransaction` 新增
+   `original_sha256` / `output_sha256`（serde/Codable default，向后兼容）。
+   图片线在记账前以内存产物字节计算、视频线以 partial 文件计算；回滚前先
+   证明"源位置字节是本次事务的产物"才允许用备份覆盖；证明仍是原图则只清
+   残骸不重写；证明不了归属（外部修改）→ 保留备份与日志并报警告，绝不自动
+   覆盖。**无哈希的老日志维持升级前"一律回滚"契约**，不另造启发式。
+4. **§6.1 队列刷新 O(N²)**：`applyQueueView` 改用一次构建的 `Set(files)`；
+   `starting` 事件去掉双重全量刷新；视频 `encoding` tick（约 0.5s 一条）只
+   刷新对应行，不再全量重排——队列摘要/排序/可见性只在状态真正变化时刷新。
+5. **§6.4 目录扫描预过滤 + 有界并发**：`plausible_video_header` 容器魔数
+   嗅探（EBML/ftyp/RIFF-AVI/OggS/FLV/ASF/MPEG-PS/MPEG-TS），既非图片也无
+   媒体特征的文件不再各自起一次 ffprobe；候选视频按可用并行度（≤4）分块
+   并发探测，结果按导入序回槽，无扩展名但内容有效的视频仍可识别。
+
+### 本轮新增测试
+
+- Rust：`no_new_permit_outlives_a_returned_pause`（多线程压力，判据取
+  usage 锁内的发放计数）、`a_paused_gate_stays_shut_even_when_capacity_frees_up`、
+  `a_missing_video_fails_alone_and_never_sinks_the_batch`、
+  `video_header_sniffing_recognizes_containers_and_ignores_documents`、
+  `rollback_refuses_to_clobber_an_externally_modified_source`、
+  `rollback_restores_the_original_when_the_source_is_the_staged_output`、
+  `rollback_skips_the_rewrite_when_the_source_is_still_the_pristine_original`、
+  `a_cross_format_output_is_only_removed_when_its_content_matches`、
+  `legacy_logs_keep_the_pre_upgrade_recovery_contract`。
+- 前端：`tests/video-batch-isolation.cjs`（逐项校验、预检失败不连坐、能力级
+  失效、二次标记幂等）、`tests/queue-view-scale.cjs`（2000 项顺序语义 +
+  `files.includes` 回归绊线）。
+- Swift：HistoryStoreCheck `[21b]` 事务身份哈希 9 条断言（产物命中回滚、
+  原图未动只清场、外部修改保留现场、跨格式产物指纹判删）。
+
+### 门禁记录（2026-10-26，全部通过）
+
+```text
+cargo test                                                → 206 passed / 0 failed
+cargo test --features inproc-backends                     → 208 passed / 0 failed
+cargo test --no-default-features --features inproc-backends → 208 passed / 0 failed
+npm run test:frontend                                     → 25/25 PASS（含 2 个新测试）
+bash scripts/test_swift_history.sh                        → 全部通过（含 [21b]）
+```
+
+### 残留与阻塞（不冒充通过）
+
+- **§2.7 文件级操作互斥协调器**：未新建。现有会话级闸门
+  （`restore_blocked_by_session`、clear_history 守卫）+ 提交前后
+  SourceIdentity 双重复核已覆盖方案列出的实际竞态面；按文件粒度的协调器
+  评估为当前无可达场景，暂缓并在此留档。
+- **§6.3 视频封面**：串行、失败不阻塞、身份校验已有；未复用导入时 probe
+  （每次预览仍重新探测一次），收益有限暂缓。
+- **§6.4 扫描取消与进度事件**：未实现。导入是单次 await 调用，需要 UI 层
+  决策；预过滤后无关文件的 ffprobe 成本已消除。
+- **大批量基准（1000/5000/10000 项）、真实图片/视频 fixture 矩阵、三轨构建
+  与签名沙盒运行检查、发布门禁**：本轮未执行，维持"未通过/未验证"状态；
+  发布前必须按 AGENTS.md Release gate 补齐。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 

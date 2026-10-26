@@ -192,8 +192,10 @@
     const value = result || {};
     const originalBytes = Number(value.originalBytes != null ? value.originalBytes : (probe && probe.sizeBytes) || 0);
     const outputBytes = value.outputBytes == null ? null : Number(value.outputBytes);
-    const skippedLarger = value.skippedLarger === true || value.stage === 'skippedLarger' || value.reason === 'skippedLarger';
-    const success = value.success === true && !skippedLarger;
+    // 结论（outcome/reasonCode）才是"这次到底成没成、有没有产物"的出处；这里只把后端
+    // 字段整理成同一条形状，不再自己造旗标。从前这里用 skippedLarger 同时表达状态和
+    // 原因，于是同一件事在行、账、按钮上各有一种读法。
+    const success = value.success === true;
     const savings = outputBytes != null && originalBytes > 0
       ? ((originalBytes - outputBytes) / originalBytes) * 100
       : null;
@@ -207,10 +209,11 @@
       originalBytes,
       outputBytes,
       success,
-      skippedLarger,
       savings,
       outputMode: value.outputMode || normalizeOptions(options).outputMode,
       reason: value.reason || null,
+      outcome: value.outcome || null,
+      reasonCode: value.reasonCode || null,
     });
   }
 

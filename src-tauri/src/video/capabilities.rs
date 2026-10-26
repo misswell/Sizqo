@@ -14,8 +14,15 @@ impl CapabilityMatrix {
 pub fn capabilities()->CapabilityMatrix{CapabilityMatrix::unavailable(NATIVE_UNAVAILABLE.into())}
 #[cfg(not(feature="inproc-backends"))]
 pub fn capabilities()->CapabilityMatrix{
-    static CACHE:std::sync::OnceLock<CapabilityMatrix>=std::sync::OnceLock::new();
-    CACHE.get_or_init(||discover().unwrap_or_else(CapabilityMatrix::unavailable)).clone()
+    // 只固化成功的探测结果；失败的（启动时磁盘抖动 / bundle 尚未就绪）不留终身缓存，
+    // 下次调用重试 —— 一次性失败把视频判死一整个会话，比多跑一次探测更伤。
+    // 判定方向不变：探测失败只会得到 unavailable，绝不会被判成"支持"。
+    static CACHE:std::sync::Mutex<Option<CapabilityMatrix>>=std::sync::Mutex::new(None);
+    let mut slot=CACHE.lock().unwrap_or_else(|poisoned|poisoned.into_inner());
+    if let Some(cached)=slot.as_ref(){if cached.available{return cached.clone();}}
+    let discovered=discover().unwrap_or_else(CapabilityMatrix::unavailable);
+    if discovered.available{*slot=Some(discovered.clone());}
+    discovered
 }
 #[cfg(not(feature="inproc-backends"))]
 fn discover()->Result<CapabilityMatrix,String>{

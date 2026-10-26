@@ -208,4 +208,40 @@ for (const intent of intents.IMAGE_INTENTS.concat(intents.VIDEO_INTENTS)) {
 }
 assert.equal(englishText('均衡 · Q75 · 原格式'), 'Balanced · Q75 · Original format');
 
+// ── §22 能力矩阵：下拉与请求都由后端能力表决定，前端不再维护第二份白名单 ──
+const matrix = {
+  backend: 'inproc',
+  formats: [
+    { id: 'jpg', label: 'JPEG' },
+    { id: 'png', label: 'PNG' },
+    { id: 'heif', label: 'HEIF' },
+  ],
+  outputTargets: ['jpg', 'png'],
+  systemOutputTargets: ['jpg', 'heif'],
+  animationPreservingTargets: ['gif'],
+};
+intents.setImageCapabilities(matrix);
+assert.deepEqual(intents.imageOutputTargets(false), ['jpg', 'png'], '高级目标必须来自矩阵');
+assert.deepEqual(intents.imageOutputTargets(true), ['jpg', 'heif'], '系统目标必须来自矩阵');
+assert.equal(compile('custom', { outputFormat: 'webp' }).options.outputFormat, 'original',
+  '矩阵没给 WebP 时不许把请求发出去');
+assert.equal(compile('custom', { outputFormat: 'png' }).options.outputFormat, 'png');
+assert.equal(compile('systemConvert', { systemOutputFormat: 'heif' }).options.outputFormat, 'heif');
+assert.equal(compile('systemConvert', { systemOutputFormat: 'png' }).options.outputFormat, 'original',
+  '系统转换矩阵外的格式必须回落');
+assert.equal(intents.formatLabel('heif'), 'HEIF', '标签也来自矩阵');
+intents.setImageCapabilities(null);
+// 后端还没答复时也必须能编译：回落到保守集合，不抛错。
+assert.deepEqual(intents.imageOutputTargets(false), ['jpg', 'png', 'webp', 'avif']);
+assert.match(appJs, /invoke\('get_image_capabilities'\)/, '前端必须从后端读能力矩阵');
+assert.match(appJs, /fillImageFormatSelect\('outputFormat', matrix\.outputTargets/,
+  '高级输出下拉必须由矩阵填充');
+// Swift 轨用同一张能力表驱动下拉，不允许再手写第二份格式列表。
+const swiftCaps = read('swift/Sources/SizqoSwift/Models/ImageCapabilities.swift');
+assert.match(swiftCaps, /static func matrix\(\)/, 'Swift 必须有能力矩阵');
+assert.match(swiftCaps, /animatedSupported[\s\S]*systemConvertible/, 'Swift 矩阵字段必须与 Rust 对齐');
+assert.match(swiftUI, /ForEach\(OutputFormat\.advancedTargets/, 'Swift 高级下拉必须由矩阵驱动');
+assert.match(swiftUI, /ForEach\(OutputFormat\.systemTargets/, 'Swift 系统下拉必须由矩阵驱动');
+assert.doesNotMatch(swiftUI, /Text\("WebP"\)\.tag/, 'Swift 下拉不许再手写格式列表');
+
 console.log('PASS: 意图表 ↔ 编译器 ↔ 界面 ↔ 引擎 ↔ 英文文案 五者一致');

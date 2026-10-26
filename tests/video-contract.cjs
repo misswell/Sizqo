@@ -49,14 +49,27 @@ assert.equal(video.estimateOutputBytes(sdr, {...defaults, mode: 'crf'}), null,
   'CRF output estimates stay unknown instead of claiming a compression ratio');
 assert.equal(video.estimateOutputBytes(sdr, {...defaults, mode: 'targetSize', targetMiB: 24}).bytes, 24 * 1024 * 1024);
 
-const larger = video.normalizeResult({success: false, sourcePath: '/movie.mov', outputPath: null, originalBytes: 100, outputBytes: 110, reason: 'skippedLarger'}, '/movie.mov', sdr, defaults);
-assert.equal(larger.skippedLarger, true);
+// §139 第三阶段：skippedLarger 这个"既是状态又是原因"的旧旗标已经删掉。
+// 有效但没变小 = 结论 skipped_no_benefit + 原因 output_larger_than_source，
+// 前端只转述后端交回的结论，不再自己合成第三种事实。
+const larger = video.normalizeResult({success: false, sourcePath: '/movie.mov', outputPath: null, originalBytes: 100, outputBytes: 110, outcome: 'skipped_no_benefit', reasonCode: 'output_larger_than_source'}, '/movie.mov', sdr, defaults);
+assert.equal(larger.skippedLarger, undefined, '旧旗标不许再被前端造出来');
 assert.equal(larger.success, false);
+assert.equal(larger.outcome, 'skipped_no_benefit');
+assert.equal(larger.reasonCode, 'output_larger_than_source');
 assert.equal(larger.savings, -10);
 console.log('PASS: video options honor runtime capabilities, source timing, HDR safeguards, and honest size results');
 const nodeFs = require('node:fs');
 const nodePath = require('node:path');
 const appJs = nodeFs.readFileSync(nodePath.join(__dirname, '..', 'frontend', 'app.js'), 'utf8');
+// 注释里正是在解释这条禁令，所以扫描前先去掉注释行（JS 与 Rust 都用 //）。
+const codeOnly = source => source.split('\n').filter(line => !line.trim().startsWith('//')).join('\n');
+for (const name of ['frontend/app.js', 'frontend/video-settings.js', 'frontend/result_state.js',
+                    'src-tauri/src/video/ffmpeg_backend.rs']) {
+  const source = nodeFs.readFileSync(nodePath.join(__dirname, '..', name), 'utf8');
+  assert.doesNotMatch(codeOnly(source), /skippedLarger/, `${name} 又读回或写回了 skippedLarger`);
+}
+console.log('PASS: skippedLarger 旧旗标已删除，跳过只由结论与原因码说');
 const appWithoutLoader = appJs.replace(/async function loadVideoCapabilities\(\)[\s\S]*?\n}/, '');
 assert.match(appWithoutLoader, /loadVideoCapabilities\(\)/,
   '启动流程必须调用 loadVideoCapabilities（只定义不调用 = 预设/编码器下拉永远空白）');

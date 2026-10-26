@@ -74,6 +74,11 @@ fn available_parallelism() -> usize {
     thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
+/// 物理内存总量。解码预算按它定（§63）；拿不到就返回 None，由调用方用兜底值。
+pub fn physical_memory_bytes() -> Option<usize> {
+    sysctl_usize("hw.memsize").filter(|bytes| *bytes > 0)
+}
+
 /// 性能核数量。只有大小核架构（`hw.nperflevels > 1`）才有意义。
 fn performance_cpus() -> Option<usize> {
     if perf_levels()? <= 1 {

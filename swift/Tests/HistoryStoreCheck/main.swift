@@ -142,6 +142,15 @@ func result(file: String, size: Int64, outType: String = "png") -> CompressResul
     return item
 }
 
+/// 契约里全部 23 种理由。列在这儿而不是抄两遍，是为了让「漏了一种」在两个地方同时炸。
+let allReasonCodes: [ReasonCode] = [
+    .alreadyUnderTarget, .noSizeReduction, .outputLargerThanSource, .targetUnmet, .sourceReadFailed,
+    .sourceNotFound, .permissionDenied, .sourceChanged, .unsupportedFormat, .invalidInput,
+    .decodeFailed, .encodeFailed,
+    .outputValidationFailed, .outputWriteFailed, .outputCollision, .backupFailed,
+    .transactionFailed, .historyWriteFailed, .rollbackFailed, .outputMissing, .cancelled, .stopped, .unknown,
+]
+
 // ─── 1. 同一张图重压多次：备份永远是第一次压缩之前的真正原图 ────────────────
 print("[1] ensureBackup 绝不覆盖真正原图")
 do {
@@ -151,12 +160,27 @@ do {
 
     let first = store.ensureBackup(for: source)
     writeData(source, [9, 9, 9]) // 模拟第一次压缩覆盖了原图
+    // 生产顺序：第一次压缩提交后先记历史（产物大小 + mtime 入账），下一轮的
+    // ensureBackup 靠它认出「现在的字节是我们自己的产物」→ 复用最早的备份。
+    let round1 = HistoryEntry.record(
+        source: source, result: result(file: source, size: 3),
+        output: source, backup: first, retentionDays: 3
+    )
+    _ = store.add(round1)
     let second = store.ensureBackup(for: source)
 
     check(first != nil, "第一次备份成功")
     check(first == second, "同一张图复用同一个备份槽位")
     check(first.flatMap { readBytes($0) } == [1, 1, 1], "备份里仍是真正的原图，不是上一版压缩结果")
     check(readBytes(source) == [9, 9, 9], "重压不改动磁盘上的当前版本")
+
+    // 用户在两轮之间自己改了文件（不是我们的产物）：那份字节必须有属于
+    // 自己的一份快照，否则 replace 一提交就再也找不回来。
+    writeData(source, [7, 7, 7, 7])
+    let third = store.ensureBackup(for: source)
+    check(third != nil && third != first, "外部编辑的字节有自己的备份槽位")
+    check(readBytes(third!) == [7, 7, 7, 7], "新槽位备份的是用户的编辑")
+    check(readBytes(first!) == [1, 1, 1], "最早的备份不许被覆盖")
 }
 
 // ─── 2. 备份 key 跨启动稳定 ────────────────────────────────────────────────
@@ -254,7 +278,7 @@ do {
     store.add(second)
 
     let ids = try? store.restore(entry: first, force: false)
-    check(ids?.count == 2, "共享同一备份的两条记录一起处理（\(ids?.count ?? 0) 条）")
+    check(ids?.historyIds.count == 2, "共享同一备份的两条记录一起处理（\(ids?.historyIds.count ?? 0) 条）")
     check(readBytes(source) == [1, 2, 3], "写回的是真正的原图")
     check(!fm.fileExists(atPath: output), "跨格式的压缩结果不留孤儿")
     check(!fm.fileExists(atPath: backup), "备份目录已清理")
@@ -317,8 +341,13 @@ do {
     check(!HistoryStore.hasConflict(entry), "1 秒抖动不误报")
     entry.outputModifiedAt = current - 60_000
     check(HistoryStore.hasConflict(entry), "1 分钟差 = 真被改过")
+    // 非覆盖模式的产物被外部改过同样算冲突：撤销 = 删产物，静默删掉用户的编辑
+    // 就是丢数据（与覆盖模式同一份判据）。
     entry.outputMode = "suffix"
-    check(!HistoryStore.hasConflict(entry), "非覆盖模式永不报冲突")
+    entry.outputPath = source
+    check(HistoryStore.hasConflict(entry), "非覆盖产物被改过 = 冲突")
+    entry.outputModifiedAt = current - 1_000
+    check(!HistoryStore.hasConflict(entry), "非覆盖产物没被改过 = 不冲突")
 }
 
 // ─── 7. 后缀/目录模式：撤销 = 只删这次生成的压缩结果 ───────────────────────
@@ -337,7 +366,7 @@ do {
     store.add(entry)
 
     let ids = try? store.restore(entry: entry, force: false)
-    check(ids == [entry.id], "撤销返回被处理的记录 id")
+    check(ids?.historyIds == [entry.id], "撤销返回被处理的记录 id")
     check(!fm.fileExists(atPath: output), "这次生成的压缩结果被删掉")
     check(readBytes(source) == [1, 1, 1], "原图从头到尾没被碰过")
     check(store.find(entry.id) == nil, "撤销后这条历史不再存在")
@@ -430,7 +459,7 @@ do {
     check(!scheduler.isPaused, "初始未暂停")
     check(scheduler.phase == .idle, "没有批次在跑时状态为 idle")
 
-    scheduler.beginBatch()
+    check(scheduler.tryBeginBatch(), "占住这一轮会话")
     check(scheduler.phase == .running, "批次开始后状态为 running")
     scheduler.pause()
     check(scheduler.isPaused, "pause 后处于暂停")
@@ -452,8 +481,14 @@ do {
     group.wait()
     check(meter.peak == 1, "resume 后等待中的任务继续")
 
+    // §37：正在跑的那一轮被拒的第二入口抢不动，也不许把它的暂停解除。
     scheduler.pause()
-    scheduler.beginBatch()
+    check(!scheduler.tryBeginBatch(), "已经有一轮在跑时，第二个入口必须被拒")
+    check(scheduler.isPaused, "被拒的入口不许把正在跑那一轮的暂停悄悄解除")
+    check(scheduler.phase == .paused, "被拒的入口也不许改写正在跑那一轮的阶段")
+    scheduler.resume()
+    scheduler.endBatch()
+    check(scheduler.tryBeginBatch(), "上一轮收尾后，下一轮才准占住会话")
     check(!scheduler.isPaused, "新批次不继承上一批的暂停")
     scheduler.pause()
     scheduler.endBatch()
@@ -489,7 +524,7 @@ do {
 print("[14] CPU 上限限住并发任务数")
 do {
     let four = CompressionScheduler(maxParallelism: 4)
-    four.beginBatch(maxParallelism: 4)
+    check(four.tryBeginBatch(maxParallelism: 4), "上限 4 的那一轮占住会话")
     let (meter4, group4) = launchTasks(four, tasks: 100, holdSeconds: 0.002)
     group4.wait()
     check(meter4.done == 100, "100 个任务一个都没少")
@@ -498,7 +533,7 @@ do {
     four.endBatch()
 
     let one = CompressionScheduler(maxParallelism: 1)
-    one.beginBatch(maxParallelism: 1)
+    check(one.tryBeginBatch(maxParallelism: 1), "上限 1 的那一轮占住会话")
     let (meter1, group1) = launchTasks(one, tasks: 30, holdSeconds: 0.001)
     group1.wait()
     check(meter1.peak == 1, "上限 1 时严格串行（峰值 \(meter1.peak)）")
@@ -513,7 +548,7 @@ do {
 print("[15] 运行中下调 / 上调上限")
 do {
     let scheduler = CompressionScheduler(maxParallelism: 8)
-    scheduler.beginBatch(maxParallelism: 8)
+    check(scheduler.tryBeginBatch(maxParallelism: 8), "上限 8 的那一轮占住会话")
     let (meter, group) = launchTasks(scheduler, tasks: 16, holdSeconds: 0.06)
     check(waitUntil { scheduler.activeJobs == 8 }, "上限 8 时确实同时跑着 8 个")
 
@@ -536,7 +571,7 @@ do {
 
     // 2 → 6：等待中的 worker 要立刻被唤醒，而不是靠 250ms 超时兜底。
     let up = CompressionScheduler(maxParallelism: 2)
-    up.beginBatch(maxParallelism: 2)
+    check(up.tryBeginBatch(maxParallelism: 2), "上限 2 的那一轮占住会话")
     let (_, upGroup) = launchTasks(up, tasks: 20, holdSeconds: 0.06)
     check(waitUntil { up.activeJobs == 2 }, "上调前先按 2 跑着")
     up.setMaxParallelism(6)
@@ -553,7 +588,7 @@ do {
 print("[16] 暂停 × CPU 上限")
 do {
     let scheduler = CompressionScheduler(maxParallelism: 2)
-    scheduler.beginBatch(maxParallelism: 2)
+    check(scheduler.tryBeginBatch(maxParallelism: 2), "上限 2 的那一轮占住会话")
     let (meter, group) = launchTasks(scheduler, tasks: 12, holdSeconds: 0.02)
     check(waitUntil { scheduler.activeJobs == 2 }, "上限 2 生效")
 
@@ -867,6 +902,63 @@ do {
     check(fm.fileExists(atPath: brokenJournal.root + "/broken.unparsed"), "现场改名留档")
 }
 
+// ─── 21b. 带指纹的新日志：启动恢复先证明源位置字节的归属，再决定动不动手 ────
+print("[21b] 事务身份哈希：证明得了归属才动手")
+do {
+    let root = freshRoot("21c")
+    let store = HistoryStore(root: root)
+    let journal = OutputTransactionStore(root: root)
+    let dir = NSTemporaryDirectory() + "sizqo-check-21c"
+    try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let source = canonicalPath(dir + "/a.png")
+    let backupFile = dir + "/original.png"
+    writeData(backupFile, [1, 2, 3])
+    let originalHash = sha256OfData(Data([1, 2, 3]))
+    let outputHash = sha256OfData(Data([9, 9, 9]))
+    let record = { (id: String, crossFormat: Bool, outputPath: String) -> ReplaceTransaction in
+        ReplaceTransaction(
+            id: id, historyId: id, sourcePath: source, outputPath: outputPath,
+            backupPath: backupFile, tempOutputPath: nil,
+            originalSize: 3, expectedOutputSize: 3,
+            originalSha256: originalHash, outputSha256: outputHash,
+            createdAt: SizqoClock.nowMillis, crossFormat: crossFormat)
+    }
+
+    // 源位置就是这次写出的字节（rename 后、历史落盘前崩溃）→ 安全回滚成原图。
+    makeFile(source, [9, 9, 9])
+    _ = journal.prepare(record("t-hash-output", false, source))
+    let staged = journal.recover(store)
+    check(staged.rolledBack == 1 && staged.warnings.isEmpty,
+          "源位置上是本次产物 → 回滚（\(staged.warnings.joined(separator: " / "))）")
+    check(readBytes(source) == [1, 2, 3], "回滚写回真正原图")
+
+    // 源文件还是没动过的原图（rename 之前崩溃）→ 不做无谓的重写，只清残骸。
+    makeFile(source, [1, 2, 3])
+    _ = journal.prepare(record("t-hash-pristine", false, source))
+    check(journal.recover(store).rolledBack == 1, "原图没动过的事务照常销账")
+    check(readBytes(source) == [1, 2, 3], "原图一个字节都不该被重写")
+
+    // 崩溃之后、重启之前源文件被外部改过 → 绝不盖回去：备份与日志都留着。
+    makeFile(source, [7, 7, 7])
+    _ = journal.prepare(record("t-hash-foreign", false, source))
+    let foreign = journal.recover(store)
+    check(foreign.rolledBack == 0 && foreign.warnings.count == 1,
+          "外部修改过的事务不许自动回滚：\(foreign.warnings.joined(separator: " / "))")
+    check(readBytes(source) == [7, 7, 7], "外部修改必须原样保留")
+    check(fm.fileExists(atPath: backupFile), "唯一的原图副本不许动")
+    check(journal.hasPending(), "事务日志必须留着，等下一次启动再试")
+
+    // 跨格式：产物被外部换成别的内容时，只删对得上指纹的，别人占的位置不动。
+    let png = canonicalPath(dir + "/photo.png")
+    let webp = dir + "/photo.webp"
+    makeFile(png, [1, 2, 3])
+    writeData(webp, [5, 5])
+    _ = journal.prepare(record("t-hash-cross", true, webp))
+    _ = journal.recover(store)
+    check(fm.fileExists(atPath: webp), "来历不明的内容不许当成自己的残骸删掉")
+    check(readBytes(png) == [1, 2, 3], "原图原样保留")
+}
+
 // ─── 22. 备份必须"文件 + 来历记录"双全，缺一半就不算备份 ────────────────────
 print("[22] 备份必须文件与来历记录双全")
 do {
@@ -958,7 +1050,7 @@ do {
 print("[25] 取消与暂停互不干扰")
 do {
     let scheduler = CompressionScheduler(maxParallelism: 2)
-    scheduler.beginBatch()
+    check(scheduler.tryBeginBatch(), "占住这一轮会话")
     scheduler.pause()
     let meter = PeakMeter()
     let group = DispatchGroup()
@@ -1060,6 +1152,8 @@ do {
     let doneActions = historyRowActions(store.find(restoredEntry.id)!)
     check(!doneActions.contains(.restore) && !doneActions.contains(.deleteOutput),
           "已恢复的行不再提供反悔按钮")
+    check(doneActions == tail,
+          "已恢复的行不许再拿写回后的原图冒充产物：另存为 / 对比 / 播放输出都不出现，实际 \(doneActions)")
 
     // ⑥ history.json 损坏后按备份重建的条目：明细丢了，恢复仍然必须在
     let rebuiltSource = canonicalPath(dir + "/e.png")
@@ -1074,8 +1168,8 @@ do {
         backupPath: rebuiltBackup, status: .recoveryAvailable,
         restoredAt: nil, outputModifiedAt: nil,
         sourceExists: true, backupExists: true, outputExists: true)
-    check(historyRowActions(rebuilt) == [.saveAs, .compare, .restore] + tail,
-          "重建条目照样给恢复按钮 —— 它存在的意义就是这个")
+    check(historyRowActions(rebuilt) == [.restore] + tail,
+          "重建条目只给恢复与日志 —— 没有压缩明细，不许拿源文件冒充产物")
 }
 
 // ─── 27. 停止整批：等待中的作废，已经在跑的跑完（与 Rust / Tauri 线同语义） ──
@@ -1101,7 +1195,7 @@ final class FlagBox: @unchecked Sendable {
 print("[27] 停止是批次级的，且不可逆")
 do {
     let scheduler = CompressionScheduler(maxParallelism: 2)
-    scheduler.beginBatch()
+    check(scheduler.tryBeginBatch(), "占住这一轮会话")
     let meter = PeakMeter()
     let running = DispatchGroup()
     // 先占满两个名额 —— 这两个就是"正在压缩的图片"。
@@ -1165,7 +1259,7 @@ do {
     scheduler.endBatch()
     check(scheduler.phase == .idle, "批次收尾回到 idle")
     check(!scheduler.isStopping, "停止标志不泄漏到下一批")
-    scheduler.beginBatch()
+    check(scheduler.tryBeginBatch(), "占住这一轮会话")
     check(scheduler.phase == .running, "新一批从 running 开始")
     scheduler.endBatch()
 }
@@ -1174,7 +1268,7 @@ do {
 print("[28] 暂停中停止")
 do {
     let scheduler = CompressionScheduler(maxParallelism: 1)
-    scheduler.beginBatch()
+    check(scheduler.tryBeginBatch(), "占住这一轮会话")
     let held = scheduler.acquire()
     scheduler.pause()
     check(scheduler.phase == .paused, "先暂停")
@@ -1384,7 +1478,812 @@ do {
           "load/cycle 都要走同一个 applyThemeAppearance")
 }
 
+print("[33] Evaluate 是唯一回答「这些字节值不值得落盘」的地方")
+do {
+    func eval(
+        _ verdict: EncodeVerdict, reason: ReasonCode = .unknown, success: Bool = true,
+        bytes: Int = 800, original: Int = 1000, convert: Bool = false, targetMet: Bool? = nil
+    ) -> Evaluation {
+        Evaluation.evaluate(verdict: verdict, engineReason: reason, engineSuccess: success,
+                            encodedBytes: bytes, originalSize: original,
+                            formatConversion: convert, targetMet: targetMet)
+    }
+    check(eval(.candidate, bytes: 800) == .commit(targetUnmet: false), "压小了才提交")
+    check(eval(.candidate, bytes: 1000) == .skip(.noSizeReduction), "一样大既不是收益也不是失败，绝不提交")
+    check(eval(.candidate, bytes: 1200) == .skip(.outputLargerThanSource), "压完更大是已跳过（AGENTS.md 第 7 条）")
+    check(eval(.keptOriginal, reason: .alreadyUnderTarget, bytes: 1000) == .skip(.alreadyUnderTarget),
+          "交回原图字节 = 压根没进编码，不是压缩成功")
+    check(eval(.keptOriginal, reason: .noSizeReduction, convert: true) == .skip(.noSizeReduction),
+          "要换格式却没产出新格式：落盘的会是原图副本，不能算转换成功")
+    check(eval(.candidate, bytes: 5000, original: 1000, convert: true) == .commit(targetUnmet: false),
+          "用户明确要换格式时，判据是那个格式在不在，不是有没有变小")
+    check(eval(.candidate, targetMet: false) == .commit(targetUnmet: true), "有产物却没打中预算 → 未达成")
+    check(eval(.candidate, bytes: 0) == .fail(.encodeFailed), "零字节不可能是产物")
+    check(eval(.candidate, success: false) == .fail(.unknown), "判据与 success 打架 → 判失败，不冒充成功")
+    check(eval(.rejected, reason: .unsupportedFormat) == .fail(.unsupportedFormat), "连候选都没有 → 失败并带上原因")
+    check(eval(.failed) == .fail(.encodeFailed), "失败却没标原因 → 归到编码失败，绝不留白")
+
+    check(Evaluation.skip(.noSizeReduction).preWriteOutcome == (.skippedNoBenefit, .noSizeReduction), "跳过在写盘前就定案")
+    check(Evaluation.commit(targetUnmet: false).preWriteOutcome.outcome == nil, "提交一支不许在落盘前预先承诺结论")
+    check(Evaluation.commit(targetUnmet: true).committedOutcome == (.targetUnmet, .targetUnmet), "未达目标是带产物的合法结论")
+    check(Evaluation.commit(targetUnmet: false).committedOutcome == (.committed, nil), "落盘之后才写 committed")
+}
+
+print("[34] 一条结果有没有产物，只有契约一处回答")
+do {
+    func contract(
+        _ outcome: ResultOutcome?, reason: ReasonCode? = nil,
+        path: String? = nil, error: String? = nil
+    ) -> CompressResult {
+        var item = result(file: "/tmp/a.png", size: 800)
+        item.outcome = outcome
+        item.reasonCode = reason
+        item.outputPath = path
+        item.error = error
+        return item
+    }
+    let committed = contract(.committed, path: "/tmp/a.min.png")
+    let skipped = contract(.skippedNoBenefit, reason: .outputLargerThanSource, error: "原图已是最优，无需替换")
+    let unmet = contract(.targetUnmet, reason: .targetUnmet, path: "/tmp/a.min.png")
+    let failed = contract(.failed, reason: .decodeFailed, error: "macOS 无法解码此图像")
+
+    check(committed.hasProduct && !skipped.hasProduct, "没落盘的那一支不许冒充产物")
+    check(!skipped.hasProduct && skipped.contractQueueStatus == .done, "跳过是这一轮处理完了，不是失败")
+    check(failed.contractQueueStatus == .failed, "只有真的坏了才是失败")
+    check(skipped.contractStatusText == "已跳过", "跳过读成「已跳过」，不是「已完成」")
+    check(unmet.contractStatusText == "已完成 · 未达到目标" && unmet.capabilities.retry, "未达目标要说清没兑现，且能重试")
+    check(committed.capabilities == ResultCapabilities(save: true, compare: true, restore: true,
+                                                        finder: true, retry: false, log: true),
+          "已达成给全套按钮，唯独不给重试——重试不会得到不同结果")
+    check(!skipped.capabilities.save && !skipped.capabilities.compare
+            && !skipped.capabilities.restore && !skipped.capabilities.finder,
+          "没有产物 → 指向那个文件的按钮一个都不许出现，而不是点了再报错")
+    check(skipped.capabilities.retry && skipped.capabilities.log, "跳过至少能重试、能看日志")
+    check(skipped.contractReasonText == "压缩后文件更大", "「为什么」按 reasonCode 选句子")
+    check(skipped.contractDetailText.hasPrefix("压缩后文件更大 · ")
+            && skipped.contractDetailText.contains("原图已是最优，无需替换"),
+          "后端原话仍进悬停/详情备查，但不再充当任何状态")
+    check(!committed.contractShowsWarning && skipped.contractShowsWarning && unmet.contractShowsWarning,
+          "三角只说「没产物」或「产物没达标」")
+
+    let allReasons = allReasonCodes
+    let blankReasons = allReasons.filter { contract(.failed, reason: $0).contractReasonText.isEmpty }
+    check(blankReasons.isEmpty, "有原因却没有句子可说，界面会留白让用户自己猜：\(blankReasons.map { $0.rawValue })")
+
+    var noConclusion = result(file: "/tmp/old.png", size: 900)
+    noConclusion.outputPath = "/tmp/old.min.png"
+    check(!noConclusion.hasProduct && noConclusion.contractStatusText == "未产出文件",
+          "§139 第四阶段：没有结论就不许拿 outputPath 猜一个产物")
+    check(noConclusion.contractQueueStatus == .failed && noConclusion.contractLogStatus.status == "unknown",
+          "没有结论的生命周期是 Failed、日志写 unknown，不反推 success")
+    check(committed.contractLogStatus.status == "committed"
+            && skipped.contractLogStatus.reason == "output_larger_than_source",
+          "日志写契约原词，跨轨对账才认得出来")
+}
+
+print("[35] 发布前核对：结论与字段不自洽必须被拦下")
+do {
+    func violation(_ outcome: ResultOutcome?, _ path: String?) -> Bool {
+        invariantViolation(mediaKind: "image", file: "a.png", outcome: outcome, outputPath: path) != nil
+    }
+    check(violation(nil, nil), "没有结论就被发布是后端 bug，不许默认读成完成")
+    check(violation(.committed, nil), "说「已提交」却没有路径 = 指向空气")
+    check(violation(.skippedNoBenefit, "/tmp/a.png"), "说「已跳过」却带着路径，会被历史/恢复/当成产物")
+    check(!violation(.targetUnmet, "/tmp/a.png") && !violation(.failed, nil), "带产物的未达成与不带的失败都合法")
+}
+
+print("[36] 三轨同源：字面量只有一份，视图不再自己判")
+do {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+    func read(_ relative: String) throws -> String {
+        try String(contentsOfFile: repoRoot.appendingPathComponent(relative).path, encoding: .utf8)
+    }
+    let rust = try read("src-tauri/src/result_model.rs")
+    let web = try read("frontend/result_state.js")
+    let own = try read("swift/Sources/SizqoSwift/Models/ResultContract.swift")
+
+    let outcomeLiterals = ["committed", "skipped_no_benefit", "skipped_already_under_target",
+                           "target_unmet", "cancelled", "failed"]
+    let reasonLiterals = ["already_under_target", "no_size_reduction", "output_larger_than_source",
+                          "target_unmet", "source_read_failed", "source_not_found", "permission_denied",
+                          "source_changed", "unsupported_format",
+                          "invalid_input", "decode_failed", "encode_failed", "output_validation_failed",
+                          "output_write_failed", "output_collision", "backup_failed", "transaction_failed",
+                          "history_write_failed", "rollback_failed", "output_missing", "cancelled", "stopped",
+                          "unknown"]
+    func missing(in source: String, literals: [String], quotedBy: (String) -> String) -> [String] {
+        literals.filter { !source.contains(quotedBy($0)) }
+    }
+    let allLiterals = outcomeLiterals + reasonLiterals
+    let rustMissing = missing(in: rust, literals: allLiterals, quotedBy: { "\"\($0)\"" })
+    let webMissing = missing(in: web, literals: allLiterals, quotedBy: { "'\($0)'" })
+    check(rustMissing.isEmpty, "同一份契约的字面量必须三轨一致，Direct 线缺：\(rustMissing)")
+    check(webMissing.isEmpty, "同一份契约的字面量必须三轨一致，前端缺：\(webMissing)")
+
+    // Swift 这边比的是**枚举真实的 rawValue**（那才是跨过 JSON 边界的东西），不是源码里的写法。
+    let swiftOutcomes = [ResultOutcome.committed, .skippedNoBenefit, .skippedAlreadyUnderTarget,
+                         .targetUnmet, .cancelled, .failed].map(\.rawValue)
+    check(Set(swiftOutcomes) == Set(outcomeLiterals),
+          "Swift 的结论取值与契约表对不上：\(Set(swiftOutcomes).symmetricDifference(Set(outcomeLiterals)).sorted())")
+    check(Set(allReasonCodes.map(\.rawValue)) == Set(reasonLiterals),
+          "Swift 的理由取值与契约表对不上，差集：\(Set(allReasonCodes.map(\.rawValue)).symmetricDifference(Set(reasonLiterals)).sorted())")
+    check(Set(outcomeLiterals + reasonLiterals).count == outcomeLiterals.count + reasonLiterals.count - 2,
+          "字面量表本身要自洽（target_unmet / cancelled 同时是结论与原因）")
+
+    // §70 的措辞表也只有一个版本：同样的结论在两条线上必须说同一句话。
+    let wording = ["已完成 · 未达到目标", "已取消", "处理失败", "已跳过", "已完成", "未产出文件"]
+    let webMissingWording = wording.filter { !web.contains($0) || !own.contains($0) }
+    check(webMissingWording.isEmpty, "§70 措辞表在某一轨上被改写了：\(webMissingWording)")
+
+    // 注释里正是在解释这条禁令，所以扫描前先去掉注释行。
+    func codeOnly(_ source: String) -> String {
+        source.split(separator: "\n").map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+    }
+    let appState = codeOnly(try read("swift/Sources/SizqoSwift/ViewModels/AppState.swift"))
+    // §139 第四阶段：CompressResult.success 已删除，连「回写旧旗标」都不再放行；
+    // 只剩引擎自身判据（EngineResult）与恢复命令的结论（RestoreOutcome）。
+    let allowed: [NSRegularExpression] = [
+        try NSRegularExpression(pattern: #"(?:engineResult|outcome)\.success"#),
+    ]
+    let readers = appState.split(separator: "\n").map(String.init).filter { line in
+        line.contains(".success") && !allowed.contains {
+            $0.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil
+        }
+    }
+    check(readers.isEmpty, "AppState 里除引擎判据、命令结论和契约回写外，不许再读 success：\(readers)")
+
+    for name in ["Views/ContentView.swift", "Views/CompareView.swift"] {
+        let view = codeOnly(try read("swift/Sources/SizqoSwift/\(name)"))
+        let paletteOnly = allowed + [try NSRegularExpression(pattern: #"SizqoPalette\.success"#)]
+        let viewReaders = view.split(separator: "\n").map(String.init).filter { line in
+            line.contains(".success") && !paletteOnly.contains {
+                $0.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil
+            }
+        }
+        check(viewReaders.isEmpty, "视图里又长出了第二条 success 判据——两个窗口会各判一次：\(name) \(viewReaders)")
+        check(view.contains("hasProduct") || view.contains("contract"),
+              "\(name) 必须通过结果契约读结论")
+    }
+}
+
+print("[37] §30 临时文件名随机：并发落盘不许撞名，也不许留下半成品")
+do {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("sizqo-staged-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(atPath: dir.path, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: dir.path) }
+
+    let lock = NSLock()
+    var temps: [String] = []
+    var problems: [String] = []
+    DispatchQueue.concurrentPerform(iterations: 100) { index in
+        let target = dir.appendingPathComponent("out-\(index).png").path
+        let bytes = Data("payload-\(index)".utf8)
+        guard let staged = StagedWrite.write(target: target, bytes: bytes) else {
+            lock.withLock { problems.append("#\(index) 没能暂存") }
+            return
+        }
+        lock.withLock { temps.append(staged.temp) }
+        let onDisk = (try? Data(contentsOf: URL(fileURLWithPath: target))) ?? Data()
+        if onDisk != bytes {
+            lock.withLock { problems.append("#\(index) 落盘的是别人的字节") }
+        }
+    }
+    check(problems.isEmpty, "100 个并发落盘互相踩了：\(problems)")
+    check(Set(temps).count == temps.count, "并发任务算出了同一个临时文件名")
+    check(temps.allSatisfy { $0.hasPrefix(dir.appendingPathComponent(".sizqo-write-").path) },
+          "临时文件不再认得出是 Sizqo 写的")
+    let leftovers = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+        .filter { $0.hasSuffix(".tmp") }
+    check(leftovers.isEmpty, "落盘之后还留着临时文件：\(leftovers)")
+
+    // §30 点名禁的是"用时钟拼临时名"：源码里再出现一次就直接失败，不靠并发测试兜。
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+    let clockNamed = try ["Services/OutputTransactionStore.swift", "Services/HistoryStore.swift"]
+        .flatMap { name -> [String] in
+            let source = try String(
+                contentsOfFile: repoRoot.appendingPathComponent("swift/Sources/SizqoSwift/\(name)").path,
+                encoding: .utf8)
+            let pattern = try NSRegularExpression(pattern: #"\(SizqoClock\.\w+\)[^"]*\.tmp"#)
+            let range = NSRange(source.startIndex..., in: source)
+            return pattern.matches(in: source, range: range).map { match in
+                String(source[Range(match.range, in: source)!])
+            }
+        }
+    check(clockNamed.isEmpty, "又有临时文件按时钟命名了：\(clockNamed)")
+}
+
+print("[38] §28 §29 §54 输出名只有一份分配器，事务按模式各自收场")
+do {
+    let dir = NSTemporaryDirectory() + "sizqo-check-38-\(UUID().uuidString)"
+    try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(atPath: dir) }
+
+    // ① 后缀模式：已存在的名字一律跳过，占位是 0 字节，邻居的字节一个都不许动。
+    makeFile(dir + "/photo_compressed.jpg", [7, 7, 7])
+    makeFile(dir + "/photo_compressed_1.jpg", [8, 8, 8])
+    let suffixNaming = OutputNaming.withSuffix(stem: "photo", suffix: "_compressed", extension: "jpg")
+    if let third = OutputNameAllocator.claim(in: dir, suffixNaming) {
+        check(third.path == dir + "/photo_compressed_2.jpg",
+              "前两个名字都被占了，该取第 3 个（实际 \(third.path)）")
+        check(fileLength(third.path) == 0, "占位必须是 0 字节：名字先于内容归这次事务")
+        third.release()
+        check(!fm.fileExists(atPath: dir + "/photo_compressed_2.jpg"),
+              "release 要能把没写成的占位收回去")
+    } else {
+        check(false, "两个名字被占了就该取第 3 个，结果一个都没拿到")
+    }
+    check(readBytes(dir + "/photo_compressed.jpg") == [7, 7, 7]
+          && readBytes(dir + "/photo_compressed_1.jpg") == [8, 8, 8],
+          "第二次压缩把第一次的产物盖掉了 —— 用户要的正是「各留一份」")
+
+    // ② 跨格式覆盖：首选"原图换扩展名"，撞了才带 _converted（与 Rust 同一条序列）。
+    let converted = OutputNaming.converted(stem: "photo", extension: "webp")
+    check(converted.candidate(0) == "photo.webp"
+          && converted.candidate(1) == "photo_converted.webp"
+          && converted.candidate(2) == "photo_converted_2.webp",
+          "跨格式的名字序列改了：三条轨得同时改，不能只动一处")
+    makeFile(dir + "/photo.webp", [5, 5])
+    if let first = OutputNameAllocator.claim(in: dir, converted) {
+        check(first.path == dir + "/photo_converted.webp",
+              "photo.webp 是邻居的成品，「转换」不许盖掉它（实际 \(first.path)）")
+        if let second = OutputNameAllocator.claim(in: dir, converted) {
+            check(second.path == dir + "/photo_converted_2.webp",
+                  "两个 _converted 都在场，就排第 2 号")
+            second.release()
+        } else { check(false, "第二个 _converted 名字申请不到") }
+        first.release()
+    } else { check(false, "跨格式转换申请不到名字") }
+    check(readBytes(dir + "/photo.webp") == [5, 5], "被占住的原名保持原样")
+
+    // ③ §30 的并发承诺：同一条队列里 50 个任务抢同一个理想名，一个都不许踩。
+    let bulkLock = NSLock()
+    var bulk: [String] = []
+    DispatchQueue.concurrentPerform(iterations: 50) { _ in
+        let naming = OutputNaming.withSuffix(stem: "bulk", suffix: "_compressed", extension: "jpg")
+        if let got = OutputNameAllocator.claim(in: dir, naming) {
+            bulkLock.withLock { bulk.append(got.path) }
+        }
+    }
+    check(bulk.count == 50, "50 个并发申请全该拿到名字（实际 \(bulk.count)）")
+    check(Set(bulk).count == bulk.count, "两个任务拿到了同一个输出名")
+
+    // ④ 老日志（0.3.0 之前没有 mode 字段）必须按覆盖模式恢复：认成新建就等于
+    //    "原图没被动过"，回滚不再写回备份，用户的那张图永久停在压缩结果上。
+    let legacyRoot = freshRoot("38")
+    let legacyJournal = OutputTransactionStore(root: legacyRoot)
+    let legacyStore = HistoryStore(root: legacyRoot)
+    let legacySource = canonicalPath(dir + "/legacy.png")
+    makeFile(legacySource, [9, 9, 9])
+    let legacyBackup = dir + "/legacy-original.png"
+    writeData(legacyBackup, [1, 2, 3])
+    check(legacyJournal.prepareDurable(ReplaceTransaction(
+        id: "t-legacy", historyId: "t-legacy", sourcePath: legacySource, outputPath: legacySource,
+        backupPath: legacyBackup, tempOutputPath: nil, originalSize: 3, expectedOutputSize: 1,
+        createdAt: SizqoClock.nowMillis, crossFormat: false)) == nil,
+        "覆盖模式的记账凭证要连目录一起落到磁盘")
+    let legacyFile = legacyJournal.root + "/t-legacy.json"
+    let stripped = ((try? String(contentsOfFile: legacyFile, encoding: .utf8)) ?? "")
+        .split(separator: "\n").filter { !$0.contains("\"mode\"") }.joined(separator: "\n")
+    writeData(legacyFile, Array(stripped.utf8))
+    let legacyLoaded = legacyJournal.list()
+    check(legacyLoaded.count == 1 && legacyLoaded[0].mode == .replaceExisting,
+          "没有 mode 的老日志读出来必须是覆盖模式")
+    check(legacyJournal.recover(legacyStore).rolledBack == 1, "老日志照样回滚")
+    check(readBytes(legacySource) == [1, 2, 3], "老日志把真正原图写了回去")
+
+    // ⑤ 新建模式：证明不了提交就删掉自己生成的文件，但一个字节都不许碰原图（§32）。
+    let newRoot = freshRoot("38b")
+    let newJournal = OutputTransactionStore(root: newRoot)
+    let newStore = HistoryStore(root: newRoot)
+    let newSource = canonicalPath(dir + "/newsrc.png")
+    makeFile(newSource, [4, 4, 4])
+    let newOutput = dir + "/newsrc_compressed.png"
+    func newTxn(_ id: String, outputSize: Int64, temp: String? = nil) -> ReplaceTransaction {
+        ReplaceTransaction(
+            id: id, historyId: id, sourcePath: newSource, outputPath: newOutput,
+            backupPath: "", tempOutputPath: temp, originalSize: 4, expectedOutputSize: outputSize,
+            createdAt: SizqoClock.nowMillis, crossFormat: false, mode: .createNew
+        )
+    }
+    writeData(newOutput, [9, 9])
+    check(newJournal.prepare(newTxn("t-new", outputSize: 2,
+                                    temp: dir + "/t-new.tmp")) == nil,
+          "新建模式也要记账：没有这条日志，磁盘上多出来的产物没人认领")
+    writeData(dir + "/t-new.tmp", [0])
+    check(newJournal.recover(newStore).rolledBack == 1, "历史不认账 → 新建模式收场")
+    check(!fm.fileExists(atPath: newOutput), "orphan output 被删掉")
+    check(!fm.fileExists(atPath: dir + "/t-new.tmp"), "崩溃留下的临时文件一起清掉")
+    check(readBytes(newSource) == [4, 4, 4], "新建模式的恢复绝不碰原图")
+
+    // 体积对不上：这位置已被别人的内容占了，不许当成自己的半成品删掉。
+    writeData(newOutput, [1, 2, 3, 4, 5])
+    _ = newJournal.prepare(newTxn("t-keep", outputSize: 2))
+    _ = newJournal.recover(newStore)
+    check(fm.fileExists(atPath: newOutput) && readBytes(newOutput) == [1, 2, 3, 4, 5],
+          "删掉一个来历不明的文件永远不是恢复的选项")
+
+    // 历史已认账：只销账，产物留着。
+    writeData(newOutput, [9, 9])
+    _ = newJournal.prepare(newTxn("t-committed-new", outputSize: 2))
+    _ = newStore.add(HistoryEntry.record(withId: "t-committed-new", source: newSource,
+                                          result: result(file: newSource, size: 2), output: newOutput,
+                                          backup: nil, retentionDays: 3))
+    let newCommitted = newJournal.recover(newStore)
+    check(newCommitted.committed == 1 && fm.fileExists(atPath: newOutput),
+          "已提交的新建产物不许删")
+}
+
+print("[39] §28 §54 源码里不许有第二套拼名字的地方")
+do {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+    let appState = ((try? String(
+        contentsOfFile: repoRoot.appendingPathComponent(
+            "swift/Sources/SizqoSwift/ViewModels/AppState.swift").path, encoding: .utf8)) ?? "")
+        .split(separator: "\n").map(String.init)
+        .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+    check(!appState.contains { $0.contains("availableSystemConversionPath") },
+          "系统转换又自己拼名字了：§54 要求 suffix / folder / 转换共用同一个分配器")
+    check(!appState.contains { $0.contains("for i in 1...") },
+          "又出现无限排名的命名循环：撞多少次都不许一直猜下去")
+    let lines = appState.joined(separator: "\n")
+    check(lines.contains("guard let claimed = OutputNameAllocator.claim"),
+          "落盘不再走独占申请：exists() 探测后再写会被另一个任务同时判成\"不存在\"")
+    check(lines.contains("placement.journal(transactions, txn)"),
+          "记账类别不再由落盘模式派生")
+    check(lines.contains("return .invalidDestination(\"请先选择输出目录\")"),
+          "folder 没选目录时必须报错，不许 return nil 冒充「压缩完成」")
+    check(lines.contains("mode: placement.transactionMode"),
+          "事务的 mode 又各判一次了")
+    check(!lines.contains("guard let record = txn else"),
+          "历史写失败时又给新建模式回了个 nil：§32 要求删掉产物并如实报错")
+}
+
+// ─── 40. §24–§27 覆盖依据：源文件身份、提前快照与快照指纹 ────────────────────
+print("[40] §24 §25 §26 §27 源文件身份与快照指纹")
+do {
+    /// 把 atime/mtime 钉到指定纳秒，模拟「原地换内容、时间戳没动」。
+    func freezeMtime(_ path: String, nanos: Int64) {
+        var times = [timespec(tv_sec: 0, tv_nsec: 0), timespec(tv_sec: 0, tv_nsec: 0)]
+        times[0] = timespec(tv_sec: Int(nanos / 1_000_000_000), tv_nsec: Int(nanos % 1_000_000_000))
+        times[1] = times[0]
+        let rc = path.withCString { utimensat(AT_FDCWD, $0, &times, 0) }
+        check(rc == 0, "测试工具：时间戳钉得住（errno \(errno)）")
+    }
+
+    let dir = freshRoot("40")
+    let source = canonicalPath(dir + "/a.png")
+    // 同大小、不同内容：§26 要内容指纹，就是为了这一支只 stat 查不出来的改动。
+    let original: [UInt8] = [65, 66, 67, 68, 69, 70, 71, 72]
+    let edited: [UInt8] = [73, 74, 75, 76, 77, 78, 79, 80]
+    check(original.count == edited.count, "测试前提：两份字节必须同大小，否则快速门就能看出来")
+    makeFile(source, original)
+
+    guard case let .success(before) = SourceIdentity.readWithHash(source) else {
+        check(false, "编码前该读得出指纹与内容哈希"); exit(1)
+    }
+    check(before.size == 8 && before.sha256?.count == 64, "覆盖依据带内容指纹（64 位十六进制）")
+    check(before.fingerprintIntact(at: source) == .unchanged && before.verify(at: source) == .unchanged,
+          "没动过的文件两道门都放行")
+
+    // ① 完整复核（含哈希）看得出改动，② 快速门看不出 —— 这正是 §25 把 verify 放在
+    // 认领目标名之前、把快速门只当作改名前最后一道保险的原因。
+    writeData(source, edited)
+    freezeMtime(source, nanos: before.modified)
+    let current = SourceIdentity.read(source)
+    guard case let .success(present) = current else {
+        check(false, "钉好时间戳的文件该 stat 得到"); exit(1)
+    }
+    check(!before.sameFingerprint(as: present) || before.sha256 != present.sha256,
+          "测试前提：两份指纹至少有一项不同（内容哈希）")
+    check(before.fingerprintIntact(at: source) == .unchanged,
+          "快速门本该看不出同大小同时间戳的原地改动，否则这条测试没测到点上")
+    if case .changed(let detail) = before.verify(at: source) {
+        check(detail.contains("字节内容已经不是同一份"), "内容指纹查得出改动并说清是谁对不上：\(detail)")
+    } else {
+        check(false, "字节都换了还判成没变：内容哈希没生效")
+    }
+
+    writeData(source, original)
+    freezeMtime(source, nanos: before.modified)
+    check(before.verify(at: source) == .unchanged, "换回原本那份字节，复核重新放行")
+
+    // 换了大小：不必读内容就该拦下。
+    writeData(source, [1, 2, 3])
+    check(before.fingerprintIntact(at: source) != .unchanged, "改过大小的文件要被快速门拦下")
+
+    // 文件没了：读不出来就是证明不了，一样不许盖。
+    let gone = dir + "/gone.png"
+    makeFile(gone, original)
+    guard case let .success(goneIdentity) = SourceIdentity.read(gone) else {
+        check(false, "刚写的文件该读得出指纹"); exit(1)
+    }
+    check(goneIdentity.sha256 == nil, "只问指纹不许读内容")
+    try? fm.removeItem(atPath: gone)
+    if case .changed(let detail) = goneIdentity.verify(at: gone) {
+        check(detail.contains("已经不在这个位置"), "文件没了要照实说：\(detail)")
+    } else {
+        check(false, "文件都没了还判成没变")
+    }
+
+    // §27 快照的两份指纹：编码前留的原图快照，字节必须和源文件同一份。
+    let store = HistoryStore(root: dir + "/store")
+    let snapshotSource = canonicalPath(dir + "/b.png")
+    makeFile(snapshotSource, original)
+    guard let backup = store.ensureBackup(for: snapshotSource) else {
+        check(false, "快照该写得成"); exit(1)
+    }
+    let metaPath = ((backup as NSString).deletingLastPathComponent as NSString)
+        .appendingPathComponent(HistoryStore.metaFileName)
+    let recorded = ((try? JSONSerialization.jsonObject(
+        with: fm.contents(atPath: metaPath) ?? Data())) as? [String: Any]) ?? [:]
+    check(recorded["version"] as? Int == 3,
+          "来历记录升到 v3：没有两份指纹就没法证明副本是原图")
+    let sourceHash = recorded["sourceSha256"] as? String
+    let copyHash = recorded["backupSha256"] as? String
+    check(sourceHash?.count == 64 && sourceHash == copyHash,
+          "源文件与副本两份指纹都落盘，而且相等（\(sourceHash ?? "nil") / \(copyHash ?? "nil")）")
+    check(store.backupIsFaithful(backup) == nil, "指纹对得上的快照 = 可信")
+
+    // 副本被人换过：改名前那道门必须拦下这次覆盖。
+    writeData(backup, [9, 9, 9])
+    if let detail = store.backupIsFaithful(backup) {
+        check(detail.contains("已经不是当初那份字节"), "副本换过要拦下并说清：\(detail)")
+    } else {
+        check(false, "副本字节都变了还说可信")
+    }
+
+    // 快照不在磁盘上：恢复入口本身就是空的。
+    try? fm.removeItem(atPath: backup)
+    check(store.backupIsFaithful(backup)?.contains("不在磁盘上") == true,
+          "快照没了要拦下")
+
+    // 记录自相矛盾：两份指纹不等，当年复制就没成功过。
+    let badSource = canonicalPath(dir + "/c.png")
+    makeFile(badSource, original)
+    guard let badBackup = store.ensureBackup(for: badSource) else {
+        check(false, "第二份快照该写得成"); exit(1)
+    }
+    let badMeta = ((badBackup as NSString).deletingLastPathComponent as NSString)
+        .appendingPathComponent(HistoryStore.metaFileName)
+    let zero = String(repeating: "0", count: 64)
+    let one = String(repeating: "1", count: 64)
+    // 手写记录要字段齐全：Swift 合成的 Decodable 对非可选字段缺键就抛错，
+    // 少写一项会让 readMeta 判成"没有记录"，测的就不是自相矛盾那一支了。
+    writeData(badMeta, Array(#"{"version":3,"sourcePath":"\#(badSource)","createdAt":1,"originalSize":8,"originalExtension":"png","sourceSha256":"\#(zero)","backupSha256":"\#(one)"}"#.utf8))
+    let contradiction = store.backupIsFaithful(badBackup)
+    check(contradiction?.contains("自相矛盾") == true,
+          "来历记录自己前后不一，也不能当备份用（实际回答：\(contradiction ?? "nil＝可信")）")
+
+    // 老记录（v2，没有指纹）：证明不了 ≠ 证明坏了，升级用户的既有备份还得能用。
+    let oldSource = canonicalPath(dir + "/d.png")
+    makeFile(oldSource, original)
+    guard let oldBackup = store.ensureBackup(for: oldSource) else {
+        check(false, "第三份快照该写得成"); exit(1)
+    }
+    let oldMeta = ((oldBackup as NSString).deletingLastPathComponent as NSString)
+        .appendingPathComponent(HistoryStore.metaFileName)
+    writeData(oldMeta, Array(#"{"version":2,"sourcePath":"\#(oldSource)","createdAt":1,"originalSize":8,"originalExtension":"png"}"#
+        .utf8))
+    check(store.backupIsFaithful(oldBackup) == nil, "老记录只缺指纹，不该把用户的覆盖一路拦死")
+
+    // §25 的顺序只能在源码里钉：快照必须早于编码，Commit 里不许再补一份。
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+    func codeOnly(_ path: String) -> String {
+        ((try? String(contentsOfFile: repoRoot.appendingPathComponent(path).path, encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+    }
+    let appState = codeOnly("swift/Sources/SizqoSwift/ViewModels/AppState.swift")
+    let captureAt = appState.range(of: "captureReplaceBaseline(path: path, options: options, history: history)")?.lowerBound
+    let engineAt = appState.range(of: "CompressionEngine.compress")?.lowerBound
+    check(captureAt != nil && engineAt != nil && captureAt! < engineAt!,
+          "编码前没备覆盖依据：§24 要求备份先于压缩，晚来的就不是原图")
+    check(appState.contains("identity.verify(at: path)"),
+          "覆盖前不再完整复核源文件（含内容指纹）：§26 的最终确认丢了")
+    check(appState.contains("staged.writeSynced(compressed)") && appState.contains("staged.publish(to: target)"),
+          "候选落盘与改名又合成一步：改名前那道复核没有插进去的位置")
+    check(appState.contains("history.backupIsFaithful(backup)"), "改名前不再确认快照字节：§27 的复核丢了")
+    check(!appState.contains("ensureBackup(for:"),
+          "Commit 里又现取了一次快照：§24 的提前备份被绕开，备到的可能是改动后的内容")
+}
+
+// ─── 41. §37 §38 同一时刻只有一个 compression session ──────────────────────
+//
+// 这一条不是形式问题。两轮会话共用同一个闸门时，先结束那一轮的收尾会把另一轮的
+// 暂停位、停止位和取消账本一起清零 —— 用户看到的就是「按了暂停却还在压」「停止后
+// 进度凭空多一截」。所以入口只有一个：抢到就跑，抢不到就拒绝。
+print("[41] §37 §38 会话唯一，三条入口共用一套语义")
+do {
+    final class ClaimTally: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        func add() { lock.lock(); value += 1; lock.unlock() }
+        var count: Int { lock.lock(); defer { lock.unlock() }; return value }
+    }
+
+    let race = CompressionScheduler(maxParallelism: 4)
+    let tally = ClaimTally()
+    let raceGroup = DispatchGroup()
+    for _ in 0..<8 {
+        raceGroup.enter()
+        DispatchQueue.global().async {
+            if race.tryBeginBatch(maxParallelism: 4) { tally.add() }
+            raceGroup.leave()
+        }
+    }
+    raceGroup.wait()
+    check(tally.count == 1, "八个入口同时来抢，只有 1 个占得住这一轮（实测 \(tally.count) 个）")
+    check(race.phase == .running, "抢到会话的那一轮就是 running")
+    race.endBatch()
+    check(race.tryBeginBatch(), "上一轮收尾后，下一轮才准占住会话")
+
+    // 抢输了必须一个状态都不改：正在跑那一轮的停止位被第二个入口悄悄解除，
+    // 就是「点了停止却还有文件被放进来」。
+    let held = CompressionScheduler(maxParallelism: 2)
+    check(held.tryBeginBatch(), "第一轮占住会话")
+    held.stop()
+    check(!held.tryBeginBatch(), "已经有一轮在跑时，第二个入口必须被拒")
+    check(held.isStopping, "被拒的入口把正在跑那一轮的停止位解除了")
+    check(held.phase == .stopping, "被拒的入口改写了正在跑那一轮的阶段")
+
+    // §38 语义只有一份：Swift 不许留「无条件开一批」的后门，Rust 与视频也不许各造一套。
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+    func codeOnly(_ path: String) -> String {
+        ((try? String(contentsOfFile: repoRoot.appendingPathComponent(path).path, encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+    }
+    check(!codeOnly("swift/Sources/SizqoSwift/Services/CompressionScheduler.swift").contains("func beginBatch("),
+          "调度器又开出无条件占会话的后门：§37 只许 tryBeginBatch")
+    let appState = codeOnly("swift/Sources/SizqoSwift/ViewModels/AppState.swift")
+    check(appState.contains("guard scheduler.tryBeginBatch(maxParallelism: effectiveCpuThreadLimit) else"),
+          "开跑不再先占会话凭证：两轮可以并跑，先结束那轮会把另一轮的暂停 / 停止 / 取消清零")
+    let rustCommands = codeOnly("src-tauri/src/commands.rs")
+    check(!rustCommands.contains("fn begin_batch("),
+          "Rust 侧也留了无条件入口：§37 要求图片 / 视频 / 混合共用同一个 try_begin_batch")
+    check(rustCommands.contains("if !state.compression.try_begin_batch()"),
+          "Rust 的会话凭证不再走 try_begin_batch，等于绕开统一入口")
+    let videoCommands = codeOnly("src-tauri/src/video_commands.rs")
+    check(videoCommands.contains("SessionGuard::begin"),
+          "视频不再从统一凭证开跑：§38 要求图片 / 视频 / 混合共用同一个 guard")
+    check(!videoCommands.contains("try_begin_batch"),
+          "视频侧又自己摆弄调度器的会话位：语义该只有一份")
+}
+
+// ─── 42. §39 §40 来源根在入队时定死 ────────────────────────────────────────
+//
+// 「输出到指定文件夹」要保住源目录层级。层级由一个来源根算出来 —— 只要这个根是
+// 每批重新挑的，同一张图在重试 / 续跑后就可能落到另一个子目录。所以：入队时把
+// 根和相对路径一起固定，之后谁都不许再读批次级的候选根。
+print("[42] §39 §40 来源根与相对路径在入队时定死")
+do {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+    func codeOnly(_ path: String) -> String {
+        ((try? String(contentsOfFile: repoRoot.appendingPathComponent(path).path, encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+    }
+    let options = codeOnly("swift/Sources/SizqoSwift/Models/CompressOptions.swift")
+    check(!options.contains("sourceRoots"),
+          "批次级的 sourceRoots 又回来了：每批重新挑根就是「同一张图换了轮次换子目录」")
+    let model = codeOnly("swift/Sources/SizqoSwift/Models/CompressResult.swift")
+    check(model.contains("var sourceRoot: String = \"\"") && model.contains("var relativePath: String = \"\""),
+          "队列项没有固定 sourceRoot / relativePath：§39 要求这两项在创建时确定")
+    let appState = codeOnly("swift/Sources/SizqoSwift/ViewModels/AppState.swift")
+    check(appState.contains("let root = Self.deepestRoot(file: path, roots: importRoots) ?? parent"),
+          "入队没有按这次导入的根算来源根：又退回「每批重新猜」")
+    check(appState.contains("sourceRoot: root,") && appState.contains("relativePath: relative"),
+          "队列项没有把来源根与相对路径存下来，重试 / 续跑就只能再猜一次")
+    check(!appState.contains("options.sourceRoots"),
+          "输出路径还在读批次级来源根：§40 要求只读队列项固定下来的字段")
+    check(appState.contains("let rel = relativePath.isEmpty ? (path as NSString).lastPathComponent : relativePath"),
+          "目录输出没有使用队列项的 relativePath：层级仍来自当批的临时判断")
+    check(appState.contains("history: store, transactions: journal, retentionDays: retention")
+            && appState.contains("relativePath: relativePath, options: opts"),
+          "relativePath 没有从队列项一路传到 Commit：中途断了等于没固定")
+    let rustCommands = codeOnly("src-tauri/src/commands.rs")
+    check(!rustCommands.contains("fallback_root"),
+          "Rust 图片线又按「这一批只有一个目录 / 文件父目录」补根：§40 禁止重复猜")
+    let rustVideo = codeOnly("src-tauri/src/video/transaction.rs")
+    check(rustCommands.contains("crate::source_root::relative_to_roots")
+            && rustVideo.contains("crate::source_root::relative_to_roots"),
+          "图片线与视频线没有共用同一份来源根解析：同一次导入会在两条线上落到不同层级")
+    let rustImport = codeOnly("src-tauri/src/video_commands.rs")
+    check(rustImport.contains("source_root:String,relative_path:String"),
+          "导入结果没有带回 sourceRoot / relativePath：前端入队时无值可存")
+}
+
+// ─── 43. §41 §42 §43 重试保持身份，进度不倒退 ─────────────────────────────
+//
+// 「重试」以前会把状态放回 pending，而进度按 done + failed 的瞬时值算，
+// 于是 10/10 会在点下重试的一刻掉成 9/10。现在队列项多两个事实：
+// attemptCount（开工时加一）与 everProcessed（至少走完过一次的闩锁）——
+// 分子读闩锁，当前状态照旧可以变。
+print("[43] §41 §42 §43 重试不换身份，进度不倒退")
+do {
+    var retried = QueueItem(path: "/tmp/retry.jpg", fileName: "retry.jpg", fileSize: 100)
+    retried.everProcessed = true          // 第一次处理已经走完（失败也是走完）
+    retried.attemptCount = 1
+    retried.status = .failed
+
+    let afterFailure = QueueProgress(items: [retried])
+    check(afterFailure.processed == 1 && afterFailure.failed == 1,
+          "失败的任务必须算「已处理」，否则 98 成功 + 2 失败的队列永远停在 98%")
+
+    // 用户点「重试」：同一个项回到 pending；attemptCount 等真正开工才加。
+    retried.status = .pending
+    let waitingRetry = QueueProgress(items: [retried])
+    check(waitingRetry.processed == 1, "§42 重试等待中 processed 倒退了")
+    check(waitingRetry.retrying == 1, "§42 重试等待中没有单独的 retrying 计数")
+    check(waitingRetry.summaryText.contains("正在重试 1 项"),
+          "摘要没有说明分子为什么没退：\(waitingRetry.summaryText)")
+
+    // 开工：pending → running，attemptCount += 1（同一次尝试只加一次）。
+    retried.status = .running
+    retried.attemptCount += 1
+    let runningRetry = QueueProgress(items: [retried])
+    check(runningRetry.processed == 1 && runningRetry.active == 1 && runningRetry.retrying == 1,
+          "§41 §42 重试运行中的计数不对：\(runningRetry.summaryText)")
+
+    // 重试成功：done + 产物 → committed；retrying 归零，processed 不变。
+    var product = result(file: retried.path, size: 80)
+    product.outcome = .committed
+    product.outputPath = "/tmp/retry_compressed.jpg"
+    retried.status = .done
+    retried.result = product
+    let succeeded = QueueProgress(items: [retried])
+    check(succeeded.processed == 1 && succeeded.completed == 1 && succeeded.committed == 1
+            && succeeded.skipped == 0 && succeeded.retrying == 0,
+          "§43 committed / completed / retrying 的拆分不对")
+    check(succeeded.summaryText == "1 / 1 已处理",
+          "重试收尾后摘要不该再写重试：\(succeeded.summaryText)")
+
+    // done 但没有产物 = skipped，同样算 completed、算 processed。
+    var skippedItem = QueueItem(path: "/tmp/skip.jpg", fileName: "skip.jpg", fileSize: 100)
+    skippedItem.status = .done
+    skippedItem.everProcessed = true
+    let skipped = QueueProgress(items: [skippedItem])
+    check(skipped.completed == 1 && skipped.skipped == 1 && skipped.committed == 0 && skipped.processed == 1,
+          "§43 没有产物的 completed 必须记在 skipped")
+
+    // removed / restored 仍然不在这套账里（分母、分子都不含）。
+    var restored = retried
+    restored.status = .restored
+    let withRestored = QueueProgress(items: [retried, restored])
+    check(withRestored.total == 1 && withRestored.processed == 1,
+          "restored 不该回到进度账里")
+
+    // 源码护栏：重试不许删项重建；开工点加计数；完成点落闩锁。
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+    let appState = (try? String(contentsOfFile: repoRoot.appendingPathComponent("swift/Sources/SizqoSwift/ViewModels/AppState.swift").path, encoding: .utf8)) ?? ""
+    if let start = appState.range(of: "func retryFile(path: String)")?.lowerBound,
+       let end = appState.range(of: "/// 摘要里跟着阶段走的那一小段")?.lowerBound, start < end {
+        let retryBody = String(appState[start..<end])
+        check(!retryBody.contains("items.remove") && !retryBody.contains("items.append"),
+              "§41 retryFile 删掉旧项重建：队列项 id / 身份会换，历史与进度对不上")
+        check(retryBody.contains("items[idx].status = .pending") && retryBody.contains("items[idx].result = nil"),
+              "retryFile 没有把原来那一项放回 pending")
+    } else {
+        check(false, "找不到 retryFile 的边界，§41 的源码护栏没有真正跑到")
+    }
+    check(appState.contains("self.items[idx].attemptCount += 1"),
+          "§41 开工没有累计 attemptCount")
+    check(appState.contains("items[idx].everProcessed = true"),
+          "§42 完成没有落 everProcessed 闩锁")
+    let model = (try? String(contentsOfFile: repoRoot.appendingPathComponent("swift/Sources/SizqoSwift/Models/CompressResult.swift").path, encoding: .utf8)) ?? ""
+    check(model.contains("var attemptCount: Int = 0") && model.contains("var everProcessed: Bool = false"),
+          "QueueItem 缺少 attemptCount / everProcessed")
+    check(!model.contains("var processed: Int { done + failed }"),
+          "§42 进度又退回 done + failed 的瞬时值：重试会倒退")
+}
+
+print("[44] §44 压缩会话期间恢复不改写进度")
+do {
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+    func read(_ path: String) -> String {
+        (try? String(contentsOfFile: repoRoot.appendingPathComponent(path).path, encoding: .utf8)) ?? ""
+    }
+    /// 截取一段函数体：边界找不到就返回 nil，由调用方判失败，而不是静默通过。
+    func slice(_ source: String, from start: String, to end: String) -> String? {
+        guard let lower = source.range(of: start)?.lowerBound,
+              let upper = source.range(of: end, range: lower..<source.endIndex)?.lowerBound,
+              lower < upper else { return nil }
+        return String(source[lower..<upper])
+    }
+
+    let appState = read("swift/Sources/SizqoSwift/ViewModels/AppState.swift")
+    check(appState.contains("var restoreBlockedBySession: Bool { isCompressing }"),
+          "§44 恢复闸门没有绑定当前压缩会话")
+    let blockedText = "压缩进行中，暂不能恢复；请先停止或等这一轮结束"
+    check(appState.contains("var restoreBlockedText: String { \"\(blockedText)\" }"),
+          "§44 恢复禁用说明缺失或被改写")
+    // 两条线的用户看到同一句话；只有一份措辞来源，才不会被改出两种解释。
+    check(read("frontend/app.js").contains(blockedText),
+          "§44 Swift 与前端对同一条禁令说了两句话：\(blockedText)")
+
+    // 三个入口都必须先拦再碰磁盘：恢复单条、恢复全部、删除结果。
+    if let restore = slice(appState, from: "func restore(entry: HistoryEntry) -> Bool {",
+                           to: "/// 后端确认恢复成功后") {
+        check(restore.contains("guard !restoreBlockedBySession"),
+              "§44 restore(entry:) 没有会话闸门：压缩进行中恢复会改写正在处理的源文件")
+        if let gate = restore.range(of: "guard !restoreBlockedBySession"),
+           let write = restore.range(of: "history.restoreOutcome") {
+            check(gate.lowerBound < write.lowerBound, "§44 闸门放在了恢复动作之后，等于没拦")
+        } else {
+            check(false, "§44 restore(entry:) 的闸门 / 落盘顺序无法核对")
+        }
+    } else {
+        check(false, "找不到 restore(entry:) 的边界，§44 源码护栏没有真正跑到")
+    }
+
+    if let all = slice(appState, from: "func restoreAll() {", to: "// MARK: - Save as") {
+        check(all.contains("guard !restoreBlockedBySession"),
+              "§44 restoreAll 绕过了统一服务，也没有自己的会话闸门")
+        if let gate = all.range(of: "guard !restoreBlockedBySession"),
+           let start = all.range(of: "let restorable") {
+            check(gate.lowerBound < start.lowerBound, "§44 restoreAll 先开工后拦，顺序不对")
+        } else {
+            check(false, "§44 restoreAll 的闸门 / 开工顺序无法核对")
+        }
+    } else {
+        check(false, "找不到 restoreAll 的边界，§44 源码护栏没有真正跑到")
+    }
+
+    if let del = slice(appState, from: "func deleteHistoryOutput(_ entry: HistoryEntry) {",
+                       to: "/// 历史行的复制日志") {
+        check(del.contains("guard !restoreBlockedBySession"),
+              "§44 deleteHistoryOutput 没有会话闸门：会话期间会把正在用的产物删掉")
+        if let gate = del.range(of: "guard !restoreBlockedBySession"),
+           let alert = del.range(of: "let alert = NSAlert()") {
+            check(gate.lowerBound < alert.lowerBound,
+                  "§44 deleteHistoryOutput 先弹确认再拦截，用户白点一次")
+        } else {
+            check(false, "§44 deleteHistoryOutput 的闸门 / 确认顺序无法核对")
+        }
+    } else {
+        check(false, "找不到 deleteHistoryOutput 的边界，§44 源码护栏没有真正跑到")
+    }
+
+    // 禁用不是隐藏：按钮仍在动作集里，只是带一个原因（与前端同一口径）。
+    check(appState.contains("func historyActionBlocked(_ action: HistoryRowAction) -> Bool")
+            && appState.contains("(action == .restore || action == .deleteOutput)"),
+          "§44 历史页的会话禁用判定没有覆盖恢复/删除结果")
+    let content = read("swift/Sources/SizqoSwift/Views/ContentView.swift")
+    check(content.contains("disabled: blocked") && content.contains(".disabled(action.disabled)"),
+          "§44 主队列行/详情没有把恢复按钮禁用")
+    check(content.contains("blockedReason: blocked ? appState.restoreBlockedText : nil"),
+          "§44 主队列的禁用按钮没说清为什么点不了")
+    let history = read("swift/Sources/SizqoSwift/Views/HistoryView.swift")
+    check(history.contains("appState.historyActionBlocked(action)") && history.contains(".disabled(blocked)"),
+          "§44 历史页恢复按钮没有随会话禁用")
+    let compare = read("swift/Sources/SizqoSwift/Views/CompareView.swift")
+    check(compare.contains(".disabled(appState.restoreBlockedBySession)"),
+          "§44 对比窗口的恢复按钮没有被会话拦住")
+}
+
 print(failures == 0
-      ? "\n✓ Swift 历史 / 备份 / 暂停 / 停止 / 队列进度 / 设置默认折叠 / CPU 上限自检全部通过"
+      ? "\n✓ Swift 历史 / 备份 / 暂停 / 停止 / 队列进度 / 设置默认折叠 / CPU 上限 / 结果契约 / 临时文件命名 / 输出命名与事务模式自检全部通过"
       : "\n✗ Swift 自检失败 \(failures) 项")
 exit(failures == 0 ? 0 : 1)

@@ -216,20 +216,35 @@ const actionsOf = row => row.querySelector('.media-actions').children
     actionsOf(context.historyRow(entry({ backupExists: false }))),
     ['save', 'finder', 'log'],
     '原图备份已清理 → 恢复和对比一起收起');
-  // 已恢复的记录：反悔已经用掉了。
-  assert.ok(!actionsOf(context.historyRow(entry({ status: 'restored', restoredAt: entry().createdAt })))
-    .some(name => name === 'restore' || name === 'deleteOutput'),
-    '已恢复的行不再提供反悔按钮');
-  assert.ok(text(context.historyRow(entry({ status: 'restored', restoredAt: entry().createdAt }))).includes('已恢复 · 今天'));
+  // 已恢复的记录：反悔已经用掉了，产物这层身份也一起没了 ——
+  // 覆盖模式下 outputPath 指向的已经是写回后的原图，绝不能再拿它另存为/对比。
+  const restoredRow = context.historyRow(entry({ status: 'restored', restoredAt: entry().createdAt }));
+  assert.deepEqual(actionsOf(restoredRow), ['finder', 'log'],
+    '已恢复的行只剩定位与日志：另存为 / 对比 / 播放输出都把原图当成了产物');
+  assert.ok(text(restoredRow).includes('已恢复 · 今天'));
+  // §48 恢复成功但产物没删掉：状态行必须同时说清这两件事，且同样不再有产物按钮。
+  const warnedRow = context.historyRow(entry({ status: 'restoredWithWarning', restoredAt: entry().createdAt }));
+  assert.ok(text(warnedRow).includes('已恢复'));
+  assert.ok(text(warnedRow).includes('压缩结果未能删除'));
+  assert.deepEqual(actionsOf(warnedRow), ['finder', 'log']);
   assert.ok(text(context.historyRow(entry({ sourceExists: false }))).includes('原文件位置不存在'));
   assert.ok(text(context.historyRow(entry({ backupExists: false }))).includes('原图备份已清理'));
+  // §76 产物被外部删除：状态必须直接说这件事；备份还在就仍可恢复，备份也没了就只剩日志。
+  const missingOutput = context.historyRow(entry({ outputExists: false, sourceExists: false }));
+  assert.ok(text(missingOutput).includes('输出文件不存在'));
+  assert.deepEqual(actionsOf(missingOutput), ['restore', 'log'],
+    '产物没了但备份还在：恢复仍然是这条记录唯一有意义的动作');
+  const incomplete = context.historyRow(entry({ outputExists: false, sourceExists: false, backupExists: false }));
+  assert.ok(text(incomplete).includes('记录不完整 · 原图备份已清理'));
+  assert.deepEqual(actionsOf(incomplete), ['log'],
+    '产物、原图、备份都不在：不许留下任何指向不存在文件的按钮');
 
   // 主队列那一行的反悔按钮同样跟着输出方式走文案：后缀模式删的是产物，不是"恢复原图"。
   vm.runInContext(slice('function renderQueueResultActions(', 'function copyCompressLog('), context);
   const queueTitles = mode => {
     const queueRow = makeEl('div');
     context.renderQueueResultActions(queueRow, {
-      file: '/Pictures/a.png', success: true, outputMode: mode,
+      file: '/Pictures/a.png', outcome: 'committed', outputMode: mode,
       outputPath: '/Pictures/a.png',
     });
     return queueRow.querySelector('.media-actions').children.map(b => b.title);
@@ -245,7 +260,9 @@ const actionsOf = row => row.querySelector('.media-actions').children
   const recoveryText = text(recovery);
   assert.ok(recoveryText.includes('明细已丢失（按原图备份重建）'), '重建条目在行上就写清明细没了');
   assert.doesNotMatch(recoveryText, /节省/, '没有真实明细就不许报一个算出来的 0.0%');
-  assert.ok(actionsOf(recovery).includes('restore'), '重建条目必须给出恢复按钮');
+  // 重建条目连压缩明细都没有，产物按钮（另存为/对比）一律不许出现，只留恢复。
+  assert.deepEqual(actionsOf(recovery), ['restore', 'finder', 'log'],
+    '重建条目只能恢复原图，不许拿源文件冒充产物');
   // 详情列把"为什么没有明细"讲完整，而不是只给一个状态词。
   context.historyEntries = [entry({ id: 'recovery-k1', status: 'recoveryAvailable', savings: 0, algorithm: 'recovery' })];
   context.selectedHistoryKey = 'recovery-k1';
@@ -257,8 +274,8 @@ const actionsOf = row => row.querySelector('.media-actions').children
   assert.deepEqual(
     actionsOf(context.historyRow(
       entry({ id: 'r2', status: 'recoveryAvailable', backupExists: false }))),
-    ['save', 'finder', 'log'],
-    '备份已被清掉的重建条目不该再挂恢复按钮');
+    ['finder', 'log'],
+    '备份已被清掉的重建条目不该再挂恢复按钮，也不许冒出产物按钮');
 
   // 冲突：先确认，再带 force 重来；取消则一发都不发。
   restoreReply = { success: false, conflict: true, filePath: '/Pictures/a.png', error: '这个文件在压缩后又被修改过', historyIds: [] };
@@ -278,7 +295,7 @@ const actionsOf = row => row.querySelector('.media-actions').children
   context.fileRows['/Pictures/a.png'] = rowA;
   context.queueItems.set('/Pictures/a.png', {
     path: '/Pictures/a.png', state: 'done', originalSize: 2048576,
-    result: { file: '/Pictures/a.png', success: true, backupPath: '/app/backup/a.png', outputPath: '/Pictures/a.png' },
+    result: { file: '/Pictures/a.png', outcome: 'committed', backupPath: '/app/backup/a.png', outputPath: '/Pictures/a.png' },
   });
   await context.restoreOriginal('/Pictures/a.png');
   assert.deepEqual(Object.keys(last('restore_original')[1]).sort(), ['filePath', 'force'], '主队列只交 filePath');
@@ -300,21 +317,25 @@ const actionsOf = row => row.querySelector('.media-actions').children
   // 队列里三条：两条成功可恢复、一条失败（失败的那条不该被带走）。
   context.queueItems = new Map([
     ['/Pictures/a.png', { path: '/Pictures/a.png', state: 'done', originalSize: 1,
-      result: { file: '/Pictures/a.png', success: true } }],
+      result: { file: '/Pictures/a.png', outcome: 'committed' } }],
     ['/Pictures/b.png', { path: '/Pictures/b.png', state: 'done', originalSize: 1,
-      result: { file: '/Pictures/b.png', success: true } }],
+      result: { file: '/Pictures/b.png', outcome: 'committed' } }],
     ['/Pictures/c.png', { path: '/Pictures/c.png', state: 'failed', originalSize: 1,
-      result: { file: '/Pictures/c.png', success: false } }],
+      result: { file: '/Pictures/c.png', outcome: 'failed' } }],
   ]);
   context.files = ['/Pictures/a.png', '/Pictures/b.png', '/Pictures/c.png'];
   invoked.length = 0;
-  restoreAllReply = { success: true, restored: 2, failed: 0, message: '已恢复 2 个文件',
+  restoreAllReply = { success: true, successCount: 2, failedCount: 0, missingCount: 0,
+    skippedCount: 0, warningCount: 0, items: [], message: '恢复完成：成功 2 个',
     restoredFiles: ['/Pictures/a.png', '/Pictures/b.png'] };
   await context.restoreAllOriginals();
   const all = last('restore_all');
-  assert.equal(all[1].results.length, 3, '整批交给后端，前端不再逐个拼参数');
+  // §77 批量恢复的输入是「有产物」的项：失败项连循环都不该进。
+  assert.equal(all[1].results.length, 2, '只把有产物的项交给后端，不在后端伪造一遍过滤');
+  assert.deepEqual(Array.from(all[1].results, result => result.file), ['/Pictures/a.png', '/Pictures/b.png']);
   assert.ok(!invoked.some(call => call[0] === 'restore_original'), '恢复全部不再走单文件命令');
   assert.equal(context.queueItems.get('/Pictures/b.png').state, 'restored');
+  assert.match(toasts[toasts.length - 1], /恢复完成 · 成功 2/, '批量摘要按真实计数说，不念后端那句中文');
   // Array.from：queueResults() 的数组造在 vm 那个 realm 里，跨 realm 比不了原型。
   assert.deepEqual(Array.from(context.queueResults(), item => item.file),
     ['/Pictures/c.png'], '失败行留在队列里');
@@ -386,6 +407,63 @@ const actionsOf = row => row.querySelector('.media-actions').children
   await context.clearHistory();
   assert.ok(!invoked.some(call => call[0] === 'clear_history'), '前端就不该发这次清空');
   assert.match(toasts[toasts.length - 1], /压缩进行中/);
+
+  // ── §44 压缩进行中不许恢复：会话与历史管理是两条生命周期 ──────────────
+  // 恢复会改写当前队列（done → restored），进度就从 5/10 跳成 5/9。
+  context.setCompressionState('running', true);
+  context.historyEntries = [entry({})];
+  context.selectedHistoryKey = 'e1';
+  context.renderHistory();
+  const blockedActions = [...ids.historyList.children[0].querySelector('.media-actions').children];
+  const restoreButton = blockedActions.find(btn => btn.dataset.historyAction === 'restore');
+  assert.ok(restoreButton, '历史行本来有恢复按钮，禁用不是把它藏起来');
+  assert.equal(restoreButton.disabled, true, '§44 会话期间历史行恢复必须禁用');
+  assert.match(restoreButton.title, /压缩进行中/);
+
+  // 队列批量按钮同样禁用：队列里有一条可恢复的产物。
+  context.queueItems = new Map([['/Pictures/a.png', {
+    path: '/Pictures/a.png', state: 'done', originalSize: 1,
+    result: { file: '/Pictures/a.png', outcome: 'committed', outputPath: '/Pictures/a.png' },
+  }]]);
+  context.files = ['/Pictures/a.png'];
+  context.updateBulkActionButtons();
+  assert.equal(ids.restoreAllBtn.disabled, true, '§44 会话期间「恢复全部原图」必须禁用');
+  assert.match(ids.restoreAllBtn.title, /压缩进行中/);
+
+  // 三个入口就算绕过按钮也一个都不许发后端调用。
+  invoked.length = 0;
+  toasts.length = 0;
+  await context.restoreOriginal('/Pictures/a.png');
+  await context.restoreAllOriginals();
+  await context.restoreFromHistory(entry());
+  assert.ok(!invoked.some(call => ['restore_original', 'restore_all', 'restore_history_entry'].includes(call[0])),
+    '§44 会话期间恢复 / 恢复全部 / 历史恢复都不许落到后端');
+  assert.equal(toasts.length, 3, '三次尝试各自说明为什么被拒');
+  toasts.forEach(message => assert.match(message, /压缩进行中/));
+
+  // 后端是最后一道闸：对比窗口等入口绕过按钮，也必须在统一服务里被拒。
+  const rustHistory = fs.readFileSync(
+    require('node:path').join(__dirname, '..', 'src-tauri', 'src', 'history.rs'), 'utf8');
+  const rustBlocked = (rustHistory.match(/pub const RESTORE_BLOCKED_MESSAGE: &str = "([^"]+)"/) || [])[1];
+  assert.equal(rustBlocked, '压缩进行中，暂不能恢复；请先停止或等这一轮结束',
+    '§44 Rust 的拒绝原话必须与前端一致');
+  const rustCommands = fs.readFileSync(
+    require('node:path').join(__dirname, '..', 'src-tauri', 'src', 'commands.rs'), 'utf8');
+  const restoreService = (rustCommands.match(/fn restore_entry[\s\S]*?let mut reauth/) || [''])[0];
+  assert.match(restoreService, /if restore_blocked_by_session\(&state\.compression\)/,
+    '§44 统一恢复服务必须在落盘前拒绝进行中的会话');
+  const restoreGateBody = (rustCommands.match(/fn restore_blocked_by_session[\s\S]*?\n\}/) || [''])[0];
+  assert.match(restoreGateBody, /state\(\) != CompressionState::Idle/,
+    '§44 会话闸门必须覆盖 paused / stopping，而不只是 running');
+
+  context.setCompressionState('idle', true);
+  context.renderHistory();
+  const idleRestore = [...ids.historyList.children[0].querySelector('.media-actions').children]
+    .find(btn => btn.dataset.historyAction === 'restore');
+  assert.equal(idleRestore.disabled, false, '§44 会话结束后恢复按钮必须放出来');
+  invoked.length = 0;
+  await context.restoreFromHistory(entry());
+  assert.ok(invoked.some(call => call[0] === 'restore_history_entry'), '空闲时恢复照常走后端');
 
   context.setCompressionState('idle', true);
   context.renderHistory();

@@ -35,6 +35,10 @@ let failNext = null;   // 下一次 invoke 要失败的命令名
 const context = vm.createContext({
   console: { log: console.log, warn: console.warn, error: message => calls.push(['error', message]) },
   Set, Map, Promise, JSON,
+  // 状态机里的 idle 采纳规则要读这两个会话变量（线上定义在「执行会话」段，
+  // 本测试只装状态机段，按真实初值播种）。
+  executionSession: null,
+  adoptedOrphanBackendSession: false,
   files: queuePaths.slice(),
   queueItems: new Map(queuePaths.map(p => [p, { path: p, state: 'pending', result: null, originalSize: null }])),
   fileRows: {},
@@ -183,14 +187,24 @@ const countOf = needle => source.split(needle).length - 1;
 
   // 处理掉 12 张、还剩 8 张 pending → 主按钮变「继续压缩」，
   // 摘要跟着变成 12 / 20（分母是**队列**，不是这一轮的目标）。
-  queuePaths.slice(0, 12).forEach(path => { context.queueItems.get(path).state = 'done'; });
+  // 「压成了」必须带一个真在盘上的产物：没有 outcome/reasonCode 和路径的话，
+  // 界面该说的是"未产出文件"。
+  const finish = path => {
+    const item = context.queueItems.get(path);
+    item.state = 'done';
+    item.result = {
+      file: path, outcome: 'committed', originalSize: 2048, compressedSize: 1800, savings: 12,
+      outputPath: path.replace(/\.png$/, '_compressed.png'), outputMode: 'suffix',
+    };
+  };
+  queuePaths.slice(0, 12).forEach(finish);
   context.updateQueueSummary();
   assert.equal(elements.queueSummary.textContent, '12 / 20 已处理');
   assert.match(elements.compressBtnText.innerHTML, /继续压缩/,
     '还剩没处理的，主按钮就不是"完成"');
 
   // 全部处理完 → 才轮到「压缩完成」。
-  queuePaths.forEach(path => { context.queueItems.get(path).state = 'done'; });
+  queuePaths.forEach(finish);
   context.updateQueueSummary();
   assert.equal(elements.queueSummary.textContent, '20 / 20 已处理');
   assert.match(elements.compressBtnText.innerHTML, /压缩完成/);

@@ -107,11 +107,14 @@ struct HistoryRowView: View {
                 // 与队列「压缩完成」那一行同一套按钮，按这条记录真实能做到的事给。
                 // 判据在服务层（historyRowActions），视图只负责摆 —— 前端 app.js 是同一份顺序。
                 ForEach(historyRowActions(entry), id: \.self) { action in
+                    let blocked = appState.historyActionBlocked(action)
                     Button { perform(action) } label: {
                         SizqoIcon(name: action.icon, size: 14)
                     }
                     .buttonStyle(RowActionButtonStyle())
-                    .help(action.title)
+                    .disabled(blocked)
+                    .opacity(blocked ? 0.45 : 1)
+                    .help(blocked ? appState.restoreBlockedText : action.title)
                 }
             }
             .fixedSize()
@@ -374,6 +377,7 @@ private struct HistoryEntryDetailView: View {
                 HairlineDivider()
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 130), spacing: 6)], alignment: .leading, spacing: 6) {
                     ForEach(actions, id: \.self) { action in
+                        let blocked = appState.historyActionBlocked(action)
                         Button {
                             perform(action)
                         } label: {
@@ -395,6 +399,9 @@ private struct HistoryEntryDetailView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .disabled(blocked)
+                        .opacity(blocked ? 0.45 : 1)
+                        .help(blocked ? appState.restoreBlockedText : action.title)
                     }
                 }
             }

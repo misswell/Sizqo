@@ -6,7 +6,7 @@
     '还原默认设置': 'Restore defaults', '历史记录': 'History', '设置': 'Settings', '切换主题': 'Switch theme', '关于': 'About',
     '外观': 'Appearance', '主题': 'Theme',
     '文件队列': 'File queue', '0 个文件': '0 files', ' 个文件': ' files', '清空列表': 'Clear list', '清除全部': 'Clear all',
-    '原始大小': 'Original size', '压缩后大小': 'Compressed size', '压缩后': 'Compressed', '已节省': 'Saved', '压缩率': 'Compression ratio',
+    '原始大小': 'Original size', '压缩后大小': 'Compressed size', '压缩后': 'Compressed', '已节省': 'Saved', '压缩率': 'Compression ratio', '体积增加': 'size increase',
     '只显示失败': 'Show failures only', '排序': 'Sort by', '导入顺序': 'Import order', '名称': 'Name', '压缩比': 'Compression ratio', '状态': 'Status',
     '当前升序，点击切换降序': 'Currently ascending; click to sort descending', '当前降序，点击切换升序': 'Currently descending; click to sort ascending',
     '升序': 'Ascending', '降序': 'Descending', '没有失败的文件': 'No failed files', '追加文件': 'Add files', '恢复全部原图': 'Restore all originals', '继续': 'Continue',
@@ -58,6 +58,8 @@
     '读取图片失败，请重试': 'Could not read the images. Please try again.', '文件夹中没有找到可压缩的图片': 'No supported images found in the folder.',
     '所选图片已在队列中': 'The selected images are already in the queue.', '添加图片失败，请重试': 'Could not add images. Please try again.',
     '已跳过': 'Skipped', '只处理这几个': 'Process selected files only', '处理过': 'Processed', '已处理': ' processed', ' · 失败 ': ' · failed ',
+    // §42 重试说明：分子不退，只补一句「正在重试 N 项」。
+    ' · 正在重试 ': ' · retrying ', ' 项': ' item(s)',
     ' · 已暂停': ' · paused', ' · 正在停止': ' · stopping', '还有几个在跑': 'Some files are still processing', '上限 / 可用并行数': 'Limit / available workers',
     '同时允许几份 CPU 并行压缩工作': 'Maximum concurrent CPU compression tasks', ' · CPU 自动': ' · CPU automatic', '失败': 'Failed', '已恢复': 'Restored', '已移除': 'Removed',
     '等待中': 'Waiting', '已暂停': 'Paused', '移除': 'Remove', '删除这次压缩结果': 'Delete compressed file', '另存为': 'Save as', '对比查看': 'Compare',
@@ -66,8 +68,8 @@
     '--- 压缩参数 ---': '--- Compression settings ---', '(未设置)': '(not set)', '--- 压缩结果 ---': '--- Compression result ---', '--- 原图备份 ---': '--- Original backup ---', '未知错误': 'Unknown error', '原始大小: ': 'Original size: ',
     '压缩后大小: ': 'Compressed size: ', '压缩率: ': 'Compression ratio: ', '输出格式: ': 'Output format: ', '(未知)': '(unknown)', '算法: ': 'Algorithm: ',
     '压缩失败': 'Compression failed', '--- 错误信息 ---': '--- Error details ---', '(无)': '(none)', '压缩日志已复制到剪贴板': 'Compression log copied to clipboard.',
-    '复制失败，请手动选中日志文本': 'Could not copy. Select and copy the log manually.', '请先选择输出目录': 'Choose an output folder first.', '确定要清空全部 ': 'Clear all ',
-    ' 个文件吗？': ' files?', '无法确认输出目录，请重试': 'Could not verify the output folder. Please try again.', '转换出错: ': 'Conversion error: ', '压缩出错: ': 'Compression error: ',
+    '复制失败，请手动选中日志文本': 'Could not copy. Select and copy the log manually.', '请先选择输出目录': 'Choose an output folder first.', '确定要把 ': 'Remove ',
+    ' 个文件移出清单吗？磁盘上的原图和压缩产物都不会删除。': ' files from the list? The originals and the compressed files on disk are not deleted.', '无法确认输出目录，请重试': 'Could not verify the output folder. Please try again.', '已有一轮压缩正在运行，请等它结束或先停止': 'Another compression session is already running; wait for it to finish or stop it first', '转换出错: ': 'Conversion error: ', '压缩出错: ': 'Compression error: ',
     '已重新压缩: ': 'Recompressed: ', '无法保存：找不到压缩文件': 'Could not save: compressed file not found.', '已保存到: ': 'Saved to: ',
     '这个文件在压缩后又被修改过。\n恢复原图会覆盖当前版本。': 'This file was changed after compression.\nRestoring the original will overwrite the current version.',
     '恢复失败: ': 'Restore failed: ', '恢复失败': 'Restore failed', '已恢复原图: ': 'Original restored: ', '已删除这次压缩结果: ': 'Deleted compressed file: ',
@@ -78,6 +80,16 @@
     '正在停止：正在处理的文件会先完成，其余文件保留在队列中': 'Stopping: current files will finish; the rest stay in the queue', '停止失败，请重试': 'Could not stop. Please try again.',
     '今天 ': 'Today ', '昨天 ': 'Yesterday ', '检测到可恢复的原图备份': 'A recoverable original backup was found', '原图备份已清理': 'Original backup was cleaned up',
     '原图未覆盖': 'Original was not overwritten', '原文件位置不存在': 'Original file location does not exist', '已压缩': 'Compressed', '压缩结果已不存在': 'Compressed file no longer exists',
+    '输出文件不存在': 'Output file does not exist', '记录不完整 · 原图备份已清理': 'Incomplete record · original backup was cleaned up',
+    '压缩结果未能删除': 'The compressed output could not be deleted',
+    // §52 §78 §79 磁盘复核失败与批量摘要的片段（前端按计数拼，后端那句中文只进日志）。
+    '文件不存在或已被移动': 'The file does not exist or has been moved', '保存失败: ': 'Could not save: ',
+    '导出失败: ': 'Export failed: ', '在访达中显示失败: ': 'Could not reveal in Finder: ',
+    '之前已经完成过这一步，这次没有再做改动': 'This step was already completed; nothing was changed this time',
+    '恢复完成 · 成功 ': 'Restore complete · succeeded: ', '导出完成 · 成功 ': 'Export complete · succeeded: ',
+    ' · 记录不存在 ': ' · missing records: ', ' · 文件不存在 ': ' · missing files: ',
+    ' · 已恢复但压缩产物未能删除 ': ' · restored but output could not be deleted: ',
+    ' · 跳过没有产物的项 ': ' · skipped items without output: ',
     '打开对比窗口失败: ': 'Could not open comparison window: ', '删除这次压缩结果？\n将删除 ': 'Delete this compressed file?\nThis will delete ',
     '，并移除这条历史记录。原图未被覆盖，不受影响。': '. This history entry will be removed. The original was not overwritten.', '明细: 已丢失（这条记录是按原图备份重建出来的）': 'Details unavailable (this entry was rebuilt from the original backup)',
     '输出: ': 'Output: ', '输出方式: ': 'Output mode: ', '明细已丢失': 'Details unavailable', '节省 ': 'Saved ', '按备份重建': 'Rebuilt from backup', ' 条': ' entries',
@@ -96,7 +108,7 @@
     '下载中 ': 'Downloading ', '安装中…': 'Installing…', '更新失败': 'Update failed', '已取消': 'Cancelled', '在线更新检查失败:': 'Online update check failed:',
     '暂无可对比的内容': 'Nothing to compare', '无法加载原图，文件可能已被移动或恢复': 'Could not load the original. It may have been moved or restored.',
     '无法加载压缩图，文件可能已被移动或恢复': 'Could not load the compressed image. It may have been moved or restored.', '打开对比失败: ': 'Could not open comparison: ',
-    '重新压缩预览加载失败': 'Could not load the recompression preview', '重新压缩完成 (质量: ': 'Recompression complete (quality: ', '重新压缩失败': 'Recompression failed',
+    '重新压缩预览加载失败': 'Could not load the recompression preview', '重新压缩完成 (质量: ': 'Recompression complete (quality: ', '重新压缩没有产出：': 'No output from recompression: ',
     '重新压缩出错: ': 'Recompression error: ', '恢复出错: ': 'Restore error: ', '该文件已恢复原图或被移除': 'This file was restored or removed', '加载失败: ': 'Load failed: ',
     '原始大小: ': 'Original size: ', '压缩后大小 ': 'Compressed size ', '保存': 'Save',
     '按所选编码器解释；数值不能跨编码器直接比较': 'Interpreted by the selected encoder; values are not comparable across encoders',
@@ -160,8 +172,13 @@
     '视图': 'View', '追加': 'Add', '清空队列': 'Clear queue',
     '图片意图': 'Image goal', '视频意图': 'Video goal', '图片目标': 'Image target', '视频目标': 'Video target',
     '更多参数': 'More parameters', '原图与备份': 'Originals and backups', '存为预设': 'Save as preset',
+    '回到导入': 'Back to import', '移出清单': 'Remove from list',
+    '结束这一轮，回到拖入文件那一页；磁盘上的文件和压缩产物都不动': 'End this round and go back to the import page. Files on disk and the compressed results are untouched.',
+    '把这些文件移出清单，不删除磁盘上的文件': 'Remove these files from the list without deleting anything on disk',
+    '已回到导入页 · 这一轮的结果在历史里': 'Back at the import page · this round stays in the history',
     '把当前高级选项存成视频预设': 'Save the current advanced options as a video preset',
     '体积预算': 'Size budget', '最长边上限': 'Longest edge cap', '加后缀': 'Add suffix', '输出到目录': 'Save to a folder',
+    '图片输出方式': 'Image output mode', '视频输出方式': 'Video output mode',
     '选择左侧的文件看详情': 'Select a file on the left to see its details',
     '更轻的文件，让创作更自由': 'Lighter files, more room to create',
     '每一次压缩都留了回来的路': 'Every compression keeps a way back',
@@ -184,11 +201,65 @@
     '选择一条记录，看它此刻在磁盘上还剩什么': 'Select a record to see what is still on disk',
     '此类别还没有压缩记录': 'No records in this category yet',
     '重试这一个': 'Retry this one', '重新压缩这一个': 'Recompress this one', '立即压缩这一个': 'Compress this one now',
-    '移出队列': 'Remove from queue', '查看失败原因': 'See why it failed', '这次压缩没有成功': 'This compression did not succeed',
+    '移出队列': 'Remove from queue', '查看原因': 'See the reason', '这次压缩没有成功': 'This compression did not succeed',
     '删除这次结果': 'Delete this output',
     '有效且更小，已按默认规则采用。': 'Valid and smaller, kept by the default rule.',
     '没能在预算内达标：给出的是这一轮最小的有效结果。': 'The budget was not met; this is the smallest valid result from the round.',
-    '已跳过（更大）': 'Skipped (larger)', '体积更大，已跳过': 'Output was larger, so it was skipped',
+
+    /* ── "引擎成功了，但盘上没有文件"这一类状态 ───────────────────────── */
+    '未产出文件': 'Nothing was written', ' 未产出文件': ' nothing was written',
+    '没有产物 · 原图未改动': 'No output · the original was left untouched',
+    '这次没有写出文件：': 'Nothing was written this time: ',
+    '产物不比原图小，原图保持原样。': 'The output was not smaller than the original, so the original stayed as it was.',
+    '产物不比原文件小，原文件保持原样。': 'The output was not smaller than the source, so the source stayed as it was.',
+    '未写出文件 · 原图保持原样': 'No file written · original left untouched',
+    '产物: ': 'Output: ',
+
+    /* ── 结果契约（ResultOutcome / ReasonCode）的界面措辞：方案 §70 ─────── */
+    '已完成 · 未达到目标': 'Finished · target not met',
+    '处理失败': 'Processing failed',
+    '没有产物 · 原文件未改动': 'No output · the source file was left untouched',
+    '原因: ': 'Reason: ',
+    // reasonCode → 句子。前端只按码选词，绝不解析后端文案（§70 §86）。
+    '原文件已经小于目标体积': 'The source was already below the target size',
+    '压缩后没有变小': 'Compressing did not make it smaller',
+    '压缩后文件更大': 'The compressed file would be larger',
+    '未达到目标体积': 'The target size was not met',
+    '这一项被取消，没有开始处理': 'This item was cancelled before it started',
+    '已停止，未开始': 'Stopped before it started',
+    '压缩结果写入失败': 'The result could not be written',
+    '历史记录保存失败，已自动恢复原图': 'The history entry could not be saved, so the original was restored',
+    '这个格式暂不支持': 'This format is not supported yet',
+    '输入无效': 'Invalid input',
+    '无法解码这个文件': 'This file could not be decoded',
+    '编码失败': 'Encoding failed',
+    '无法读取源文件': 'The source file could not be read',
+    '源文件不存在': 'The source file does not exist',
+    '没有权限访问这个文件': 'Permission to access this file was denied',
+    '源文件在处理期间被改动，已保留你的版本': 'The source changed while it was being processed; your version was kept',
+    '无法保存原图备份': 'The original backup could not be saved',
+    '无法登记这次覆盖': 'This replacement could not be journaled',
+    '自动恢复原图也没成功，备份仍在': 'Automatic restore also failed; the backup is still there',
+    '目标位置已有同名文件': 'A file with that name already exists at the destination',
+    '输出校验未通过': 'The output failed validation',
+    '原因未上报': 'No reason was reported',
+    // 后端原话会出现在悬停与详情里，英文界面下不能留成中文。
+    // 这一组只会被 translateMessage（整句匹配）读到：带 {detail} 尾巴的模板句没法整句命中，
+    // 就让它原样留着 —— 半译的句子比中文更难读。
+    // 「引擎压成功但没落盘」那句不再由后端写成一句话上屏：它现在是 outcome+reasonCode，
+    // 句子在前端按码选（见上面 §70 那一组）。
+    '压缩过程发生内部错误': 'Compression stopped with an internal error',
+    '压缩结果已生成，但历史记录保存失败，已自动恢复原图': 'The compressed file was produced, but the history entry could not be saved, so the original was restored automatically',
+    '请先选择输出目录': 'Choose an output folder first',
+    // 恢复失败的这六句是 RestoreError::message() 的全文（history.rs），Toast 直接念出来。
+    '找不到这条历史记录': 'That history entry could not be found',
+    '原图未被覆盖，无需恢复': 'The original was never overwritten, so there is nothing to restore',
+    '原图备份已清理，无法恢复': 'The original backup was already cleaned up, so this cannot be restored',
+    '这个文件在压缩后又被修改过': 'This file was modified again after compression',
+    '没有该文件夹的访问权限，请重新授权': 'Sizqo no longer has access to that folder, please grant it again',
+    ' · 已恢复 ': ' · restored ',
+    // §44 会话期间恢复被禁用时，行 / 详情 / 批量按钮共用这一句原因。
+    '压缩进行中，暂不能恢复；请先停止或等这一轮结束': 'Compression is running, so restoring is unavailable; stop it or wait for this round to finish',
 
     /* ── 视频：行内读数、控制、校验 ─────────────────────────────────── */
     '时长': 'Duration', '尺寸': 'Dimensions', '编码': 'Codec', '编码器': 'Encoder', '音轨': 'Audio',
@@ -281,6 +352,16 @@
     return text;
   }
 
+  /// 引擎/后端的原话不是界面文案，不许走上面那条"最长优先子串替换"。
+  /// 子串替换会把「解码失败：文件不是有效图片」切成半译的「解码Failed：文件不是有效Images」——
+  /// 一句话被换掉两个词，比留着原文更难读。这里只认整句词条：词典里有就换，没有就原样给出。
+  function translateMessage(value, language) {
+    const text = String(value == null ? '' : value);
+    if ((language || currentLanguage) !== 'en') return text;
+    const hit = ENGLISH[text];
+    return hit === undefined ? text : hit;
+  }
+
   let currentLanguage = 'en';
   let currentPreference = 'auto';
   const originalElementText = new WeakMap();
@@ -344,6 +425,7 @@
     normalizePreference,
     resolveUiLanguage,
     translateText,
+    translateMessage,
     readPreference,
     applyUiLanguage: applyToDocument,
     applyToDocument,

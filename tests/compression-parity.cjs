@@ -163,12 +163,12 @@ const directSmart = functionBody(directEngine, 'pub async fn compress_smart', '#
 const appStoreSmart = functionBody(appStoreEngine, 'pub async fn compress_smart', '#[cfg(test)]');
 const swiftSmart2 = functionBody(swiftEngine, 'static func compressSmart', 'private static func analyzeQuality');
 for (const [name, body, expected] of [
-  ['Direct', directSmart, ['compress_png(file, &opts)', 'compress_to_webp(file, &opts)']],
-  ['App Store', appStoreSmart, ['compress_png(file, &opts)', 'compress_to_webp(file, &opts)']],
-  ['Swift', swiftSmart2, ['compressPNG(file: file, options: opts)', 'compressToWebP(file: file, options: opts)']],
+  ['Direct', directSmart, [/compress_png\(file, &opts, OutputRule::BenefitOnly\)/, /compress_to_webp\(file, &opts, OutputRule::BenefitOnly\)/]],
+  ['App Store', appStoreSmart, [/compress_png\(file, &opts, rule\)/, /compress_to_webp\(file, &opts, rule\)/]],
+  ['Swift', swiftSmart2, [/compressPNG\(file: file, options: opts\)/, /compressToWebP\(file: file, options: opts\)/]],
 ]) {
   for (const candidate of expected) {
-    assert.ok(body.includes(candidate), `${name} smart PNG mode must compare both PNG and WebP candidates`);
+    assert.match(body, candidate, `${name} smart PNG mode must compare both PNG and WebP candidates`);
   }
 }
 
@@ -220,5 +220,23 @@ assert.match(swiftBuild, /ENCODER_TOOLS=\(pngquant oxipng cjpeg cwebp avifenc gi
 assert.ok(swiftRunner.includes('case "avifenc": return ["--jobs", "\\(threadLimit)"]'));
 assert.ok(swiftRunner.includes('case "oxipng": return ["--threads", "\\(threadLimit)"]'));
 assert.match(buildAll, /bash "\$PROJECT_DIR\/scripts\/build_swift\.sh" \|\| fail "Swift 版构建失败"/);
+
+// §57 Replace 的源文件身份只允许一份实现：图片与视频都必须用同一个
+// SourceIdentity（编码前钉指纹、覆盖前复核），不许各自写一套更弱的判断。
+const commandsSource = read('src-tauri/src/commands.rs');
+const videoTransaction = read('src-tauri/src/video/transaction.rs');
+const videoBackend = read('src-tauri/src/video/ffmpeg_backend.rs');
+assert.ok(commandsSource.includes('use crate::source_identity::{SourceCheck, SourceIdentity}'),
+  '图片线必须使用共享的 SourceIdentity');
+assert.ok(videoTransaction.includes('pub use crate::source_identity::{SourceCheck, SourceIdentity}'),
+  '视频线必须复用同一份 SourceIdentity，而不是另写一套');
+assert.ok(commandsSource.includes('SourceIdentity::read_with_hash(path)'),
+  '图片 Replace 必须在编码前钉下内容指纹');
+assert.ok(videoBackend.includes('transaction::SourceIdentity::read(&source)'),
+  '视频 Replace 必须在编码前钉下源身份');
+assert.ok(videoTransaction.includes('identity.verify(source)'),
+  '视频覆盖前必须复核源身份');
+assert.ok(commandsSource.includes('identity.verify('),
+  '图片覆盖前必须复核源身份');
 
 console.log('Compression parity contract checks passed');

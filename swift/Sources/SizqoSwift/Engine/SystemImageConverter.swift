@@ -4,6 +4,20 @@ import CoreGraphics
 import UniformTypeIdentifiers
 
 enum SystemImageConverter {
+    /// 源文件真实 UTI → 输出标签。认不出就返回 nil：调用方必须拒绝，不许换格式。
+    private static func label(forSourceUTI uti: String) -> String? {
+        switch uti {
+        case "public.jpeg": return "jpg"
+        case "public.png": return "png"
+        case "public.heic", "public.heif": return "heic"
+        case "com.compuserve.gif": return "gif"
+        case "public.tiff": return "tiff"
+        case "com.microsoft.bmp": return "bmp"
+        case "org.webmproject.webp": return "webp"
+        default: return nil
+        }
+    }
+
     static func convert(
         file: String,
         options: CompressOptions
@@ -11,19 +25,43 @@ enum SystemImageConverter {
         guard let original = FileManager.default.contents(atPath: file) else {
             return EngineResult(
                 success: false, compressed: Data(), outType: options.outputFormat.rawValue,
-                algorithm: "macOS ImageIO", error: "macOS 无法读取此图像"
+                algorithm: "macOS ImageIO", error: "macOS 无法读取此图像",
+                verdict: .rejected, reason: .sourceReadFailed
+            )
+        }
+        guard let source = CGImageSourceCreateWithData(original as CFData, nil) else {
+            return EngineResult(
+                success: false, compressed: original, outType: options.outputFormat.rawValue,
+                algorithm: "macOS ImageIO", error: "macOS 无法读取此图像",
+                verdict: .rejected, reason: .decodeFailed
             )
         }
 
-        let ext = (file as NSString).pathExtension.lowercased()
+        // §23 多帧输入明确拒绝：这条路径只取第一帧，静默丢帧就是毁数据。
+        let frameCount = CGImageSourceGetCount(source)
+        if frameCount > 1 {
+            return EngineResult(
+                success: false, compressed: original, outType: options.outputFormat.rawValue,
+                algorithm: "macOS ImageIO",
+                error: "系统转换不支持动图（\(frameCount) 帧）：只会保留第一帧。已拒绝这次降级，原文件未改动",
+                verdict: .rejected, reason: .unsupportedFormat
+            )
+        }
+
         let (uti, outType): (String, String)
         if options.outputFormat == .original {
-            switch ext {
-            case "jpg", "jpeg": (uti, outType) = ("public.jpeg", "jpg")
-            case "png": (uti, outType) = ("public.png", "png")
-            case "heic", "heif": (uti, outType) = ("public.heic", "heic")
-            default: (uti, outType) = ("public.jpeg", "jpg")
+            // 原格式：目标容器由**源文件真实 UTI** 决定，不按扩展名猜，
+            // 也绝不回退成 JPEG —— GIF 保持 GIF；认不出就拒绝，不换格式。
+            guard let sourceType = CGImageSourceGetType(source) as String?,
+                  let label = label(forSourceUTI: sourceType) else {
+                return EngineResult(
+                    success: false, compressed: original, outType: "original",
+                    algorithm: "macOS ImageIO",
+                    error: "无法从字节识别源图格式，系统转换不会替你换一个格式",
+                    verdict: .rejected, reason: .unsupportedFormat
+                )
             }
+            (uti, outType) = (sourceType, label)
         } else {
             switch options.outputFormat {
             case .jpg: (uti, outType) = ("public.jpeg", "jpg")
@@ -32,21 +70,17 @@ enum SystemImageConverter {
             default:
                 return EngineResult(
                     success: false, compressed: original, outType: options.outputFormat.rawValue,
-                    algorithm: "macOS ImageIO", error: "系统转换仅支持 JPEG、PNG 和 HEIF"
+                    algorithm: "macOS ImageIO", error: "系统转换仅支持 JPEG、PNG 和 HEIF",
+                    verdict: .rejected, reason: .unsupportedFormat
                 )
             }
         }
 
-        guard let source = CGImageSourceCreateWithData(original as CFData, nil) else {
-            return EngineResult(
-                success: false, compressed: original, outType: outType,
-                algorithm: "macOS ImageIO", error: "macOS 无法读取此图像"
-            )
-        }
         guard let fullImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             return EngineResult(
                 success: false, compressed: original, outType: outType,
-                algorithm: "macOS ImageIO", error: "macOS 无法解码此图像"
+                algorithm: "macOS ImageIO", error: "macOS 无法解码此图像",
+                verdict: .rejected, reason: .decodeFailed
             )
         }
 
@@ -67,7 +101,8 @@ enum SystemImageConverter {
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOpts as CFDictionary) else {
             return EngineResult(
                 success: false, compressed: original, outType: outType,
-                algorithm: "macOS ImageIO", error: "macOS 无法调整图像尺寸"
+                algorithm: "macOS ImageIO", error: "macOS 无法调整图像尺寸",
+                verdict: .failed, reason: .encodeFailed
             )
         }
 
@@ -77,7 +112,8 @@ enum SystemImageConverter {
         ) else {
             return EngineResult(
                 success: false, compressed: original, outType: outType,
-                algorithm: "macOS ImageIO", error: "无法创建系统转换缓冲区"
+                algorithm: "macOS ImageIO", error: "无法创建系统转换缓冲区",
+                verdict: .failed, reason: .encodeFailed
             )
         }
 
@@ -90,14 +126,16 @@ enum SystemImageConverter {
         guard CGImageDestinationFinalize(dest) else {
             return EngineResult(
                 success: false, compressed: original, outType: outType,
-                algorithm: "macOS ImageIO", error: "macOS 系统转换失败"
+                algorithm: "macOS ImageIO", error: "macOS 系统转换失败",
+                verdict: .failed, reason: .encodeFailed
             )
         }
 
         let compressed = destData as Data
         return EngineResult(
             success: true, compressed: compressed, outType: outType,
-            algorithm: "macOS ImageIO · \(options.systemImageSize.shortLabel)", error: nil
+            algorithm: "macOS ImageIO · \(options.systemImageSize.shortLabel)", error: nil,
+            verdict: .candidate
         )
     }
 }

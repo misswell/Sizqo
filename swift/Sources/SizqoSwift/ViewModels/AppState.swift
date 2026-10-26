@@ -93,6 +93,17 @@ enum AppPage: String, CaseIterable {
 
 @MainActor
 final class AppState: ObservableObject {
+    /// 全进程唯一的实例（init 时登记）。退出清理（AppDelegate）用它核对
+    /// 批次/事务闸门 —— 另建实例会看不到同一个闸门上的状态。
+    private(set) static var current: AppState?
+
+    /// 退出清理是否允许执行：批次仍在跑或事务未收口时必须跳过（与 clearHistory
+    /// 同一道判据），否则刚建好、还没写进历史的备份会被 sweep 当孤儿删掉。
+    static func exitCleanupPermitted() -> Bool {
+        guard let state = current else { return true }
+        return !state.scheduler.isBatchActive && !state.transactions.hasPending()
+    }
+
     // 队列
     @Published var items: [QueueItem] = []
     @Published var options = CompressOptions()
@@ -178,6 +189,9 @@ final class AppState: ObservableObject {
         cpuThreadLimit = settings.cpuThreadLimit
         scheduler = CompressionScheduler(maxParallelism: CPULimit.effective(
             configured: settings.cpuThreadLimit, detected: cpuInfo.budgetCeiling))
+        // 供 AppDelegate 在退出时核对批次/事务状态：全进程只有一个 AppState 实例，
+        // 退出清理必须看得见这同一个实例上的闸门（在主线程读写）。
+        AppState.current = self
         // 第一步先结清上次没走完的覆盖事务，**必须早于任何清理**：回滚要用的那份备份
         // 如果被清理当成孤儿扫掉，原图就真没了。
         let recovered = transactions.recover(history)
@@ -237,14 +251,15 @@ final class AppState: ObservableObject {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = (outPath as NSString).lastPathComponent
         guard panel.runModal() == .OK, let dest = panel.url else { return }
-        showToast(Self.copyOverwriting(from: outPath, to: dest.path)
+        showToast(atomicCopyFile(from: outPath, to: dest.path)
             ? "已保存到: \(dest.lastPathComponent)"
             : "保存失败，请重试")
     }
 
     /// 对比查看：备份还在就比备份（覆盖模式的真正原图），否则比源文件本身。
     func compareHistoryEntry(_ entry: HistoryEntry) {
-        guard let outPath = entry.outputPath, fileExists(at: outPath) else {
+        guard entry.status == .compressed || entry.status == .missing,
+              let outPath = entry.outputPath, fileExists(at: outPath) else {
             showToast("压缩结果已不存在")
             refreshHistory()
             return
@@ -262,6 +277,10 @@ final class AppState: ObservableObject {
     /// 后缀 / 目录模式的对等「反悔」= 删掉这次生成的压缩结果。
     /// 删的是用户目录里的真实文件，所以必须二次确认；原图从头到尾没动过。
     func deleteHistoryOutput(_ entry: HistoryEntry) {
+        guard !restoreBlockedBySession else {
+            showToast(restoreBlockedText)
+            return
+        }
         guard let output = entry.outputPath else { return }
         let alert = NSAlert()
         alert.messageText = "删除这次压缩结果？"
@@ -328,6 +347,16 @@ final class AppState: ObservableObject {
         alert.addButton(withTitle: "清空")
         alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+        // runModal 的嵌套 runloop 里可能已经开跑新一轮（自动压缩的 asyncAfter
+        // 就在等这种时机）：确认之后必须再核一次闸门，确认前的判据不作数。
+        guard !scheduler.isBatchActive else {
+            showToast("压缩进行中，无法清空历史记录")
+            return
+        }
+        guard !transactions.hasPending() else {
+            showToast("仍有文件事务正在处理，暂时无法清空历史记录")
+            return
+        }
         let report = history.clear()
         refreshHistory()
         var message = "已清空历史记录"
@@ -376,14 +405,14 @@ final class AppState: ObservableObject {
                 let bv = b.result?.originalSize ?? b.fileSize
                 result = av < bv
             case .compressedSize:
-                let av = a.result?.success == true ? a.result!.compressedSize : nil
-                let bv = b.result?.success == true ? b.result!.compressedSize : nil
+                let av = a.result?.hasProduct == true ? a.result!.compressedSize : nil
+                let bv = b.result?.hasProduct == true ? b.result!.compressedSize : nil
                 if av == nil { return false }
                 if bv == nil { return true }
                 result = av! < bv!
             case .ratio:
-                let av = a.result?.success == true ? a.result!.savings : nil
-                let bv = b.result?.success == true ? b.result!.savings : nil
+                let av = a.result?.hasProduct == true ? a.result!.savings : nil
+                let bv = b.result?.hasProduct == true ? b.result!.savings : nil
                 if av == nil { return false }
                 if bv == nil { return true }
                 result = av! < bv!
@@ -398,15 +427,17 @@ final class AppState: ObservableObject {
 
     // MARK: - Stats
 
+    /// 体积账只数**盘上真有产物**的那些项（§6.1）。"压成功但一个字节没写"的那种
+    /// 以前会被记进账里，于是摘要说「省 0B · 2 个产物」而其中一张图根本没变过。
     var totalOriginal: Int64 {
         items.reduce(0) { sum, item in
-            guard let r = item.result, r.success else { return sum }
+            guard let r = item.result, r.hasProduct else { return sum }
             return sum + r.originalSize
         }
     }
     var totalCompressed: Int64 {
         items.reduce(0) { sum, item in
-            guard let r = item.result, r.success else { return sum }
+            guard let r = item.result, r.hasProduct else { return sum }
             return sum + r.compressedSize
         }
     }
@@ -417,8 +448,8 @@ final class AppState: ObservableObject {
     }
     var doneCount: Int { items.filter { $0.status == .done }.count }
     var failedCount: Int { items.filter { $0.status == .failed }.count }
-    /// 只要有成功结果即可恢复（与 Tauri 展示「恢复全部原图」的条件一致）
-    var hasRestorable: Bool { items.contains { $0.result?.success == true } }
+    /// 只要有产物即可恢复（与 Tauri 展示「恢复全部原图」的条件一致）
+    var hasRestorable: Bool { items.contains { $0.result?.hasProduct == true } }
     /// 还要压的文件数。失败的不算 —— 它们得用户显式点「重试」。
     var pendingCount: Int { items.filter { $0.status == .pending }.count }
 
@@ -432,8 +463,9 @@ final class AppState: ObservableObject {
     /// 摘要里的「42 / 100 已处理 · 失败 2」（失败为 0 时不写那一段）。
     var queueSummaryText: String { queueProgress.summaryText }
 
+    /// 对比窗口要打开两个文件：没落盘的那些年"结果"不许进来（§68 与前端同一判据）。
     var comparableResults: [CompressResult] {
-        items.compactMap(\.result).filter { $0.success }
+        items.compactMap(\.result).filter { $0.hasProduct }
     }
 
     // MARK: - Intent / 请求编译
@@ -549,7 +581,12 @@ final class AppState: ObservableObject {
         if let raw = d.string(forKey: "sizqo.setting-systemImageSize"), let v = SystemImageSize(rawValue: raw) { options.systemImageSize = v }
         if d.object(forKey: "sizqo.setting-preserveMetadata") != nil { options.preserveMetadata = d.bool(forKey: "sizqo.setting-preserveMetadata") }
         if d.object(forKey: "sizqo.setting-quality") != nil { options.quality = d.integer(forKey: "sizqo.setting-quality") }
-        if let raw = d.string(forKey: "sizqo.setting-outputFormat"), let v = OutputFormat(rawValue: raw) { options.outputFormat = v }
+        if let raw = d.string(forKey: "sizqo.setting-outputFormat"), let v = OutputFormat(rawValue: raw) {
+            // §22：存回来的格式若这台机器已经写不出来（缺少对应编码器），退回原格式，
+            // 而不是留一个菜单里选不中的值继续驱动请求。
+            let allowed = options.processingMode == .system ? OutputFormat.systemTargets : OutputFormat.advancedTargets
+            options.outputFormat = allowed.contains(v) ? v : .original
+        }
         if let raw = d.string(forKey: "sizqo.setting-outputMode"), let v = OutputMode(rawValue: raw) { options.outputMode = v }
         if let raw = d.string(forKey: "sizqo.setting-outputSuffix"), !raw.isEmpty { options.outputSuffix = raw }
         autoCompress = d.bool(forKey: "sizqo.setting-autoCompress")
@@ -600,6 +637,15 @@ final class AppState: ObservableObject {
             return
         }
         let existing = Set(items.filter { $0.status != .removed && $0.status != .restored }.map(\.path))
+        // §39 §40：先把这次导入的来源根收好，再逐项把「根 + 相对位置」写进队列项。
+        var importRoots: [String] = []
+        for root in incoming {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: root, isDirectory: &isDir), isDir.boolValue {
+                let canonical = canonicalPath(root)
+                if !importRoots.contains(canonical) { importRoots.append(canonical) }
+            }
+        }
         var added = 0
         for path in expanded where !existing.contains(path) {
             // 已移除 / 已恢复的行只是历史展示，重新加入时创建全新的 pending 行
@@ -607,21 +653,19 @@ final class AppState: ObservableObject {
                 items.remove(at: idx)
             }
             let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
+            let parent = (path as NSString).deletingLastPathComponent
+            // 目录导入 → 命中的那个来源根；单文件导入 → 它自己的父目录。
+            let root = Self.deepestRoot(file: path, roots: importRoots) ?? parent
+            let relative = Self.relativePathFromRoots(file: path, roots: [root])
+                ?? (path as NSString).lastPathComponent
             items.append(QueueItem(
                 path: path,
                 fileName: (path as NSString).lastPathComponent,
-                fileSize: size
+                fileSize: size,
+                sourceRoot: root,
+                relativePath: relative
             ))
             added += 1
-        }
-        // 记录来源根目录（用于「输出到指定文件夹」保留相对路径）
-        for root in incoming {
-            var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: root, isDirectory: &isDir),
-               isDir.boolValue,
-               !options.sourceRoots.contains(root) {
-                options.sourceRoots.append(root)
-            }
         }
         if added == 0 {
             hasImported = true
@@ -688,7 +732,6 @@ final class AppState: ObservableObject {
             scheduler.wakeWaiters()
         }
         items.removeAll()
-        options.sourceRoots.removeAll()
         pendingAutoCompress = false
     }
 
@@ -724,6 +767,9 @@ final class AppState: ObservableObject {
 
     /// 重试单个文件（与 Tauri compressOneFile 对齐：只处理该文件）。
     /// 失败 / 已恢复的行靠它回到 pending，普通「继续压缩」不碰这两种。
+    ///
+    /// §41：重试不换身份 —— 原地改同一个 QueueItem（id 不变），attemptCount 由
+    /// 开工那一刻加一。§42：everProcessed 不清，所以「已处理」的分子不会倒退。
     func retryFile(path: String) {
         guard !isCompressing else { return }
         guard options.outputMode != .folder || options.outputDir != nil else {
@@ -763,14 +809,22 @@ final class AppState: ObservableObject {
     private func runBatch(paths: [String]) {
         guard !paths.isEmpty else { return }
 
-        let sessionID = UUID()
         let revision = queueRevision
-        activeSessionID = sessionID
-        let targets = paths.compactMap { path -> (path: String, itemID: UUID)? in
+        let targets = paths.compactMap { path -> (path: String, itemID: UUID, relativePath: String)? in
             guard let item = items.first(where: { $0.path == path && $0.status == .pending }) else { return nil }
-            return (path, item.id)
+            return (path, item.id, item.relativePath)
         }
-        guard !targets.isEmpty else { activeSessionID = nil; return }
+        guard !targets.isEmpty else { return }
+
+        // §37 §38：一轮 session 只有一个入口，抢不到就说明已经有一轮在跑。
+        // 抢失败时**什么都不写**（会话号、按钮、取消账本一个都不动）—— 并跑第二轮的话，
+        // 先到那轮的收尾会把后一轮的暂停 / 停止 / 取消全清零，那正是"暂停失效、进度乱跳"。
+        guard scheduler.tryBeginBatch(maxParallelism: effectiveCpuThreadLimit) else {
+            showToast("已有一轮压缩正在运行，请等它结束或先停止")
+            return
+        }
+        let sessionID = UUID()
+        activeSessionID = sessionID
 
         setCompressionPhase(.running)
         compressButtonText = ""
@@ -783,14 +837,12 @@ final class AppState: ObservableObject {
 
         let group = DispatchGroup()
         let queue = DispatchQueue(label: "sizqo.compress", attributes: .concurrent)
-        // 新批次从未暂停、未停止开始，不继承上一批的状态；上限取设置页当前值。
-        scheduler.beginBatch(maxParallelism: effectiveCpuThreadLimit)
         let gate = scheduler
         let store = history
         let journal = transactions
         let retention = retentionDays
 
-        for (path, itemID) in targets {
+        for (path, itemID, relativePath) in targets {
             group.enter()
             queue.async { [self] in
                 // 每条出口都必须 leave 一次，否则被取消的文件会把整批吊住。
@@ -809,16 +861,24 @@ final class AppState: ObservableObject {
                     return
                 case .acquired(let permit):
                     defer { permit.release() }
+                    // 过闸之后、开工之前还有一个窗口：用户在此刻把它移出队列的话，
+                    // 不许照样压完落盘 —— 磁盘与历史都不该记下一份用户已经不要的结果。
+                    if self.isCancelled(path) {
+                        DispatchQueue.main.async { self.updateStatus(path, itemID: itemID, revision: revision, sessionID: sessionID, .removed) }
+                        return
+                    }
                     // 「压缩中」只在真正开工这一刻标记，等待中的行保持「等待」。
                     DispatchQueue.main.async {
                         if self.queueRevision == revision, self.activeSessionID == sessionID,
                            let idx = self.items.firstIndex(where: { $0.id == itemID && $0.path == path }),
                            self.items[idx].status == .pending {
                             self.items[idx].status = .running
+                            // §41：attemptCount 只在真正开工时加一；重试沿用同一个项 / id。
+                            self.items[idx].attemptCount += 1
                         }
                     }
                     let result = Self.compressOneStatic(
-                        path: path, options: opts, useSmart: useSmart,
+                        path: path, relativePath: relativePath, options: opts, useSmart: useSmart,
                         history: store, transactions: journal, retentionDays: retention
                     )
                     DispatchQueue.main.async { self.applyResult(path, itemID: itemID, revision: revision, sessionID: sessionID, result: result) }
@@ -946,16 +1006,26 @@ final class AppState: ObservableObject {
         guard queueRevision == revision, activeSessionID == sessionID,
               let idx = items.firstIndex(where: { $0.id == itemID && $0.path == path && $0.status == .running }) else { return }
         items[idx].result = result
-        items[idx].status = result.success ? .done : .failed
+        // §2 §67 生命周期由结论派生：跳过、取消、未达目标都是"这一轮处理完了"（done），
+        // 只有 outcome=failed 才是 Failed。
+        items[idx].status = result.contractQueueStatus
+        // §42：生命周期走完就落闩锁，之后的「重试」只改当前状态，不让进度倒退。
+        // 没收到开工事件时也补一个计数，保证「尝试过」至少是 1。
+        items[idx].everProcessed = true
+        if items[idx].attemptCount == 0 { items[idx].attemptCount = 1 }
     }
 
     // MARK: - Single compress
 
     nonisolated private static func compressOneStatic(
-        path: String, options: CompressOptions, useSmart: Bool,
+        path: String, relativePath: String, options: CompressOptions, useSmart: Bool,
         history: HistoryStore, transactions: OutputTransactionStore, retentionDays: Int
     ) -> CompressResult {
         let originalSize = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
+        // §24 §25 覆盖模式的原图快照必须在**编码之前**落好：编码要跑几秒到几十秒，
+        // 期间用户完全可能又改了这张图。到 Commit 才备份，备份到的就是改完的那份，
+        // 「恢复原图」从此恢复不出用户认得出的东西。非覆盖模式一次磁盘写都不做。
+        let baseline = captureReplaceBaseline(path: path, options: options, history: history)
         let started = Date()
         let engineResult = useSmart
             ? CompressionEngine.compressSmart(file: path, options: options)
@@ -972,182 +1042,346 @@ final class AppState: ObservableObject {
         }
         // 诚实规则 3：重编像素的意图照实说明 EXIF/GPS 不带入；系统转换才是保留元数据的路径。
         if options.processingMode == .advanced, engineResult.success,
-           engineResult.compressed.count != originalSize {
+           engineResult.compressed.count != Int(originalSize) {
             result.warnings.append("EXIF / GPS 等元数据不会带入输出（需保留请用系统转换）")
         }
+
+        // §10 §11 「这些字节值不值得落盘」只在这里回答一次， writer 不再自己猜。
+        let evaluation = Evaluation.evaluate(
+            verdict: engineResult.verdict,
+            engineReason: engineResult.reason,
+            engineSuccess: engineResult.success,
+            encodedBytes: engineResult.compressed.count,
+            originalSize: Int(originalSize),
+            formatConversion: options.outputFormat != .original,
+            targetMet: engineResult.targetMet
+        )
+        let beforeWrite = evaluation.preWriteOutcome
+        if let outcome = beforeWrite.outcome {
+            // 不提交的一支：一个字节都不许写、历史一条都不许记。
+            result.outcome = outcome
+            result.reasonCode = beforeWrite.reason
+            result.outputPath = nil
+            result.compressedSize = originalSize
+            result.savings = 0
+            return publish(result, mediaKind: "image")
+        }
+
         if let failure = writeOutputStatic(
-            &result, compressed: engineResult.compressed, options: options,
-            history: history, transactions: transactions, retentionDays: retentionDays
+            &result, compressed: engineResult.compressed, relativePath: relativePath, options: options,
+            history: history, transactions: transactions, retentionDays: retentionDays,
+            baseline: baseline
         ) {
             // 落盘没成就是没成：UI 绝不许显示「压缩完成」。
-            result.success = false
             result.outputPath = nil
+            result.backupPath = nil
             result.error = failure.userMessage
+            result.outcome = .failed
+            result.reasonCode = failure.reasonCode
+            return publish(result, mediaKind: "image")
         }
-        return result
+        let published = evaluation.committedOutcome
+        result.outcome = published.outcome
+        result.reasonCode = published.reason
+        return publish(result, mediaKind: "image")
     }
 
-    /// 落盘 + 记历史，与 Tauri 的 write_output_file 同一套事务顺序：
+    /// §141 发布前的最后一道核对：结论与字段必须自洽。
+    /// 违反它的是后端 bug，不是措辞 —— 宁可降级成 failed 把问题说出来，也不许让一个
+    /// 「说自己有产物却指向空气」的结果进到界面（那正是这次重构要根除的那类 bug）。
+    ///
+    /// 它只读参数本身，不碰 `AppState` 的任何状态，所以能留在 worker 线程上跑。
+    nonisolated private static func publish(_ result: CompressResult, mediaKind: String) -> CompressResult {
+        guard let problem = invariantViolation(
+            mediaKind: mediaKind, file: result.file,
+            outcome: result.outcome, outputPath: result.outputPath
+        ) else { return result }
+        var degraded = result
+        degraded.outputPath = nil
+        degraded.outcome = .failed
+        degraded.reasonCode = .unknown
+        // 原图到底动没动，走到这一步我们并不知道，绝不许替它保证。
+        degraded.error = "\(problem)；这次结果已按失败处理"
+        return degraded
+    }
+
+    /// 落盘 + 记历史，与 Tauri 的 commit_output 同一套顺序：
     ///
     /// ```text
-    /// ① ensureBackup ② 写 transaction ③ 同目录临时文件写压缩结果
-    /// ④ fsync ⑤ rename 覆盖目标 ⑥ history.add ⑦ 删 transaction
+    /// ① 完整复核源文件（stat + 内容哈希）  ② 独占目标名 + 独占临时名  ③ 写 transaction
+    /// ④ 写满候选 → flush + fsync  ⑤ 改名前再核一次指纹 + 确认备份字节对得上
+    /// ⑥ rename 覆盖目标  ⑦ history.add  ⑧ 销账
     /// ```
     ///
-    /// 任何一步失败都不得留下"覆盖了但没人知道"的状态；⑥ 失败用备份回滚。
+    /// 原图快照**不在这里做**（§24）：它已经在编码前由 `captureReplaceBaseline` 备好，
+    /// 这里只负责复核它。⑦ 失败才回滚；①②③④⑤⑥ 失败只撤回我们自己的临时文件和占位名
+    /// —— 那些时刻用户的文件还完好在原地，没动过的东西不许假装恢复（§34 同一条道理）。
+    ///
     /// 返回 nil = 一切正常，否则返回要报给用户的失败原因。
+    ///
+    /// 「这些字节值不值得落盘」不属于这里 —— 那由 `Evaluation` 在调用之前就答完了，
+    /// 走到这里的只有 Commit 一支。以前它自己再看一遍体积、顺手写一句「原图已是最优」
+    /// 然后返回 nil，于是 success 还是 true、产物却一个没有。
     nonisolated private static func writeOutputStatic(
-        _ result: inout CompressResult, compressed: Data, options: CompressOptions,
-        history: HistoryStore, transactions: OutputTransactionStore, retentionDays: Int
+        _ result: inout CompressResult, compressed: Data, relativePath: String, options: CompressOptions,
+        history: HistoryStore, transactions: OutputTransactionStore, retentionDays: Int,
+        baseline: ReplaceBaseline
     ) -> OutputWriteError? {
-        guard result.success, !compressed.isEmpty else { return nil }
-        let isFormatConversion = options.outputFormat != .original
-        if !isFormatConversion && Int64(compressed.count) >= result.originalSize {
-            result.error = "原图已是最优，无需替换"
-            return nil
+        if compressed.isEmpty {
+            return .outputWriteFailed("要写出的字节是空的")
         }
-
-        var backupFile: String?
-        let outExt = ".\(result.outType)"
         let fm = FileManager.default
         let path = result.file
-        let outPath: String?
+        // 目标位置的扩展名以**引擎交回的字节格式**为准（§10）。
+        let outType = result.outType
+        var backupFile: String?
+        // 只有覆盖模式才有"要复核的对象"；后缀/目录模式的原图从头到尾没被碰过。
+        var replaceIdentity: SourceIdentity?
+        let target: String
+        let placement: OutputPlacement
 
+        // §29 先定落盘模式，再由这一个决定派生"要不要备份""名字怎么来""事务算哪一类"。
+        // 拿到手的目标名已经是独占申请到的（同格式覆盖除外：它的目标本来就是用户那个文件）。
         switch options.outputMode {
         case .replace:
-            // 先备份再覆盖：备份没写成就不碰用户文件，否则原图永久丢失。
-            guard let backup = history.ensureBackup(for: path) else {
-                return .backupFailed("备份或它的来历记录没能写成")
+            // §25 覆盖的依据必须在场：读不到源文件指纹、或编码前的快照没写成，
+            // 就一个字节都不许碰用户文件。原因由 Publish 统一发布成对应结论。
+            let identity: SourceIdentity
+            let backup: String
+            switch baseline {
+            case .ready(let value, let snapshot): identity = value; backup = snapshot
+            case .unavailable(let error): return error
+            case .notReplace:
+                return .backupFailed("覆盖模式没有编码前留下的原图快照")
+            }
+            // ①复核放在占名之前：判定一旦变成"文件已经不是你压缩的那份了"，
+            //   用户目录里连一个多余文件都不该出现过（§25「删除 candidate」）。
+            //   这里必须是完整 `verify`：改名前那道快速门看不出"同大小、时间戳没动"
+            //   的原地改动，而那种改动恰恰是最需要拦的。
+            if case .changed(let detail) = identity.verify(at: path) {
+                return .sourceChanged(detail)
             }
             backupFile = backup
             result.backupPath = backup
-
-            let currentExt = ((path as NSString).pathExtension).lowercased()
-            let sameFormat = currentExt == result.outType
-                || (currentExt == "jpeg" && result.outType == "jpg")
-                || (currentExt == "jpg" && result.outType == "jpeg")
-                || (currentExt == "heif" && result.outType == "heic")
-                || (currentExt == "heic" && result.outType == "heif")
-            if options.processingMode == .system && isFormatConversion && !sameFormat {
-                outPath = availableSystemConversionPath(file: path, outType: result.outType)
+            replaceIdentity = identity
+            // 字节属于哪种格式，文件就得叫什么扩展名：把 JPEG 字节塞进 photo.gif
+            // 得到的是一个两边都打不开的"压缩成功"产物。判据只看字节格式，不看用户的
+            // 意图 —— 系统模式在 outputFormat=原格式 时也会把 GIF/WebP 转成 JPEG。
+            if sameOutputFormat(path: path, outType: outType) {
+                target = path
+                placement = .replaceExisting(crossFormat: false)
             } else {
-                outPath = path
+                // 跨格式转换的产物是新文件，但名字照样要独占申请：photo.webp 可能是
+                // 邻居的成品，"转换"把它盖掉就不是转换而是毁掉别人的东西（§28）。
+                guard let claimed = OutputNameAllocator.claim(
+                    in: outputDirectory(of: path),
+                    .converted(stem: fileStem(of: path), extension: outType)
+                ) else {
+                    return .collision(outputDirectory(of: path))
+                }
+                target = claimed.path
+                placement = .replaceExisting(crossFormat: true)
             }
 
         case .suffix:
-            let stem = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
-            let dir = (path as NSString).deletingLastPathComponent
-            let suffix = normalizedOutputSuffix(options.outputSuffix)
-            outPath = (dir as NSString).appendingPathComponent("\(stem)\(suffix)\(outExt)")
+            guard let claimed = OutputNameAllocator.claim(
+                in: outputDirectory(of: path),
+                .withSuffix(stem: fileStem(of: path),
+                            suffix: normalizedOutputSuffix(options.outputSuffix),
+                            extension: outType)
+            ) else {
+                return .collision(outputDirectory(of: path))
+            }
+            target = claimed.path
+            placement = .createNew
 
         case .folder:
-            guard let outDir = options.outputDir else { return nil }
-            let rel = relativePathFromRoots(file: path, roots: options.sourceRoots)
-                ?? (path as NSString).lastPathComponent
-            let relOut = (rel as NSString).deletingPathExtension + outExt
-            let target = (outDir as NSString).appendingPathComponent(relOut)
-            try? fm.createDirectory(
-                atPath: (target as NSString).deletingLastPathComponent,
-                withIntermediateDirectories: true
-            )
-            outPath = target
+            // 评估说"该落盘"，输出方式却给不出目标位置（folder 没选目录）。这不是跳过，
+            // 是配置没兑现：以前这里 `return nil`，用户看到「压缩完成」而磁盘上什么都没有。
+            guard let outDir = options.outputDir, !outDir.isEmpty else {
+                return .invalidDestination("请先选择输出目录")
+            }
+            // §39 §40：产物在输出目录里的层级只读队列项入队时定死的相对路径。
+            let rel = relativePath.isEmpty ? (path as NSString).lastPathComponent : relativePath
+            let relDir = (rel as NSString).deletingLastPathComponent
+            let dir = relDir.isEmpty ? outDir : (outDir as NSString).appendingPathComponent(relDir)
+            // 子目录必须先存在：否则独占申请报出来的是"找不到目录"，
+            // 和用户能理解的毛病（输出目录还没建）对不上。
+            do {
+                try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            } catch {
+                return .outputWriteFailed("\(dir): \(error.localizedDescription)")
+            }
+            let stem = ((rel as NSString).deletingPathExtension as NSString).lastPathComponent
+            guard let claimed = OutputNameAllocator.claim(
+                in: dir, .withSuffix(stem: stem, suffix: "", extension: outType)
+            ) else {
+                return .collision(dir)
+            }
+            target = claimed.path
+            placement = .createNew
+        }
+        let crossFormat = placement.crossFormat
+
+        // ① 事务 id 必须在动手之前定下来：历史落盘成功与否就靠它和 transaction 对账。
+        //    两种模式都要记账 —— 新建模式那份日志负责"证明不了提交就删掉自己生成的文件"（§32）。
+        let historyId = HistoryEntry.newId(forSource: path)
+
+        // ② 临时名先独占、再记账：日志必须在一个字节落盘之前就知道它叫什么。反过来做的话，
+        //    崩在"写完临时文件"与"改名"之间时，那个 .tmp 是唯一知道自己在场的记录还没写。
+        guard let staged = StagedWrite.claim(target: target) else {
+            releaseOutputPlaceholder(target, source: path)
+            return .outputWriteFailed("无法在 \(target) 旁边独占一个临时文件名")
+        }
+        let txn = ReplaceTransaction(
+            id: historyId,
+            historyId: historyId,
+            sourcePath: canonicalPath(path),
+            outputPath: target,
+            backupPath: backupFile ?? "",
+            tempOutputPath: staged.temp,
+            originalSize: result.originalSize,
+            expectedOutputSize: Int64(compressed.count),
+            // §2.5：事务必须带着身份证据落账。original 来自编码前钉下的源指纹，
+            // output 来自还没落盘的产物字节 —— 启动恢复靠这两个哈希证明归属，
+            // 证明不了就不会拿备份去盖一个被外部改过的文件。
+            originalSha256: replaceIdentity?.sha256,
+            outputSha256: sha256OfData(compressed),
+            createdAt: SizqoClock.nowMillis,
+            crossFormat: crossFormat,
+            mode: placement.transactionMode
+        )
+        // ③ 记账先于动手：写不进日志就还不许碰用户文件，占好的名字也得收回去。
+        if let detail = placement.journal(transactions, txn) {
+            staged.discard()
+            releaseOutputPlaceholder(target, source: path)
+            return .transactionFailed(detail)
         }
 
-        guard let target = outPath else { return nil }
-        let isReplace = options.outputMode == .replace
-        let crossFormat = isReplace && !sameFile(target, path)
+        // 改名**之前**失败都只做一件事：把这次自己造出来的东西收回去。用户的文件一个字
+        // 没动，所以绝不 rollback —— 把快照写回去反而会把用户在此期间的新改动盖掉（§25）。
+        func withdraw(_ error: OutputWriteError) -> OutputWriteError {
+            // 先删临时文件、后销账：反过来的话，两步之间崩溃会在用户图片目录里留下
+            // 一个没有任何 journal 知道它在场的 .tmp 孤儿。反过来最坏只是 journal
+            // 多留一拍 —— 下次启动的恢复按幂等语义收掉，磁盘不会多东西。
+            staged.discard()
+            transactions.finish(txn.id)
+            releaseOutputPlaceholder(target, source: path)
+            return error
+        }
 
-        // ① 事务 id 必须在覆盖之前定下来：历史落盘成功与否就靠它和 transaction 对账。
-        let historyId = isReplace ? HistoryEntry.newId(forSource: path) : nil
-        var txn: ReplaceTransaction?
-        if let id = historyId {
-            txn = ReplaceTransaction(
-                id: id,
-                historyId: id,
-                sourcePath: canonicalPath(path),
-                outputPath: target,
-                backupPath: backupFile ?? "",
-                tempOutputPath: nil,
-                originalSize: result.originalSize,
-                expectedOutputSize: Int64(compressed.count),
-                createdAt: SizqoClock.nowMillis,
-                crossFormat: crossFormat
-            )
-            // ② 记账先于动手：写不进日志就还不许碰用户文件。
-            if let record = txn, let detail = transactions.prepare(record) {
-                return .transactionFailed(detail)
+        // ④ 候选写满 → flush + fsync。到这一步结束，目标文件依然没被动过一个字节。
+        if !staged.writeSynced(compressed) {
+            return withdraw(.outputWriteFailed("无法写入 \(target)"))
+        }
+
+        // ⑤ 改名前的最后两道门（§26「最终 Commit 前必须确认当前 source == 本次压缩所
+        //    基于的 source」+ §31 的 backup check）。快速门只 stat 不读内容：改名之后
+        //    就是用户的文件了，来不及反悔，所以这一道必须便宜到任何时候都跑得动。
+        //    备份则按 §27 验字节 —— 覆盖之后它是原图唯一的副本。
+        if let identity = replaceIdentity, let backup = backupFile {
+            if case .changed(let detail) = identity.fingerprintIntact(at: path) {
+                return withdraw(.sourceChanged(detail))
+            }
+            if let detail = history.backupIsFaithful(backup) {
+                return withdraw(.backupFailed(detail))
             }
         }
 
-        // ③④⑤ 同目录临时文件 → fsync → rename。失败时目标文件保持原样。
-        guard let staged = StagedWrite.write(target: target, bytes: compressed) else {
-            if let record = txn { transactions.finish(record.id) }
-            return .outputWriteFailed("无法写入 \(target)")
+        // ⑥ 原子改名。到这里用户的原图才真的被换掉。
+        if !staged.publish(to: target) {
+            return withdraw(.outputWriteFailed("无法改名到 \(target)"))
         }
-        txn?.tempOutputPath = staged.temp
 
         if crossFormat {
-            try? fm.removeItem(atPath: path)
+            do { try fm.removeItem(atPath: path) }
+            catch {
+                // 删不掉（权限/被占用）时不许静默：磁盘上会同时留着原图和新格式产物。
+                // 产物已提交、历史已记，不能反过来撤销一次成功的压缩 —— 留警告给用户。
+                NSLog("Sizqo 跨格式替换：原文件删除失败（产物已保留）: %@", error.localizedDescription)
+                result.warnings.append("原格式文件删除失败，已保留: \(path)")
+            }
         }
         result.outputPath = target
         result.outputMode = options.outputMode.rawValue
 
         // 输出确认落盘之后才记历史：历史里绝不出现没写成的文件。
-        let entry = historyId == nil
-            ? HistoryEntry.record(
-                source: path, result: result, output: target,
-                backup: backupFile, retentionDays: retentionDays
-            )
-            : HistoryEntry.record(
-                withId: historyId!, source: path, result: result, output: target,
-                backup: backupFile, retentionDays: retentionDays
-            )
+        let entry = HistoryEntry.record(
+            withId: historyId, source: path, result: result, output: target,
+            backup: backupFile, retentionDays: retentionDays
+        )
         if history.add(entry) {
-            // ⑦ 历史已经落盘 = 这次覆盖有据可查，销账。留着下次启动会误判成中断事务。
-            if let record = txn { transactions.finish(record.id) }
+            // ⑦ 历史已经落盘 = 这次覆盖有据可查，⑧ 销账。留着下次启动会误判成中断事务。
+            transactions.finish(txn.id)
             return nil
         }
-        // ⑥ 失败 = 这次覆盖不能算数：把真正原图写回去，删掉这次生成的文件。
-        staged.discard()
-        guard let record = txn else {
-            // 后缀/目录模式没有"覆盖原图"这回事：最坏只是留下一个没进历史的压缩结果。
-            return nil
-        }
-        if let rollbackError = OutputTransactionStore.rollback(record) {
+        // ⑦ 失败 = 这次落盘不能算数。覆盖模式用备份把真正原图写回去；新建模式从没动过
+        //    原图，它删掉自己生成的那个文件（§32「磁盘没有 orphan output」）。
+        if let rollbackError = OutputTransactionStore.rollback(txn) {
             // 回滚也没成：事务日志必须留着，下次启动的 recovery 再试一次。
             return .rollbackFailed(rollbackError)
         }
-        transactions.finish(record.id)
+        transactions.finish(txn.id)
         return .historyWriteFailed
     }
 
     // MARK: - Restore（统一服务：主队列 / 历史页 / 对比窗口 / 恢复全部 都走 HistoryStore.restore）
 
+    /// §44 压缩会话与历史管理是两条生命周期：这一轮没结束前恢复会改写正在被压缩的
+    /// 源文件，进度还会从「5 / 10」倒成「4 / 9」。所有恢复入口共用这一道闸。
+    var restoreBlockedBySession: Bool { isCompressing }
+    var restoreBlockedText: String { "压缩进行中，暂不能恢复；请先停止或等这一轮结束" }
+
+    /// 历史行里依赖「当前没有压缩会话」的动作：恢复与删除结果都会改写源文件或产物。
+    func historyActionBlocked(_ action: HistoryRowAction) -> Bool {
+        restoreBlockedBySession && (action == .restore || action == .deleteOutput)
+    }
+
     /// 恢复一条历史记录。压缩之后又被外部改过时先问用户，坚持才 force 覆盖。
     /// 所有路径都由历史记录提供，调用方不参与拼路径。
     @discardableResult
     func restore(entry: HistoryEntry) -> Bool {
+        guard !restoreBlockedBySession else {
+            showToast(restoreBlockedText)
+            return false
+        }
         var outcome = history.restoreOutcome(entry: entry, force: false)
         if outcome.conflict {
             let alert = NSAlert()
             alert.messageText = "这个文件在压缩后又被修改过。"
-            alert.informativeText = "恢复原图会覆盖当前版本。"
-            alert.addButton(withTitle: "仍然恢复")
+            // 覆盖模式恢复 = 写回原图（覆盖改动）；非覆盖模式撤销 = 删产物（丢弃改动）。
+            // 两种动作丢的东西不一样，提示必须照实说。
+            alert.informativeText = entry.outputMode == "replace"
+                ? "恢复原图会覆盖当前版本。"
+                : "删除这次压缩结果会丢弃你在产物上做的修改。"
+            alert.addButton(withTitle: "仍然继续")
             alert.addButton(withTitle: "取消")
             guard alert.runModal() == .alertFirstButtonReturn else { return false }
+            // 模态的嵌套 runloop 里批次状态可能已经变了（自动压缩恰好起跑）：
+            // 强制恢复之前再核一次会话闸门，冲突确认不等于会话闸门确认。
+            guard !restoreBlockedBySession else {
+                showToast(restoreBlockedText)
+                return false
+            }
             outcome = history.restoreOutcome(entry: entry, force: true)
         }
         guard outcome.success else {
             showToast(outcome.error ?? "恢复失败")
             return false
         }
+        // 恢复成功 = 这条事务的最终结局已定（原图回去了 / 产物删掉了），
+        // 同一 id 的 journal 必须顺手销账：留着的话，下次启动会因 status=restored
+        // 把它当成"未提交事务"回滚，覆盖用户恢复之后的编辑。
+        transactions.finish(entry.id)
         markItemsRestored(forSource: entry.sourcePath)
         refreshHistory()
         // 非 replace 模式的原图从没被盖过，后端做的是"删掉这次的压缩产物" ——
         // 报「已恢复原图」等于把一件没发生过的事说给用户听。
-        showToast(entry.outputMode == "replace"
+        let message = entry.outputMode == "replace"
             ? "已恢复原图: \(entry.fileName)"
-            : "已删除这次压缩结果: \(entry.fileName)")
+            : "已删除这次压缩结果: \(entry.fileName)"
+        // §48 恢复成功与"产物没删掉"可以同时成立：一句 toast 说清两件事。
+        showToast(outcome.warning.map { "\(message)；\($0)" } ?? message)
         return true
     }
 
@@ -1170,7 +1404,11 @@ final class AppState: ObservableObject {
     }
 
     func restoreAll() {
-        let restorable = items.filter { $0.status == .done && $0.result?.success == true }
+        guard !restoreBlockedBySession else {
+            showToast(restoreBlockedText)
+            return
+        }
+        let restorable = items.filter { $0.status == .done && $0.result?.hasProduct == true }
         guard !restorable.isEmpty else { return }
         let alert = NSAlert()
         alert.messageText = "确定要恢复全部已压缩成功的原图吗？"
@@ -1181,12 +1419,16 @@ final class AppState: ObservableObject {
         var restored = 0
         var conflicts = 0
         var failed = 0
+        var cleanupWarnings = 0
         for item in restorable {
             guard let file = item.result?.file,
                   let entry = history.findLatest(forSource: file) else { failed += 1; continue }
             let outcome = history.restoreOutcome(entry: entry, force: false)
             if outcome.success {
+                // 与 restore(entry:) 同一份销账：恢复终局后不许留悬空 journal。
+                transactions.finish(entry.id)
                 restored += 1
+                if outcome.warning != nil { cleanupWarnings += 1 }
                 markItemsRestored(forSource: entry.sourcePath)
             } else if outcome.conflict {
                 conflicts += 1
@@ -1198,6 +1440,7 @@ final class AppState: ObservableObject {
         // 冲突不静默覆盖：整批里遇到的都记下来，让用户去历史页逐个确认。
         var message = "已恢复 \(restored) 个文件到原图"
         if conflicts > 0 { message += "，\(conflicts) 个文件压缩后又被修改过，请在历史记录里逐个确认" }
+        if cleanupWarnings > 0 { message += "，\(cleanupWarnings) 个压缩结果未能删除" }
         if failed > 0 { message += "，\(failed) 个未能恢复" }
         showToast(message)
     }
@@ -1213,7 +1456,7 @@ final class AppState: ObservableObject {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = (outPath as NSString).lastPathComponent
         if panel.runModal() == .OK, let dest = panel.url {
-            if Self.copyOverwriting(from: outPath, to: dest.path) {
+            if atomicCopyFile(from: outPath, to: dest.path) {
                 showToast("已保存到: \(dest.lastPathComponent)")
             } else {
                 showToast("保存失败，请重试")
@@ -1224,22 +1467,43 @@ final class AppState: ObservableObject {
     // MARK: - Export all
 
     func exportAll() {
-        let doneItems = items.filter { $0.status == .done && $0.result?.success == true }
+        let doneItems = items.filter { $0.status == .done && $0.result?.hasProduct == true }
         guard !doneItems.isEmpty else { return }
         let suffix = Self.normalizedOutputSuffix(doneItems.first?.result?.options?.outputSuffix ?? options.outputSuffix)
+        let fm = FileManager.default
         var count = 0
+        var failed = 0
         for item in doneItems {
             guard let outPath = item.result?.outputPath else { continue }
-            let stem = ((item.path as NSString).lastPathComponent as NSString).deletingPathExtension
-            let dir = (item.path as NSString).deletingLastPathComponent
+            let dir = Self.outputDirectory(of: item.path)
             let ext = (outPath as NSString).pathExtension
-            let destPath = (dir as NSString).appendingPathComponent("\(stem)\(suffix).\(ext)")
-            if destPath == outPath { count += 1; continue }
-            if Self.copyOverwriting(from: outPath, to: destPath) {
+            // §54 导出用的是**同一个**名字分配器：上一次导出的 `foo_compressed.jpg` 已经在
+            // 目录里，这次就取 `foo_compressed_1.jpg`，绝不把上一次的成果盖掉。
+            let naming = OutputNaming.withSuffix(
+                stem: Self.fileStem(of: item.path), suffix: suffix, extension: ext.isEmpty ? "png" : ext
+            )
+            // 产物已经躺在导出的位置上（后缀模式 + 同一个后缀）：不必复制第二份。
+            if (dir as NSString).appendingPathComponent(naming.candidate(0)) == outPath {
                 count += 1
+                continue
+            }
+            guard let claimed = OutputNameAllocator.claim(in: dir, naming) else { failed += 1; continue }
+            var exported = false
+            if let bytes = fm.contents(atPath: outPath), let staged = StagedWrite.claim(target: claimed.path) {
+                exported = staged.writeAndPublish(bytes, to: claimed.path)
+                if !exported { staged.discard() }
+            }
+            if exported {
+                count += 1
+            } else {
+                // 复制没成：占住的空名字收回去，别在用户目录里留一个 0 字节的"导出成果"。
+                claimed.release()
+                failed += 1
             }
         }
-        showToast("已导出 \(count) 个文件到原目录（\(suffix) 后缀）")
+        showToast(failed == 0
+            ? "已导出 \(count) 个文件到原目录（\(suffix) 后缀）"
+            : "已导出 \(count) 个文件到原目录（\(suffix) 后缀），\(failed) 个没能导出")
     }
 
     // MARK: - Copy log
@@ -1253,7 +1517,11 @@ final class AppState: ObservableObject {
         lines.append("=== Sizqo 压缩日志 ===")
         lines.append("")
         lines.append("文件: \(result.file)")
-        lines.append("状态: \(result.success ? "成功" : "失败")")
+        // 日志里那两行写的是**契约原词**（outcome / reasonCode），不是中文句子：
+        // 截图要能反查到后端到底判了什么（与前端 copyCompressLog 同一套）。
+        let logged = result.contractLogStatus
+        lines.append("状态: \(logged.status)")
+        if !logged.reason.isEmpty { lines.append("原因: \(logged.reason)") }
         lines.append("")
         lines.append("--- 本轮请求 ---")
         lines.append("quality: \(opts.quality)")
@@ -1264,7 +1532,7 @@ final class AppState: ObservableObject {
         lines.append("outputSuffix: \(opts.outputSuffix)")
         lines.append("")
         lines.append("--- 压缩结果 ---")
-        if result.success {
+        if result.hasProduct {
             lines.append("原始大小: \(CompressResult.formatBytesJS(result.originalSize)) (\(result.originalSize) bytes)")
             lines.append("压缩后大小: \(CompressResult.formatBytesJS(result.compressedSize)) (\(result.compressedSize) bytes)")
             lines.append("压缩率: \(result.savingsSignedText)")
@@ -1276,7 +1544,10 @@ final class AppState: ObservableObject {
             }
             for warning in result.warnings { lines.append("说明: \(warning)") }
         } else {
-            lines.append("压缩失败")
+            // 没有产物不等于失败：跳过 / 取消同样是"这一轮到此为止，原图没动"。
+            lines.append("没有产物 · 原文件未改动（\(result.contractStatusText)）")
+            let why = result.contractReasonText
+            if !why.isEmpty { lines.append("为什么: \(why)") }
         }
         lines.append("")
         lines.append("--- 错误信息 ---")
@@ -1326,8 +1597,14 @@ final class AppState: ObservableObject {
 
         // 主窗口保留真实输出/备份元数据，仅同步体积、算法与压缩率
         // （与 Tauri compare-recompressed 处理一致），确保另存为/恢复/导出仍指向真实结果。
+        // 结论字段同样保留正式产物的那一份：`init(engine:)` 不写 outcome（默认 nil），
+        // 直接合并会把 done 行的契约冲掉 —— hasProduct 变 false、恢复/对比按钮消失、
+        // 体积账少计，而预览的体积/压缩率描述的是临时文件，不是落盘的产物。
         var merged = newResult
         merged.outputPath = existing.outputPath
+        // hasProduct 等契约字段由 outcome 派生，保住结论就保住了整条行契约。
+        merged.outcome = existing.outcome
+        merged.reasonCode = existing.reasonCode
         items[idx].result = merged
         return newResult
     }
@@ -1386,35 +1663,58 @@ final class AppState: ObservableObject {
         return String(s.prefix(64))
     }
 
-    nonisolated private static func availableSystemConversionPath(file: String, outType: String) -> String {
-        let preferred = (file as NSString).deletingPathExtension + "." + outType
-        if !FileManager.default.fileExists(atPath: preferred) { return preferred }
-        let stem = ((file as NSString).lastPathComponent as NSString).deletingPathExtension
-        let dir = (file as NSString).deletingLastPathComponent
-        for i in 1... {
-            let suffix = i == 1 ? "_converted" : "_converted_\(i)"
-            let candidate = (dir as NSString).appendingPathComponent("\(stem)\(suffix).\(outType)")
-            if !FileManager.default.fileExists(atPath: candidate) { return candidate }
-        }
-        return preferred
+    /// 产物放在源文件所在的目录里（与 Rust `output_directory` 同一句）。
+    nonisolated private static func outputDirectory(of path: String) -> String {
+        let dir = (path as NSString).deletingLastPathComponent
+        return dir.isEmpty ? "." : dir
     }
 
-    nonisolated private static func relativePathFromRoots(file: String, roots: [String]) -> String? {
-        // 文件路径已规范化，根目录需同样规范化后做前缀匹配；取最深的匹配根
-        // （与 Tauri relative_path_from_source_roots 对齐）。
+    /// 不带扩展名的文件名，用作候选名的词干（与 Rust `file_stem_of` 同一句）。
+    nonisolated private static func fileStem(of path: String) -> String {
+        let stem = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+        return stem.isEmpty ? "file" : stem
+    }
+
+    /// 字节属于哪种格式，文件就得叫什么扩展名（与 Rust `same_output_format` 同一份判定）。
+    ///
+    /// jpeg/jpg、heif/heic 是同一种格式的不同拼法：把它们判成"转换"会让每个 `.jpeg`
+    /// 都在原图旁边长出一个 `.jpg`。
+    nonisolated private static func sameOutputFormat(path: String, outType: String) -> Bool {
+        let current = ((path as NSString).pathExtension).lowercased()
+        return current == outType
+            || (current == "jpeg" && outType == "jpg")
+            || (current == "jpg" && outType == "jpeg")
+            || (current == "heif" && outType == "heic")
+    }
+
+    /// 落盘没成，收回这次占住的输出名。
+    ///
+    /// 同格式覆盖的目标**就是用户原图**，那种情况下"收回占位"等于删原图 —— 所以界线
+    /// 就是 `target == path` 这一条：只有我们新建出来的空占位才归自己删。
+    nonisolated private static func releaseOutputPlaceholder(_ target: String, source path: String) {
+        if target != path { try? FileManager.default.removeItem(atPath: target) }
+    }
+
+    /// 最深的、真正包住这个文件的来源根（§39 §40）。
+    /// 与 Tauri `source_root::relative_to_roots` 同一套判据：只认传进来的根，不按文件名猜。
+    nonisolated private static func deepestRoot(file: String, roots: [String]) -> String? {
         let canonicalFile = canonicalPath(file)
-        var best: (depth: Int, relative: String)?
+        var best: (depth: Int, root: String)?
         for root in roots {
             var rootPath = canonicalPath(root)
             if rootPath.hasSuffix("/") { rootPath = String(rootPath.dropLast()) }
             guard canonicalFile.hasPrefix(rootPath + "/") else { continue }
-            let relative = String(canonicalFile.dropFirst(rootPath.count + 1))
             let depth = rootPath.split(separator: "/").count
             if best == nil || depth > best!.depth {
-                best = (depth, relative)
+                best = (depth, rootPath)
             }
         }
-        return best?.relative
+        return best?.root
+    }
+
+    nonisolated private static func relativePathFromRoots(file: String, roots: [String]) -> String? {
+        guard let root = deepestRoot(file: file, roots: roots) else { return nil }
+        return String(canonicalPath(file).dropFirst(root.count + 1))
     }
 }
 

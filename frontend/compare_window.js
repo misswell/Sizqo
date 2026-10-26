@@ -12,6 +12,12 @@ function localizeUiText(value) {
   return window.SizqoI18n.translateText(value);
 }
 
+/// 后端原话走整句词典，不走子串替换 —— 详见 i18n.js 的 translateMessage。
+function localizeBackendText(value) {
+  if (typeof window === 'undefined' || !window.SizqoI18n) return value;
+  return window.SizqoI18n.translateMessage(value);
+}
+
 // ─── DOM ────────────────────────────────────────────────────────
 const comparePanel = document.getElementById('comparePanel');
 const compareModalBody = document.getElementById('compareModalBody');
@@ -169,7 +175,7 @@ function refreshInfo() {
   compareFilename.textContent = basename(currentResult.file);
   compareOriginalSize.textContent = currentResult.originalSizeFormatted || '?';
   compareCompressedSize.textContent = currentResult.compressedSizeFormatted || '?';
-  compareSavings.textContent = (currentResult.savings >= 0 ? '-' : '+') + Math.abs(currentResult.savings).toFixed(1) + '%';
+  compareSavings.textContent = savingsPercentText(currentResult);
   compareAlgorithm.textContent = currentResult.algorithm || '?';
 }
 
@@ -240,9 +246,9 @@ async function renderAt(index) {
 
 function loadPayload(payload) {
   if (!payload) return;
-  compareResults = (Array.isArray(payload.results) ? payload.results : []).filter(function(r) {
-    return r && r.success;
-  });
+  // §68 「有没有产物」由结果契约回答，本窗口不另起一条判据：success 为真却没落盘的那一支
+  // 会指向一个磁盘上不存在的压缩图。
+  compareResults = (Array.isArray(payload.results) ? payload.results : []).filter(resultHasProduct);
   const index = typeof payload.index === 'number' ? payload.index : 0;
   if (!compareResults.length) {
     currentResult = null;
@@ -304,6 +310,30 @@ function navigateCompare(direction) {
 }
 
 // ─── Actions: recompress / restore / close ──────────────────────
+/// §44 主窗口正在压的时候，这个窗口的「恢复原图」也必须变灰：
+/// 判据来自后端阶段，按钮只照着画。
+let compareRestoreBlocked = false;
+
+function setCompareRestoreBlocked(blocked) {
+  compareRestoreBlocked = !!blocked;
+  const btn = document.getElementById('restoreCompareBtn');
+  if (!btn) return;
+  btn.disabled = compareRestoreBlocked;
+  btn.title = compareRestoreBlocked
+    ? localizeUiText('压缩进行中，暂不能恢复；请先停止或等这一轮结束')
+    : '';
+}
+
+async function refreshCompareRestoreAvailability() {
+  try {
+    const state = await invoke('get_compression_state');
+    setCompareRestoreBlocked(!!state && state !== 'idle');
+  } catch (e) {
+    // 问不到状态就按空闲处理：报不出真状态时宁可什么都不说（与主窗口同一口径）。
+    setCompareRestoreBlocked(false);
+  }
+}
+
 async function recompressWithQuality(quality) {
   if (!currentResult) return;
   const result = currentResult;
@@ -320,7 +350,7 @@ async function recompressWithQuality(quality) {
       outputFormat: result.type || 'original',
     };
     const newResult = await invoke('compress_single', { filePath: result.file, options: options });
-    if (newResult && newResult.success && newResult.outputPath) {
+    if (resultHasProduct(newResult)) {
       if (requestId !== compareRequestId || !currentResult || currentResult.file !== result.file) return;
       const loadedPreview = await loadOriginalImage(compareCompressedImg, newResult.outputPath);
       if (requestId !== compareRequestId || !currentResult || currentResult.file !== result.file) return;
@@ -329,7 +359,7 @@ async function recompressWithQuality(quality) {
         return;
       }
       compareCompressedSize.textContent = newResult.compressedSizeFormatted || '?';
-      compareSavings.textContent = (newResult.savings >= 0 ? '-' : '+') + Math.abs(newResult.savings).toFixed(1) + '%';
+      compareSavings.textContent = savingsPercentText(newResult);
       compareAlgorithm.textContent = newResult.algorithm || '?';
 
       // compress_single 输出的是临时预览文件；保留真实输出与备份元数据，
@@ -343,7 +373,10 @@ async function recompressWithQuality(quality) {
       emit('compare-recompressed', { filePath: result.file, result: currentResult });
       showToast(localizeUiText('重新压缩完成 (质量: ') + quality + '%)');
     } else {
-      showToast(localizeUiText('重新压缩失败'));
+      // 没产物 ≠ 失败：跳过和未达成各有各的结论，toast 要说的是那句真话（§70）。
+      const why = resultReasonText(newResult);
+      showToast(localizeUiText('重新压缩没有产出：') + resultStatusText(newResult)
+        + (why ? ' · ' + why : ''));
     }
   } catch (err) {
     showToast(localizeUiText('重新压缩出错: ') + (err.message || err));
@@ -354,23 +387,30 @@ async function recompressWithQuality(quality) {
 
 async function restoreFromCompare() {
   if (!currentResult) return;
+  // §44 会话期间恢复会和正在处理的源文件抢写，还会让主队列进度倒退；
+  // 后端同样会拒绝，这里先把动作停在窗口内并说明原因。
+  if (compareRestoreBlocked) {
+    showToast(localizeUiText('压缩进行中，暂不能恢复；请先停止或等这一轮结束'));
+    return;
+  }
   const r = currentResult;
   try {
-    const result = await invoke('restore_original', {
+    // 这是**恢复命令自己的结论**（success/error），不是媒体结果；媒体结果有没有产物只问契约。
+    const outcome = await invoke('restore_original', {
       filePath: r.file,
       backupPath: r.backupPath || null,
       outputMode: r.outputMode || 'suffix',
       outputPath: r.outputPath || null,
       outputSuffix: (r.compressOptions && r.compressOptions.outputSuffix) || null,
     });
-    if (result && result.success) {
+    if (outcome && outcome.success) {
       emit('compare-restored', { filePath: r.file });
       closeCompareWindow();
     } else {
-      showToast(localizeUiText('恢复失败: ') + ((result && result.error) || localizeUiText('未知错误')));
+      showToast(localizeUiText('恢复失败: ') + ((outcome && localizeBackendText(outcome.error)) || localizeUiText('未知错误')));
     }
   } catch (err) {
-    showToast(localizeUiText('恢复出错: ') + (err.message || err));
+    showToast(localizeUiText('恢复出错: ') + localizeBackendText(err.message || err));
   }
 }
 
@@ -444,15 +484,18 @@ window.addEventListener('beforeunload', () => {
 });
 
 // ─── 主窗口事件同步 ─────────────────────────────────────────────
+listen('compression-state-change', function(event) {
+  const state = event && event.payload && event.payload.state;
+  setCompareRestoreBlocked(!!state && state !== 'idle');
+}).catch(function() {});
+
 listen('compare-open', function(event) {
   loadPayload(event.payload);
 });
 
 listen('compare-results-changed', function(event) {
   const payload = event.payload || {};
-  const incoming = (Array.isArray(payload.results) ? payload.results : []).filter(function(r) {
-    return r && r.success;
-  });
+  const incoming = (Array.isArray(payload.results) ? payload.results : []).filter(resultHasProduct);
   compareResults = incoming;
   setNavButtonsState();
 
@@ -487,6 +530,8 @@ listen('compare-results-changed', function(event) {
 
 // ─── Init ───────────────────────────────────────────────────────
 (async function init() {
+  // 窗口打开时主窗口可能已经在压：先问一次真实阶段，再开始接收变化事件。
+  refreshCompareRestoreAvailability();
   try {
     const payload = await invoke('take_compare_window_payload');
     if (payload) {

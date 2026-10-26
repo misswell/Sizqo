@@ -6,7 +6,8 @@
 //   · 「继续压缩」不许重压已经 done 的文件；
 //   · failed 不许被普通「继续压缩」自动重试，但要能显式「重试」；
 //   · Pause→Resume 不新开一轮，Stop→Continue 必须新开一轮；
-//   · 进度绝不倒退回 0/N，processed 只增不减。
+//   · 进度绝不倒退回 0/N，processed 只增不减；
+//   · §37 会话凭证抢不到时顶回来的是"并发会话"，界面既不报压坏了，也不谎称空闲。
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const {
@@ -21,6 +22,25 @@ const fill = { style: {} };
 const runs = [];
 const toasts = [];
 let progress = null;
+/// §37 顶回「已经有一轮在跑」那一段里，后端回报的真实阶段。
+let busyBackendState = 'idle';
+
+// §37 会话凭证抢不到时后端回的那句原话，是前端判断"这是并发会话、不是压坏了"的
+// 整句依据。两边必须一字不差 —— 改一个字，前端就退回把并发会话谎报成一次压缩失败。
+const nodeFs = require('node:fs');
+const nodePath = require('node:path');
+const rustSessionGuard = nodeFs.readFileSync(
+  nodePath.join(__dirname, '..', 'src-tauri', 'src', 'commands.rs'), 'utf8');
+const frontendSource = nodeFs.readFileSync(
+  nodePath.join(__dirname, '..', 'frontend', 'app.js'), 'utf8');
+const busyFromRust = (rustSessionGuard.match(/pub const SESSION_BUSY_MESSAGE: &str = "([^"]+)"/) || [])[1];
+const busyFromFrontend = (frontendSource.match(/var SESSION_BUSY_MESSAGE = '([^']+)'/) || [])[1];
+assert.ok(busyFromRust, 'Rust 侧的会话被顶回原话必须是一个常量，不能散落在命令里');
+assert.equal(busyFromFrontend, busyFromRust, '前后端对"已有一轮在跑"这句话不再一字不差');
+assert.doesNotMatch(rustSessionGuard, /pub fn begin_batch\(/,
+  '§37 又开出无条件占会话的后门：入口只许是 try_begin_batch');
+assert.doesNotMatch(rustSessionGuard, /fn compress_batch_with_session/,
+  '会话凭证又变成了一个 bool 参数：绕过 SessionGuard 的入口就该编译不过');
 
 const context = vm.createContext({
   console, Set, Map, Promise, Date,
@@ -41,10 +61,17 @@ const context = vm.createContext({
   // app.js 那边监听的是事件对象，事件载荷在 event.payload 里。
   listen: async (_, handler) => { progress = payload => handler({ payload }); return () => {}; },
   invoke: async (command, args) => {
-    if (command === 'probe_media') return args.paths.map(path => ({ path, mediaKind: 'image', size: 2048 }));
+    // §39 导入结果自带来源根与相对路径；这里按"单文件导入"回答（根 = 父目录）。
+    if (command === 'probe_media') return args.paths.map(path => ({
+      path, mediaKind: 'image', size: 2048,
+      sourceRoot: path.slice(0, path.lastIndexOf('/')),
+      relativePath: path.slice(path.lastIndexOf('/') + 1),
+    }));
     if (command === 'get_file_sizes') return args.filePaths.map(() => 2048);
-    return new Promise(resolve => runs.push({
-      command, paths: args.filePaths, sessionId: args.sessionId, queueRevision: args.queueRevision, resolve,
+    // §37 会话被后端顶回时，前端要问一次后端此刻的真实阶段。
+    if (command === 'get_compression_state') return busyBackendState;
+    return new Promise((resolve, reject) => runs.push({
+      command, paths: args.filePaths, sessionId: args.sessionId, queueRevision: args.queueRevision, resolve, reject,
     }));
   },
   formatBytes: String, iconMarkup: () => '<svg></svg>',
@@ -90,7 +117,14 @@ const emit = payload => progress(Object.assign({ sessionId: currentRun().session
 const start = file => emit({ file, status: 'starting' });
 const done = (file, ok = true) => emit({
   file, status: ok ? 'completed' : 'failed',
-  result: { file, success: ok, savings: ok ? 12 : 0, originalSize: 2048, compressedSize: 1800 },
+  // outputPath 是后端只在**真的落盘之后**才填的那个字段：没有它，这一项就是
+  // "引擎压成功了但盘上没文件"，界面上任何"完成 / 产物"的说法都不该出现。
+  result: {
+    file, outcome: ok ? 'committed' : 'failed', reasonCode: ok ? null : 'decode_failed',
+    savings: ok ? 12 : 0, originalSize: 2048, compressedSize: 1800,
+    outputPath: ok ? `${file.replace(/\.png$/, '')}_compressed.png` : null,
+    outputMode: 'suffix',
+  },
 });
 const deferred = file => emit({ file, status: 'deferred' });
 const cancelAck = file => emit({ file, status: 'cancelled' });
@@ -208,16 +242,28 @@ const pendingPaths = () => context.getPendingQueuePaths();
 
   // 显式重试：失败 → pending → 再压一次，总体已处理数不倒退。
   const beforeRetry = progressOf().processed;
+  const retriedTaskId = context.queueItems.get(bad).taskId;
+  assert.equal(context.queueItems.get(bad).attemptCount, 1, '§41 失败的那次算一次尝试');
   const retry = context.compressOneFile(bad);
   await flush();
   assert.equal(stateOf(bad), 'pending', '重试先把它放回 pending');
+  assert.equal(context.queueItems.get(bad).taskId, retriedTaskId, '§41 重试不换 taskId');
+  assert.equal(progressOf().processed, beforeRetry, '§42 重试等待中分子不倒退');
+  assert.equal(progressOf().retrying, 1, '处理过又回到 pending = 正在重试');
+  assert.equal(summary.textContent, '21 / 21 已处理 · 正在重试 1 项', '摘要说明分子为什么没退');
   assert.deepEqual(Array.from(currentRun().paths), [bad], '重试只开一轮含这个文件的会话');
   start(bad);
   assert.equal(stateOf(bad), 'running', '开工事件到达后才写 running');
+  assert.equal(context.queueItems.get(bad).attemptCount, 2, '§41 重试开工把 attemptCount 加一');
+  assert.equal(progressOf().processed, beforeRetry, '§42 重试运行中分子也不倒退');
+  assert.equal(progressOf().retrying, 1);
   done(bad);
   settleRun();
   await retry;
+  assert.equal(context.queueItems.get(bad).taskId, retriedTaskId, '重试结束后仍是同一个 taskId');
+  assert.equal(context.queueItems.get(bad).attemptCount, 2);
   assert.equal(progressOf().processed, beforeRetry, '重试成功后已处理数不变（失败换成成功）');
+  assert.equal(progressOf().retrying, 0, '重试收尾后不再显示"正在重试"');
   assert.equal(summary.textContent, '21 / 21 已处理', '失败清零后摘要不再写"失败 1"');
   assert.equal(progressOf().failed, 0);
 
@@ -250,5 +296,27 @@ const pendingPaths = () => context.getPendingQueuePaths();
   settleRun();
   await seventhRun;
 
-  console.log('PASS: 会话模型（暂停续跑同轮、停止继续换轮、旧事件隔离、失败不自动重试、进度不倒扣）');
+  // ── §37 后端顶回「已经有一轮在跑」：那不是压坏了，界面也不许谎称空闲 ─────
+  const busy = Array.from({ length: 2 }, (_, i) => `/busy-${i}.png`);
+  await context.handleFilePaths(busy);
+  busyBackendState = 'running';
+  const pauseVisibility = [];
+  context.setPauseButtonVisible = visible => pauseVisibility.push(visible);
+  const runsBeforeBusy = runs.length;
+  const busyRun = context.startCompression(false);
+  await flush();
+  assert.equal(runs.length, runsBeforeBusy + 1, '这一轮确实去后端申领过会话');
+  currentRun().reject(new Error(busyFromRust));
+  await busyRun;
+  await flush();
+  assert.match(toasts[toasts.length - 1], /已有一轮压缩正在运行/,
+    '顶回来的是并发会话，就不能念成「压缩出错: …」');
+  assert.equal(context.compressionState, 'running',
+    '真的还有一轮在跑时把界面写成 idle，暂停 / 停止就在最需要的时候消失了');
+  assert.deepEqual(pauseVisibility.slice(-1), [true], '还在跑的那一轮必须留得住暂停 / 停止按钮');
+  assert.equal(runs.length, runsBeforeBusy + 1, '被顶回的一轮不许自动再申领一次');
+  assert.deepEqual(busy.map(stateOf), ['pending', 'pending'],
+    '没开始的两个文件仍然是 pending：被拒的是这一轮，不是这些文件');
+
+  console.log('PASS: 会话模型（暂停续跑同轮、停止继续换轮、旧事件隔离、失败不自动重试、进度不倒扣、并发会话被顶回时界面说真话）');
 })().catch(error => { console.error(error); process.exitCode = 1; });

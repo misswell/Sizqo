@@ -18,6 +18,7 @@ function slice(from, to) {
 
 function installTranslationFallback(context) {
   if (typeof context.localizeUiText !== 'function') context.localizeUiText = value => value;
+  if (typeof context.localizeBackendText !== 'function') context.localizeBackendText = value => value;
 }
 
 /// 「队列状态（唯一真相）」整段：queueItems + 派生进度 + 队列摘要。
@@ -32,6 +33,22 @@ function queueRowPainter() {
   return slice('/// 把一个队列项此刻的状态', 'function createQueueRow(');
 }
 
+/// 「结果契约的唯一解释器」现在是一份独立文件（frontend/result_state.js）：
+/// 主窗口和独立对比窗口共用同一份判据，测试装的也必须是那个文件本身 ——
+/// 在 app.js 里再抄一份判据来测，测的就不是线上跑的那一份了。
+/// 它之上还压着队列自己的两个事实（已恢复 / 已移除 的不算产物、产物清单），一起装。
+function productRule() {
+  const contract = fs.readFileSync(path.join(__dirname, '..', 'frontend', 'result_state.js'), 'utf8');
+  return contract + '\n' + slice('/// 一项现在到底有没有产物', 'function updateBulkActionButtons(');
+}
+
+/// §44 会话闸门：队列摘要 / 历史行 / 所有恢复入口共用的唯一判据。
+/// 它定义在压缩状态机段，但队列核心里的 updateBulkActionButtons 也要读，
+/// 所以单独切一份装上——测的仍是线上那份代码，不在测试里重写。
+function restoreGate() {
+  return slice('/// §44 压缩会话与恢复是两条生命周期', '/// 后端阶段变化的确认');
+}
+
 /// 「执行会话（一轮）」整段：executionSession + 会话身份判定。
 function sessionModel() {
   return slice('// ─── 执行会话（一轮）', '// ─── 压缩主流程');
@@ -44,11 +61,18 @@ function stateMachine() {
 
 function installQueueCore(context) {
   installTranslationFallback(context);
+  // 摘要 / 批量按钮要按 §44 的会话闸门决定「恢复全部」是否可点：
+  // 闸门本体属于状态机，队列核心单独使用时也要装同一份真代码。
+  vm.runInContext(restoreGate(), context);
+  // 队列视图按「压缩后大小」排序时读的是产物判据（没落盘的不许冒充读数），
+  // 所以装队列核心必须连契约一起装 —— 否则跑的不是真判据。
+  vm.runInContext(productRule(), context);
   vm.runInContext(queueCore(), context);
 }
 
 function installQueueRowPainter(context) {
   installTranslationFallback(context);
+  vm.runInContext(productRule(), context);
   vm.runInContext(queueRowPainter(), context);
 }
 
@@ -148,6 +172,7 @@ function installSelection(context) {
 function installRunBar(context) {
   installTranslationFallback(context);
   vm.runInContext(slice('function formatBytes(', '// ─── 页面导航'), context);
+  vm.runInContext(productRule(), context);
   vm.runInContext(slice('/// 队列的体积账', '/// 选中一项：行上只有一条选中线'), context);
 }
 
@@ -163,6 +188,7 @@ module.exports = {
   installTranslationFallback,
   queueCore, installQueueCore,
   queueRowPainter, installQueueRowPainter,
+  productRule,
   sessionModel, installSessionModel,
   stateMachine, installStateMachine,
   installMediaWorkspaceStubs, installIntentModel, installSystemMode, installActionText,

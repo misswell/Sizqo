@@ -120,6 +120,24 @@
     return null;
   }
 
+  // §22：输出格式的权威是后端下发的 ImageCapabilityMatrix。这里只缓存；
+  // 后端还没答复时用一份保守的回落集合，绝不把「本机写不出来」的格式发出去。
+  var imageCapabilities = null;
+
+  function setImageCapabilities(matrix) {
+    imageCapabilities = matrix && Array.isArray(matrix.formats) ? matrix : null;
+  }
+
+  function imageOutputTargets(system) {
+    var targets = imageCapabilities
+      ? (system ? imageCapabilities.systemOutputTargets : imageCapabilities.outputTargets)
+      : null;
+    if (!Array.isArray(targets)) {
+      targets = system ? ['jpg', 'png', 'heif'] : ['jpg', 'png', 'webp', 'avif'];
+    }
+    return targets.slice();
+  }
+
   function imageIntentList(isMac) {
     return IMAGE_INTENTS.filter(function (intent) {
       return !intent.macOnly || isMac;
@@ -158,7 +176,7 @@
 
     if (spec.processingMode === 'system') {
       request.processingMode = 'system';
-      request.outputFormat = normalizeFormat(state.systemOutputFormat, 'original');
+      request.outputFormat = normalizeFormat(state.systemOutputFormat, 'original', true);
       request.systemImageSize = normalizeSystemSize(state.systemImageSize);
       request.preserveMetadata = state.preserveMetadata !== false;
       return {
@@ -205,9 +223,9 @@
     return Math.min(Math.max(Math.round(n), 10), 100);
   }
 
-  function normalizeFormat(value, fallback) {
-    var allowed = ['original', 'jpg', 'png', 'webp', 'avif', 'heif'];
-    return allowed.indexOf(value) >= 0 ? value : fallback;
+  function normalizeFormat(value, fallback, system) {
+    if (value === 'original') return 'original';
+    return imageOutputTargets(system).indexOf(value) >= 0 ? value : fallback;
   }
 
   function normalizeSystemSize(value) {
@@ -216,6 +234,12 @@
 
   function formatLabel(format) {
     if (!format || format === 'original') return '原格式';
+    if (imageCapabilities) {
+      for (var i = 0; i < imageCapabilities.formats.length; i++) {
+        var capability = imageCapabilities.formats[i];
+        if (capability && capability.id === format && capability.label) return capability.label;
+      }
+    }
     return String(format).toUpperCase();
   }
 
@@ -337,6 +361,9 @@
     clampDimension: clampDimension,
     imageSummary: imageSummary,
     formatLabel: formatLabel,
+    setImageCapabilities: setImageCapabilities,
+    imageOutputTargets: imageOutputTargets,
+    normalizeFormat: normalizeFormat,
   };
 
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

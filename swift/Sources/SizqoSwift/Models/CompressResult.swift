@@ -14,11 +14,16 @@ struct EngineResult {
     var targetMet: Bool? = nil
     /// 缩放 / 未达预算 / 元数据等如实说明
     var warnings: [String] = []
+    /// 这一轮交回的**字节属于哪一种事实**（见 ResultContract.swift）。
+    /// 默认 candidate = 「这是编码产物」；交回原图字节的每一支都必须自己明说 keptOriginal，
+    /// 否则 evaluate 会把忘了标判据的失败一律降级成失败，而不是冒充成功。
+    var verdict: EncodeVerdict = .candidate
+    /// 引擎自己知道的那个原因（不支持 / 解码失败 / 没收益…）。没标就是 unknown。
+    var reason: ReasonCode = .unknown
 }
 
 struct CompressResult: Identifiable {
     let id = UUID()
-    var success: Bool
     var file: String
     var originalSize: Int64
     var compressedSize: Int64
@@ -40,6 +45,12 @@ struct CompressResult: Identifiable {
     var targetBytes: Int64?
     var targetMet: Bool?
     var warnings: [String] = []
+    /// 这次任务对用户的最终结论（见 ResultContract.swift）。
+    /// 它由落盘之后那一处写入（Publish），落盘之前谁都不许预先承诺；nil 只出现在
+    /// 这一版之前留下的载荷上，界面按「没有结论」兜底，绝不按「完成」兜底。
+    var outcome: ResultOutcome? = nil
+    /// 结论的理由。UI 选句子只读它，不读 error 文案。
+    var reasonCode: ReasonCode? = nil
 
     var originalSizeFormatted: String { Self.formatBytes(originalSize) }
     var compressedSizeFormatted: String { Self.formatBytes(compressedSize) }
@@ -65,7 +76,6 @@ struct CompressResult: Identifiable {
     }
 
     init(engine: EngineResult, file: String, originalSize: Int64, options: CompressOptions? = nil) {
-        self.success = engine.success
         self.file = file
         self.originalSize = originalSize
         self.compressedSize = Int64(engine.compressed.count)
@@ -81,7 +91,6 @@ struct CompressResult: Identifiable {
 
     /// 历史页要复用对比窗口/复制日志那一套，但记录里只有大小、没有字节本身。
     init(historyEntry entry: HistoryEntry) {
-        self.success = true
         self.file = entry.sourcePath
         self.originalSize = entry.originalSize
         self.compressedSize = entry.compressedSize
@@ -92,6 +101,10 @@ struct CompressResult: Identifiable {
         self.outputPath = entry.outputPath
         self.backupPath = entry.backupPath
         self.outputMode = entry.outputMode
+        // 历史只登记真正落过盘的结果；路径都没记的那条（异常数据）不许被读成「有产物」。
+        // 已恢复 / 重建条目同样不是产物：前者的 outputPath 指向写回后的原图，后者没有明细。
+        let isProduct = entry.status == .compressed || entry.status == .missing
+        self.outcome = isProduct && entry.outputPath != nil ? .committed : nil
         self.options = nil
     }
 
@@ -128,6 +141,16 @@ struct QueueItem: Identifiable {
     var path: String
     var fileName: String
     var fileSize: Int64
+    /// §39 §40：来源根与相对位置在入队时定死，重试 / 续跑 / 导出都读这两个字段，
+    /// 不再按"这一批选了哪些目录"重新推一遍。
+    var sourceRoot: String = ""
+    var relativePath: String = ""
+    /// §41：只在真正开工（pending → running）时加一。重试沿用同一个队列项 / id，
+    /// 绝不删掉旧项再建新项 —— 否则历史、进度和事件会对不上号。
+    var attemptCount: Int = 0
+    /// §42：至少完整处理过一次的闩锁，一旦置上永不复位。总体进度的分子读它，
+    /// 所以重试把状态放回 pending 时，进度不会从 10/10 掉成 9/10。
+    var everProcessed: Bool = false
     var status: QueueStatus = .pending
     var result: CompressResult?
 }
@@ -143,15 +166,28 @@ struct QueueProgress {
     var failed = 0
     var running = 0
     var pending = 0
+    /// §42 §43：至少完整处理过一次的任务数。失败也算（它确实跑完了一次，
+    /// 只是没成）；重试只改当前状态，不改这个分子 —— 按 `done + failed`
+    /// 的瞬时值算，10/10 会在重试时掉成 9/10。
+    var processed = 0
+    /// completed 的两种结果：有没有落下产物（判据仍只走 CompressResult.hasProduct）。
+    var committed = 0
+    var skipped = 0
+    /// 处理过一次、此刻又在 running / pending 的任务数（§42 的「正在重试 N 项」）。
+    var retrying = 0
 
-    /// 已处理 = 成功 + 失败。失败的文件确实跑完了一次，只是没成 ——
-    /// 不算它的话，98 成功 + 2 失败的队列会永远停在 98%。
-    var processed: Int { done + failed }
+    /// §43 的拆分读法：completed 是走完的生命周期，committed + skipped 解释它；
+    /// active 是此刻真正在跑的。done / running 保留为旧读法的别名。
+    var completed: Int { done }
+    var active: Int { running }
     var fraction: Double { total > 0 ? Double(processed) / Double(total) : 0 }
 
-    /// 摘要那一行（失败为 0 时不写那一段）。
+    /// 摘要那一行（为 0 的那几段不写）。
     var summaryText: String {
-        failed > 0 ? "\(processed) / \(total) 已处理 · 失败 \(failed)" : "\(processed) / \(total) 已处理"
+        var text = "\(processed) / \(total) 已处理"
+        if failed > 0 { text += " · 失败 \(failed)" }
+        if retrying > 0 { text += " · 正在重试 \(retrying) 项" }
+        return text
     }
 
     init(items: [QueueItem]) {
@@ -165,12 +201,30 @@ struct QueueProgress {
             case .pending: pending += 1
             }
             total += 1
+            // 瞬时终态兜底：分子永远不小于终态数，且重试不减少。
+            if item.everProcessed || item.status == .done || item.status == .failed {
+                processed += 1
+            }
+            if item.everProcessed && (item.status == .running || item.status == .pending) {
+                retrying += 1
+            }
+            if item.status == .done {
+                if item.result?.hasProduct == true { committed += 1 } else { skipped += 1 }
+            }
         }
     }
 }
 
 func detectImageType(path: String) -> String {
-    guard let data = FileManager.default.contents(atPath: path) else { return "unknown" }
+    // 嗅探只需要 12 个字节的魔数：为它们读整个文件（200MB 的 TIFF 也整份进内存）
+    // 与"大文件不许整份进内存"的纪律冲突。多 worker 并行时放大最明显。
+    guard let handle = FileHandle(forReadingAtPath: path) else { return "unknown" }
+    defer { try? handle.close() }
+    guard let header = try? handle.read(upToCount: 12) else { return "unknown" }
+    return detectImageType(of: header)
+}
+
+func detectImageType(of data: Data) -> String {
     let bytes = [UInt8](data.prefix(12))
     if bytes.count >= 4 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47 {
         return "png"

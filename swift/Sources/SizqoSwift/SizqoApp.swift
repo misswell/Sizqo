@@ -56,6 +56,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func applyRetentionOnExit() {
         // 必须用进程内那一份实例：损坏锁死标记挂在实例上，另 new 一个会把启动时
         // 立起来的锁丢掉，现场刚留档就被 sweep。
+        // 与 clearHistory 同一道闸门判据：批次还在跑或事务未收口时，备份目录可能
+        // 刚建好、还没写进历史（rename 之后、add 之前），sweep 会把它当孤儿删掉 ——
+        // 而它可能正是那份原图唯一的副本。跳过本次清理，下次退出再收账；
+        // 不留「已清账」记号，下次运行继续按"上次未清账"对待。
+        guard AppState.exitCleanupPermitted() else {
+            NSLog("Sizqo 退出时批次/事务仍在收尾，跳过保留档位清理，原图备份全部保留")
+            return
+        }
         let store = HistoryStore.shared
         let report = store.applyRetentionOnExit(
             retentionDays: SettingsStore().load().originalRetentionDays,

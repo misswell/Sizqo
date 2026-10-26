@@ -6,8 +6,12 @@ final class CompareWindowController {
 
     static func show(appState: AppState, originalPath: String, result: CompressResult, allResults: [CompressResult]) {
         window?.close()
-        let okResults = allResults.filter { $0.success }
-        let list = okResults.isEmpty ? [result] : okResults
+        // §68 对比要打开两个文件：产物与否只问结果契约，不在这里再判一次 success。
+        // 没有产物时这一行的按钮根本不会出现（capabilities 已经把住），走到这里只剩一种可能：
+        // 载荷过期了。宁可不开窗，也不许开一张指向空气的对比图。
+        let okResults = allResults.filter { $0.hasProduct }
+        let list = okResults.isEmpty ? (result.hasProduct ? [result] : []) : okResults
+        guard !list.isEmpty else { return }
         let startIndex = list.firstIndex(where: { $0.file == result.file }) ?? 0
         let view = CompareView(appState: appState, results: list, startIndex: startIndex)
         let hosting = NSHostingController(rootView: view)
@@ -450,6 +454,9 @@ struct CompareView: View {
                 }
                 .buttonStyle(.bordered)
                 .font(.system(size: 11))
+                // §44 会话没结束时这条路径会被统一服务拒绝；按钮先禁用并说明原因。
+                .disabled(appState.restoreBlockedBySession)
+                .help(appState.restoreBlockedBySession ? appState.restoreBlockedText : "")
 
                 Button {
                     CompareWindowController.close()

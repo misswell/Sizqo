@@ -9,6 +9,12 @@ function localizeUiText(value) {
   return window.SizqoI18n.translateText(value);
 }
 
+/// 后端原话走整句词典，不走子串替换 —— 详见 i18n.js 的 translateMessage。
+function localizeBackendText(value) {
+  if (typeof window === 'undefined' || !window.SizqoI18n) return value;
+  return window.SizqoI18n.translateMessage(value);
+}
+
 function iconMarkup(name, small) {
   return '<svg class="symbol-icon' + (small ? ' symbol-icon-small' : '') + '" aria-hidden="true"><use href="#icon-' + name + '"></use></svg>';
 }
@@ -632,6 +638,21 @@ function toggleVideoSettings() {
   if (advanced) advanced.open = !advanced.open;
 }
 
+/// 输出方式只有radio一个真相源：下拉已下线，读值必须走这里，
+/// 否则「界面写着覆盖、发出去是后缀」这类分叉又会回来。
+function currentVideoOutputMode() {
+  var selected = document.querySelector('input[name="videoOutputMode"]:checked');
+  // 回落值与 video-settings.js 的 DEFAULT_OPTIONS 一致。
+  return selected ? selected.value : 'suffix';
+}
+
+function setVideoOutputModeRadio(value) {
+  var radio = document.querySelector('input[name="videoOutputMode"][value="' + value + '"]');
+  if (!radio) return false;
+  radio.checked = true;
+  return true;
+}
+
 function videoOptionsFromControls() {
   var resolutionValue = document.getElementById('videoResolution').value;
   var outputMode = currentVideoOutputMode();
@@ -659,7 +680,10 @@ function videoOptionsFromControls() {
   });
 }
 
-function applyVideoOptions(options) {
+/// pushOutput 只服务于"把落盘的那套输出偏好铺回控件"（读档）。
+/// 意图编译出的参数不含输出方式，一旦顺手写回，就会在用户眼皮底下把
+/// 「覆盖原文件」换成「加后缀」——落盘归用户决定，不归意图决定。
+function applyVideoOptions(options, pushOutput) {
   currentVideoOptions = window.SizqoVideo.normalizeOptions(options);
   var setValue = function(id, value) {
     var element = document.getElementById(id);
@@ -677,17 +701,17 @@ function applyVideoOptions(options) {
   setValue('videoAudioPolicy', currentVideoOptions.audioPolicy);
   setValue('videoSubtitlePolicy', currentVideoOptions.subtitlePolicy);
   setValue('videoMetadataPolicy', currentVideoOptions.metadataPolicy);
-  document.querySelectorAll('input[name="videoOutputMode"]').forEach(function(radio) {
-    radio.checked = radio.value === currentVideoOptions.outputMode;
-  });
-  setValue('videoOutputSuffix', currentVideoOptions.outputSuffix);
   setValue('videoContainer', currentVideoOptions.container);
   setValue('videoThreads', currentVideoOptions.threads);
   var allowLarger = document.getElementById('videoAllowLarger');
   if (allowLarger) allowLarger.checked = !!currentVideoOptions.allowLargerOutput;
-  videoOutputDir = currentVideoOptions.outputDir || videoOutputDir;
-  var dirDisplay = document.getElementById('videoOutputDirDisplay');
-  if (dirDisplay) { dirDisplay.textContent = videoOutputDir || localizeUiText('未选择'); dirDisplay.title = videoOutputDir || ''; }
+  if (pushOutput) {
+    setVideoOutputModeRadio(currentVideoOptions.outputMode);
+    setValue('videoOutputSuffix', currentVideoOptions.outputSuffix);
+    videoOutputDir = currentVideoOptions.outputDir || videoOutputDir;
+    var dirDisplay = document.getElementById('videoOutputDirDisplay');
+    if (dirDisplay) { dirDisplay.textContent = videoOutputDir || localizeUiText('未选择'); dirDisplay.title = videoOutputDir || ''; }
+  }
   syncVideoSettingsControls();
 }
 
@@ -741,11 +765,11 @@ function loadVideoSettings() {
   try { saved = JSON.parse(localStorage.getItem('sizqo-video-settings') || 'null'); } catch (_) {}
   if (saved && saved.options) {
     selectedVideoPresetId = saved.selectedPresetId || 'balanced';
-    applyVideoOptions(saved.options);
+    applyVideoOptions(saved.options, true);
     return true;
   }
   selectedVideoPresetId = 'balanced';
-  applyVideoOptions(saved || window.SizqoVideo.DEFAULT_OPTIONS);
+  applyVideoOptions(saved || window.SizqoVideo.DEFAULT_OPTIONS, true);
   return false;
 }
 
@@ -860,6 +884,47 @@ async function loadVideoCapabilities() {
   updateMediaWorkspace();
 }
 
+/// 下拉框的选项来自后端能力矩阵（§22）；标签也来自矩阵，前端不再写第二份格式表。
+function fillImageFormatSelect(id, targets, formats, originalLabel) {
+  var select = document.getElementById(id);
+  if (!select) return;
+  var current = select.value;
+  var labels = {};
+  (formats || []).forEach(function(format) {
+    if (format && format.id) labels[format.id] = format.label;
+  });
+  select.innerHTML = '';
+  var original = document.createElement('option');
+  original.value = 'original';
+  original.textContent = localizeUiText(originalLabel);
+  select.appendChild(original);
+  (targets || []).forEach(function(target) {
+    if (!target || target === 'original') return;
+    var option = document.createElement('option');
+    option.value = target;
+    option.textContent = localizeUiText(labels[target] || String(target).toUpperCase());
+    select.appendChild(option);
+  });
+  select.value = current;
+  // 之前存下的格式这台机器写不出来：退回原格式，而不是留一个选不中的值在状态里。
+  if (select.value !== current) select.value = 'original';
+}
+
+async function loadImageCapabilities() {
+  var matrix = null;
+  try { matrix = await invoke('get_image_capabilities'); } catch (_) { return; }
+  if (!matrix || !Array.isArray(matrix.formats)) return;
+  window.SizqoIntents.setImageCapabilities(matrix);
+  fillImageFormatSelect('outputFormat', matrix.outputTargets, matrix.formats, '保持原格式');
+  fillImageFormatSelect('systemOutputFormat', matrix.systemOutputTargets, matrix.formats, '原格式');
+  imageIntent.outputFormat = window.SizqoIntents.normalizeFormat(imageIntent.outputFormat, 'original');
+  imageIntent.systemOutputFormat = window.SizqoIntents.normalizeFormat(imageIntent.systemOutputFormat, 'original', true);
+  if (imageIntent.intent === 'custom' || imageIntent.intent === 'systemConvert') paintImageStateControls();
+  else paintImageRawControls(imageRequestFromIntent());
+  saveCompressSettings();
+  renderDetailPane();
+}
+
 async function selectVideoOutputDir() {
   try {
     var dirs = await invoke('select_output_dir');
@@ -896,6 +961,7 @@ function bindVideoSettings() {
     });
   document.querySelectorAll('input[name="videoOutputMode"]').forEach(function(radio) {
     radio.addEventListener('change', function() {
+      syncVideoSettingsControls();
       saveVideoSettings();
       renderDetailPane();
     });
@@ -903,22 +969,58 @@ function bindVideoSettings() {
 }
 
 async function validateVideoBatch(paths, options) {
-  if (!videoCapabilities.available) return { valid: false, errors: [videoCapabilities.reason || localizeUiText('视频编码当前不可用')] };
+  if (!videoCapabilities.available) {
+    var reason = videoCapabilities.reason || localizeUiText('视频编码当前不可用');
+    return { valid: false, globalErrors: [reason], warnings: [], failures: paths.map(function(path) { return { path: path, message: reason }; }) };
+  }
+  // §5.3 逐项校验：把每个不兼容的视频都收进 failures，而不是在第一个就短路 ——
+  // 一个文件不兼容只标记它自己，其余有效视频照常开跑。
+  var failures = [];
+  var warnings = [];
   for (var i = 0; i < paths.length; i++) {
-    var item = queueItems.get(paths[i]);
+    var path = paths[i];
+    var item = queueItems.get(path);
     if (!item || item.mediaKind !== 'video') continue;
     var local = window.SizqoVideo.validateOptions(options, item.videoProbe, videoCapabilities);
-    if (!local.valid) return local;
+    if (!local.valid) {
+      failures.push({ path: path, message: (local.errors || []).join(' · ') || localizeUiText('该视频与当前设置不兼容') });
+      continue;
+    }
     try {
       var verdict = await invoke('validate_video_options', { options: options, probe: item.videoProbe });
       if (verdict === false || (verdict && verdict.valid === false)) {
-        return { valid: false, errors: verdict && verdict.errors && verdict.errors.length ? verdict.errors : [localizeUiText('该视频与当前设置不兼容')], warnings: verdict && verdict.warnings || [] };
+        failures.push({
+          path: path,
+          message: verdict && verdict.errors && verdict.errors.length ? verdict.errors.join(' · ') : localizeUiText('该视频与当前设置不兼容'),
+        });
+      } else if (verdict && Array.isArray(verdict.warnings)) {
+        warnings = warnings.concat(verdict.warnings);
       }
     } catch (error) {
-      return { valid: false, errors: [error.message || localizeUiText('视频参数校验失败')] };
+      failures.push({ path: path, message: error.message || localizeUiText('视频参数校验失败') });
     }
   }
-  return { valid: true, errors: [], warnings: [] };
+  return { valid: failures.length === 0, globalErrors: [], warnings: warnings, failures: failures };
+}
+
+/// 预检失败的样本就地记成失败（带着原因），它们不进入这一轮会话。
+/// 没跑过就没有 attemptCount —— 用户修好设置后可以直接重试。
+function markVideoPreflightFailures(failures) {
+  var marked = 0;
+  (failures || []).forEach(function(failure) {
+    var item = queueItems.get(failure.path);
+    if (!item || item.state !== 'pending') return;
+    item.result = {
+      file: failure.path,
+      outcome: 'failed',
+      reasonCode: 'unsupported_format',
+      reason: failure.message,
+      originalSize: item.originalSize,
+    };
+    item.state = taskStateFor(item.result);
+    marked += 1;
+  });
+  return marked;
 }
 
 function renderVideoQueueRows() {
@@ -954,23 +1056,34 @@ async function setupDragDrop() {
       const payload = event.payload;
       if (payload.type === 'drop') {
         dropzone.classList.remove('dragover');
+        document.body.classList.remove('dropping');
         if (payload.paths && payload.paths.length > 0) {
           handleFilePaths(payload.paths);
         }
       } else if (payload.type === 'enter' || payload.type === 'over') {
         dropzone.classList.add('dragover');
+        // 拖放事件是整个 webview 的，清单非空时那块画框收着了，落点也得看得见。
+        document.body.classList.add('dropping');
       } else if (payload.type === 'leave') {
         dropzone.classList.remove('dragover');
+        document.body.classList.remove('dropping');
       }
     });
   } catch (e) {
     console.error('Tauri drag-drop setup failed, falling back to HTML5:', e);
     // Fallback: HTML5 drag-drop (paths won't be available in Tauri)
-    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
-    dropzone.addEventListener('dragleave', () => { dropzone.classList.remove('dragover'); });
-    dropzone.addEventListener('drop', (e) => {
+    // 绑在清单面板上而不是拖放区：导入后拖放区收起，落点不能跟着一起消失。
+    const zone = document.querySelector('.list-scroll') || dropzone;
+    zone.addEventListener('dragover', (e) => {
       e.preventDefault();
-      dropzone.classList.remove('dragover');
+      document.body.classList.add('dropping');
+    });
+    zone.addEventListener('dragleave', (e) => {
+      if (!zone.contains(e.relatedTarget)) document.body.classList.remove('dropping');
+    });
+    zone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      document.body.classList.remove('dropping');
       const droppedFiles = Array.from(e.dataTransfer.files);
       handleFiles(droppedFiles);
     });
@@ -1099,6 +1212,14 @@ function mergeQueueMedia(records) {
     queueItems.set(filePath, {
       id: taskId, taskId: taskId, path: filePath,
       mediaKind: record.mediaKind, state: 'pending', result: null,
+      // §41 §42：重试沿用同一个 taskId，只把 attemptCount 加一；everProcessed 是
+      // "这一项至少完整处理过一次"的闩锁，总体进度读它，重试才不会把分子退回去。
+      attemptCount: 0,
+      everProcessed: false,
+      // §39 §40：来源根与相对位置在导入这一刻定死，之后重试 / 续跑 / 导出都读它，
+      // 不许再按"这一批选了哪些目录"重新猜一次。
+      sourceRoot: typeof record.sourceRoot === 'string' ? record.sourceRoot : '',
+      relativePath: typeof record.relativePath === 'string' ? record.relativePath : '',
       originalSize: Number.isFinite(Number(record.size)) ? Number(record.size) : null,
       videoProbe: record.videoProbe || null,
       probeWarning: record.warning || null,
@@ -1294,26 +1415,64 @@ function queueResults() {
 /// 用户看到的总进度。**这是队列的属性，不是某一轮的属性**：
 /// 停止后重新开始一轮时，这一轮的目标会变小（只含 pending），但这里的 total
 /// 一直是整个队列（100 → 100），所以进度绝不会从 40/100 掉回 0/60。
+///
+/// §42 §43：分子是"至少完整处理过一次"的任务数（everProcessed），不是
+/// done + failed 的瞬时值 —— 重试会先把状态放回 pending，按瞬时值算就会让
+/// 10/10 掉成 9/10。进度同时拆开：completed 是走完的生命周期，committed /
+/// skipped 说明其中有没有落盘产物，active / pending / failed 是此刻的分布，
+/// retrying 是"处理过、现在又在跑（或排队）"的那几项。
 function getQueueProgress() {
-  var progress = { total: 0, processed: 0, done: 0, failed: 0, running: 0, pending: 0 };
+  var progress = {
+    total: 0, processed: 0,
+    completed: 0, committed: 0, skipped: 0,
+    active: 0, pending: 0, failed: 0,
+    retrying: 0, restored: 0,
+    // 旧读法保留这两个别名：队列核心之外只读它们，不必知道 §43 的拆分。
+    done: 0, running: 0,
+  };
   files.forEach(function(file) {
     var item = queueItems.get(file);
     if (!item) return;
     // removed / restored 已经离开了这套账：一个被移出队列，一个被用户撤销了。
-    if (item.state === 'removed' || item.state === 'restored') return;
+    // 但行还在清单上看得见，所以摘要必须把它们报出来，否则「1 / 1」对着两行文件。
+    if (item.state === 'removed' || item.state === 'restored') {
+      if (item.state === 'restored') progress.restored += 1;
+      return;
+    }
     progress.total += 1;
-    if (item.state === 'done') progress.done += 1;
-    else if (item.state === 'failed') progress.failed += 1;
-    else if (item.state === 'running') progress.running += 1;
-    else if (item.state === 'pending') progress.pending += 1;
+    // failed 也算"处理过"：它确实跑完了一次，只是没成。瞬时终态兜底，
+    // 保证分子永远不小于终态数（即使有哪条导入路径没写 everProcessed）。
+    if (item.everProcessed === true || item.state === 'done' || item.state === 'failed') {
+      progress.processed += 1;
+    }
+    // 处理过一次、此刻又回到 pending / running = 正在重试。分子不退，这一段解释原因。
+    if (item.everProcessed === true && (item.state === 'pending' || item.state === 'running')) {
+      progress.retrying += 1;
+    }
+    if (item.state === 'done') {
+      progress.done += 1;
+      progress.completed += 1;
+      // committed / skipped 是 completed 的两种结果：有没有落下产物。判据仍只读契约。
+      if (resultHasProduct(item.result)) progress.committed += 1;
+      else progress.skipped += 1;
+    } else if (item.state === 'failed') {
+      progress.failed += 1;
+    } else if (item.state === 'running') {
+      progress.running += 1;
+      progress.active += 1;
+    } else if (item.state === 'pending') {
+      progress.pending += 1;
+    }
   });
-  // failed 也算"处理过"：它确实跑完了一次，只是没成。否则 98 成功 + 2 失败
-  // 的队列会永远停在 98%，那条进度条就成了假的。
-  progress.processed = progress.done + progress.failed;
   return progress;
 }
 
 function updateQueueSummary() {
+  // 拖放区只在清单为空时占这一块：清单非空时它是队列前面一块永远走不掉的画框，
+  // `.dropzone` 又是 flex:1，会把行顶到看不见的那一边。收文件本来就不靠它——Tauri 的
+  // 拖放事件是整个 webview 的，清单在的时候随时拖进来照样收（运行条上也有「追加」）。
+  var zone = document.getElementById('dropzone');
+  if (zone) zone.hidden = files.length > 0;
   var summary = document.getElementById('queueSummary');
   if (!summary) return;
   var p = getQueueProgress();
@@ -1323,6 +1482,10 @@ function updateQueueSummary() {
     // 「已处理」而不是「已完成」：失败的文件也算处理过，说"完成"会把失败藏起来。
     summary.textContent = p.processed + ' / ' + p.total + localizeUiText(' 已处理')
       + (p.failed > 0 ? localizeUiText(' · 失败 ') + p.failed : '')
+      // §42：重试把状态放回 pending / running，分子不会退；这一段说明它在重跑什么。
+      + (p.retrying > 0 ? localizeUiText(' · 正在重试 ') + p.retrying + localizeUiText(' 项') : '')
+      // 已恢复的行仍然看得见，只是离开了这套账：不写出来，数字就和清单对不上。
+      + (p.restored > 0 ? localizeUiText(' · 已恢复 ') + p.restored : '')
       + compressionStateSuffix()
       + cpuLimitText();
   }
@@ -1351,14 +1514,45 @@ function renderQueueProgressFill() {
   fill.style.width = p.total === 0 ? '0%' : (p.processed / p.total * 100) + '%';
 }
 
+/// ─── 结果契约的唯一解释器：住在 result_state.js ────────────────────
+///
+/// 判据只有一份，而且不属于任何一个页面文件 —— 独立对比窗口也是它的读者（§68 §69）。
+/// 本文件只在这份判据之上加队列自己的事实（已恢复 / 已移除），不再另起一条"有没有产物"。
+
+/// 一项现在到底有没有产物。已恢复的那一项刚刚被撤销，产物已经不在了：
+/// 它不该进体积账，也不该出现在导出、对比或「恢复全部原图」的判据里。
+function itemHasProduct(item) {
+  return !!(item && item.state !== 'restored' && item.state !== 'removed'
+    && resultHasProduct(item.result));
+}
+
+function queueProducts() {
+  var products = [];
+  files.forEach(function(file) {
+    var item = queueItems.get(file);
+    if (itemHasProduct(item)) products.push(item.result);
+  });
+  return products;
+}
+
 function updateBulkActionButtons() {
-  var successes = queueResults().filter(function(r) { return r && r.success; });
+  var successes = queueProducts();
   var restoreBtn = document.getElementById('restoreAllBtn');
   // 「恢复全部原图」只对**覆盖模式**落过备份的条目有意义，但服务层自己会跳过
   // 没有备份的那些；按钮这里只管"有没有可撤销的产物"。
-  if (restoreBtn) restoreBtn.hidden = successes.length === 0;
+  if (restoreBtn) {
+    restoreBtn.hidden = successes.length === 0;
+    // §44 会话期间恢复会改写当前进度：直接禁用并说明，而不是按下再报错。
+    restoreBtn.disabled = isCompressing;
+    restoreBtn.title = isCompressing ? restoreBlockedText() : '';
+  }
   var exportBtn = document.getElementById('exportAllBtn');
   if (exportBtn) exportBtn.hidden = successes.length === 0;
+  // 「回到导入」只在这一轮真的收口时出现：还有等待中的文件、或会话还在跑，
+  // 按下去就会把没干的活儿一起收走，那时它不该在这儿。
+  var nextRoundBtn = document.getElementById('nextRoundBtn');
+  var p = getQueueProgress();
+  if (nextRoundBtn) nextRoundBtn.hidden = !!isCompressing || p.total === 0 || p.pending > 0;
 }
 
 // ─── 队列渲染（排序 / 视图 / 每一行的画法）──────────────────────
@@ -1408,8 +1602,9 @@ function applyQueueView() {
     var value = index;
     if (key === 'name') value = basename(file);
     if (key === 'original') value = result ? result.originalSize : item && item.originalSize;
-    if (key === 'compressed') value = result && result.success ? result.compressedSize : null;
-    if (key === 'ratio') value = result && result.success ? result.savings : null;
+    // 「压缩后大小」「压缩率」两列排的是磁盘上那个产物，没落盘就没有这个读数，跟"未知"一起排尾部。
+    if (key === 'compressed') value = resultHasProduct(result) ? result.compressedSize : null;
+    if (key === 'ratio') value = resultHasProduct(result) ? result.savings : null;
     if (key === 'status') value = states.indexOf(item ? item.state : 'pending');
     return { file: file, row: row, index: index, value: value };
   });
@@ -1424,13 +1619,16 @@ function applyQueueView() {
     return (queueSortDescending ? -compared : compared) || a.index - b.index;
   });
   var visible = 0;
+  var members = new Set(files);
   Object.keys(fileRows).forEach(function(file) {
     // 「只看失败」也按 queueItems 判，不按 DOM class：类名只是画出来的结果，
     // 拿它当判据，一旦某处忘了同步 class，筛出来的东西就是错的。
+    // §6.1：成员判断用 Set —— 行循环里对每行做 `files.includes` 是 O(N²)，
+    // 大队列的每个任务事件都会被它拖慢。
     var failedRow = queueState(file) === 'failed';
     var item = queueItems.get(file);
     var mediaVisible = mediaView === 'all' || !item || !item.mediaKind || item.mediaKind === mediaView;
-    fileRows[file].hidden = !files.includes(file) || !mediaVisible || (failedOnly && !failedRow);
+    fileRows[file].hidden = !members.has(file) || !mediaVisible || (failedOnly && !failedRow);
   });
   entries.forEach(function(entry, index) {
     if (!entry.row) return;
@@ -1513,24 +1711,58 @@ function paintQueueRow(filePath) {
   }
 
   var result = item.result;
+  var visual = rowStateVisual(item, result);
   if (subEl) subEl.textContent = imageSourceLine(item, result);
   if (subEl) subEl.title = filePath;
 
   if (state === 'done' && result) {
-    setStateIcon(row, result.error ? 'warning' : 'check', result.error ? 'failed' : 'done');
+    var facts = mediaResultFacts(result);
+    if (!facts.hasProduct) {
+      // §6.2 后端判定"没有值得提交的产物"（或这一项被取消）：磁盘上什么都没发生。
+      // 这一行不许报产物的大小、降幅，更不许给出任何指向产物的按钮。
+      setStateIcon(row, visual.icon, visual.tone);
+      if (sizeEl) {
+        sizeEl.textContent = item.originalSize ? formatBytes(item.originalSize) : '';
+        sizeEl.title = localizeUiText('没有产物 · 原图未改动');
+      }
+      if (metaEl) {
+        metaEl.textContent = resultStatusText(result);
+        metaEl.title = resultDetailTitle(result);
+      }
+      renderQueueResultActions(row, result);
+      return;
+    }
+    // 有产物的两种结论（达成 / 未达目标）都给出同一套按钮，措辞由结论决定。
+    setStateIcon(row, visual.icon, visual.tone);
+    if (facts.outputMissing) {
+      // §52 §71 产物在提交后被人删掉了：行上不许再报一个盘上不存在的大小。
+      if (sizeEl) {
+        sizeEl.textContent = item.originalSize ? formatBytes(item.originalSize) : '';
+        sizeEl.title = localizeUiText('压缩结果已不存在');
+      }
+      if (metaEl) {
+        metaEl.textContent = resultStatusText(result);
+        metaEl.title = resultDetailTitle(result);
+      }
+      renderQueueResultActions(row, result);
+      return;
+    }
     if (sizeEl) sizeEl.textContent = formatBytes(result.compressedSize);
     if (sizeEl) sizeEl.title = formatBytes(result.originalSize) + ' → ' + formatBytes(result.compressedSize);
     if (metaEl) {
       metaEl.textContent = imageOutcomeLine(result);
-      metaEl.title = result.error || '';
+      metaEl.title = resultDetailTitle(result);
     }
     renderQueueResultActions(row, result);
     return;
   }
   if (state === 'failed' && result) {
-    setStateIcon(row, 'error', 'failed');
+    setStateIcon(row, visual.icon, visual.tone);
     if (sizeEl) sizeEl.textContent = item.originalSize ? formatBytes(item.originalSize) : '';
-    if (metaEl) metaEl.textContent = localizeUiText('失败');
+    if (metaEl) {
+      metaEl.textContent = resultStatusText(result);
+      metaEl.title = resultDetailTitle(result);
+    }
     renderQueueResultActions(row, result);
     return;
   }
@@ -1598,7 +1830,7 @@ function imageOutcomeLine(result) {
         : localizeUiText('目标 ') + want);
   }
   if (Number.isFinite(result.savings)) {
-    parts.push((result.savings >= 0 ? '-' : '+') + Math.abs(result.savings).toFixed(1) + '%');
+    parts.push(savingsPercentText(result));
   }
   if (result.algorithm) parts.push(result.algorithm);
   return parts.join(' · ');
@@ -1610,15 +1842,22 @@ function showErrorDetail(filePath, message) {
   showToast(basename(filePath) + ': ' + message);
 }
 
+/// §70 「这一项为什么是这样」的唯一入口。它按**结论**决定要不要出现：
+/// 跳过、取消、失败都有义务被解释，不再只在后端写了 error 时才冒出来。
+/// 悬停与点开看到的都是 resultDetailTitle —— 按 reasonCode 选的那句打头，原话备查。
 function appendErrorIcon(actionsEl, result) {
-  if (!actionsEl || !result.error) return;
+  if (!actionsEl || !result) return;
+  if (!resultReasonText(result) && !result.error) return;
   var errIcon = document.createElement('button');
   errIcon.type = 'button';
   errIcon.className = 'error-info-btn';
-  errIcon.title = result.error;
-  errIcon.setAttribute('aria-label', localizeUiText('查看失败原因'));
+  errIcon.title = resultDetailTitle(result);
+  errIcon.setAttribute('aria-label', localizeUiText('查看原因'));
   errIcon.innerHTML = iconMarkup('warning', true);
-  errIcon.onclick = function(e) { e.stopPropagation(); showErrorDetail(result.file, result.error); };
+  errIcon.onclick = function(e) {
+    e.stopPropagation();
+    showErrorDetail(result.file, resultDetailTitle(result));
+  };
   actionsEl.appendChild(errIcon);
 }
 
@@ -1674,7 +1913,7 @@ function queueRowThumb(filePath) {
     thumb.innerHTML = '';
     thumb.appendChild(img);
   };
-  setImageSource(img, imageFileSrc(filePath), 4000);
+  Promise.resolve(setImageSource(img, imageFileSrc(filePath), 4000)).catch(function() { /* 缩略图加载失败不构成错误：类型图标还在。 */ });
 }
 
 function videoAudioSummary(probe) {
@@ -1722,21 +1961,23 @@ function videoProgressNumbers(item) {
 }
 
 /// 状态词。暂停 / 收尾中必须能在文字里读到，所以 running 与 pending 走的是
-/// 与图片行**同一张**状态表（taskStatusMarkup）。
+/// 与图片行**同一张**状态表（taskStatusMarkup）；有结论的那些走同一个
+/// 结果解释器（resultStatusText），不再由 `skippedLarger` 这类旧旗标拼句子。
 function videoStatusText(item) {
   if (item.state === 'running') return taskStatusMarkup('running').text;
   if (item.state === 'pending') return taskStatusMarkup(waitingRowStatus()).text;
-  var result = item.result || {};
-  if (item.state === 'done' && result.skippedLarger) return localizeUiText('体积更大，已跳过');
-  if (item.state === 'done' && result.success) {
-    return localizeUiText('已压缩 ') + (Number.isFinite(result.savings)
-      ? (result.savings >= 0 ? '-' : '+') + Math.abs(result.savings).toFixed(1) + '%' : '');
-  }
-  if (item.state === 'done') return localizeUiText('已完成');
-  if (item.state === 'failed') return localizeUiText('失败');
   if (item.state === 'restored') return localizeUiText('已恢复');
   if (item.state === 'removed') return localizeUiText('已移除');
-  return '';
+  var result = item.result;
+  if (!result) return '';
+  var facts = mediaResultFacts(result);
+  if (!facts.hasProduct || facts.outputMissing) return resultStatusText(result);
+  var savings = savingsPercentText(result);
+  if (facts.outcome === OUTCOME_TARGET_UNMET) {
+    return resultStatusText(result) + (savings ? ' · ' + savings : '');
+  }
+  // savings 为空（原图体积拿不到）时不再拼出尾随空格的「已压缩 」。
+  return savings ? localizeUiText('已压缩 ') + savings : localizeUiText('已压缩');
 }
 
 function paintVideoQueueRow(filePath, row, item) {
@@ -1746,6 +1987,8 @@ function paintVideoQueueRow(filePath, row, item) {
   var sizeEl = row.querySelector('.media-size');
   var actions = row.querySelector('.media-actions');
   var result = item.result;
+  // §52 产物被外部删掉后，这一行只在磁盘事实成立时才报产物的大小。
+  var outputGone = !!(result && mediaResultFacts(result).outputMissing);
 
   if (thumbEl && item.coverUrl) {
     var existing = thumbEl.querySelector('img');
@@ -1773,25 +2016,29 @@ function paintVideoQueueRow(filePath, row, item) {
     metaEl.classList.toggle('media-warning', !!warning && item.state === 'pending');
   }
   if (sizeEl) {
-    sizeEl.textContent = result && result.success
+    // 已恢复的那一项产物早不在了：行上写的必须是还在盘上的那个大小。
+    var showProductSize = itemHasProduct(item) && !outputGone;
+    sizeEl.textContent = showProductSize
       ? formatBytes(result.outputBytes)
       : (item.originalSize ? formatBytes(item.originalSize) : '');
-    sizeEl.title = result && result.success
-      ? formatBytes(result.originalBytes) + ' → ' + formatBytes(result.outputBytes) : '';
+    sizeEl.title = showProductSize
+      ? formatBytes(result.originalBytes) + ' → ' + formatBytes(result.outputBytes)
+      : (outputGone ? localizeUiText('压缩结果已不存在')
+        : (result ? localizeUiText('没有产物 · 原文件未改动') : ''));
   }
-  setStateIcon(row,
-    item.state === 'running' ? 'spinner' : result && result.skippedLarger ? 'warning'
-      : item.state === 'done' ? 'check' : item.state === 'failed' ? 'error'
-      : item.state === 'restored' ? 'restore' : item.state === 'removed' ? 'minus' : 'queue',
-    item.state === 'running' ? 'running' : result && result.skippedLarger ? 'warning' : item.state);
+  var visual = rowStateVisual(item, result);
+  setStateIcon(row, visual.icon, visual.tone);
   setRowProgressBar(row, item.state === 'running' ? item.videoProgress && item.videoProgress.fraction : null);
 
   if (!actions) return;
+  var caps = resultCapabilities(result);
   actions.innerHTML = '';
   if (item.state === 'running') {
     var cancelButton = appendVideoAction(actions, 'cancel', item.cancelRequested ? localizeUiText('正在取消…') : localizeUiText('取消当前视频'), 'stop', function() { cancelCurrentVideo(item.taskId); });
     cancelButton.disabled = !!item.cancelRequested;
-  } else if (item.state === 'done' && item.result && item.result.success) {
+    return;
+  }
+  if (item.state === 'done' && caps.save) {
     var original = result.outputMode === 'replace' ? result.backupPath : result.sourcePath;
     if (original) appendVideoAction(actions, 'play-original', localizeUiText('播放原视频'), 'play', function() { openMediaFile(original); });
     if (result.outputPath) appendVideoAction(actions, 'play-output', localizeUiText('播放输出视频'), 'play', function() { openMediaFile(result.outputPath); });
@@ -1802,10 +2049,29 @@ function paintVideoQueueRow(filePath, row, item) {
     if (result.historyId && canUndo) appendVideoAction(actions, 'restore',
       localizeUiText(result.outputMode === 'replace' ? '恢复原视频' : '删除这次压缩结果'),
       result.outputMode === 'replace' ? 'restore' : 'trash', function() { restoreVideoResult(result); });
-  } else if (item.state === 'failed') {
-    appendVideoAction(actions, 'retry', localizeUiText('重试'), 'recompress', function() { compressOneFile(filePath); });
-    if (item.result) appendVideoAction(actions, 'log', localizeUiText('查看日志'), 'copy', function() { copyVideoLog(item.result); });
-  } else if (item.state === 'done' && item.result && item.result.skippedLarger) {
+    // §70 未达目标：产物照常给按钮，但"再来一次"也在同一行上。
+    if (caps.retry) {
+      var retryBtn = appendVideoAction(actions, 'retry', localizeUiText('重试'), 'recompress', function() { compressOneFile(filePath); });
+      retryBtn.disabled = isCompressing || !videoCapabilities.available;
+    }
+    return;
+  }
+  // §52 产物在提交后被删掉：保留日志与「撤销这次压缩」，但不再给指向空文件的按钮。
+  if (item.state === 'done' && outputGone) {
+    if (result.outputMode === 'replace' && result.backupPath && result.historyId) {
+      appendVideoAction(actions, 'restore', localizeUiText('恢复原视频'), 'restore', function() { restoreVideoResult(result); });
+    } else if (result.historyId) {
+      appendVideoAction(actions, 'restore', localizeUiText('删除这次压缩结果'), 'trash', function() { restoreVideoResult(result); });
+    }
+    appendVideoAction(actions, 'log', localizeUiText('查看日志'), 'copy', function() { copyVideoLog(result); });
+    return;
+  }
+  // 跳过 / 取消 / 失败：磁盘上没发生（或没做完）的事，就不许出现任何指向产物的按钮。
+  if (item.result) {
+    if (caps.retry) {
+      var retryBtn2 = appendVideoAction(actions, 'retry', localizeUiText('重试'), 'recompress', function() { compressOneFile(filePath); });
+      retryBtn2.disabled = isCompressing || !videoCapabilities.available;
+    }
     appendVideoAction(actions, 'log', localizeUiText('查看日志'), 'copy', function() { copyVideoLog(item.result); });
   }
 }
@@ -1848,6 +2114,11 @@ async function drainVideoCoverQueue() {
 
 async function openMediaFile(filePath) {
   if (!filePath) return;
+  // §52 播放的也是磁盘上的文件：先确认它还在，再交给系统播放器。
+  if (!(await pathExists(filePath))) {
+    showToast(localizeUiText('文件不存在或已被移动'));
+    return;
+  }
   try { await invoke('open_media_file', { path: filePath }); }
   catch (error) { showToast(localizeUiText('无法打开媒体文件: ') + (error.message || error)); }
 }
@@ -1870,6 +2141,10 @@ async function cancelCurrentVideo(taskId) {
 
 async function restoreVideoResult(result, force) {
   if (!result || !result.historyId) return;
+  if (restoreBlockedBySession()) {
+    showToast(restoreBlockedText());
+    return;
+  }
   if (result.outputMode !== 'replace' && !confirm(localizeUiText('删除这次压缩结果？\n将删除 ') + (result.outputPath || '')
     + localizeUiText('，并移除这条历史记录。原图未被覆盖，不受影响。'))) return;
   var outcome;
@@ -1880,24 +2155,30 @@ async function restoreVideoResult(result, force) {
     await restoreVideoResult(result, true);
     return;
   }
-  if (!outcome.success) { showToast(outcome.error || localizeUiText('恢复失败')); return; }
-  showToast(result.outputMode === 'replace'
-    ? localizeUiText('已恢复原视频: ') + basename(result.sourcePath)
-    : localizeUiText('已删除这次压缩结果: ') + basename(result.outputPath));
+  if (!outcome.success) { showToast(localizeBackendText(outcome.error) || localizeUiText('恢复失败')); return; }
+  showRestoreOutcome(outcome, outcome.alreadyRestored
+    ? localizeUiText('之前已经完成过这一步，这次没有再做改动')
+    : (result.outputMode === 'replace'
+      ? localizeUiText('已恢复原视频: ') + basename(result.sourcePath)
+      : localizeUiText('已删除这次压缩结果: ') + basename(result.outputPath)));
   afterRestore(outcome.filePath || result.sourcePath);
 }
 
 function copyVideoLog(result) {
   if (!result) return;
   var options = result.videoOptions || result.compressOptions || {};
+  var logged = resultLogStatus(result);
+  var hasProduct = resultHasProduct(result);
   var lines = [
     '=== Sizqo video task ===',
     'source: ' + (result.sourcePath || ''),
-    'output: ' + (result.outputPath || ''),
-    'status: ' + (result.skippedLarger ? 'skippedLarger' : result.success ? 'success' : 'failed'),
+    'output: ' + (hasProduct ? (result.outputPath || '') : 'none'),
+    'status: ' + logged.status,
+    'reasonCode: ' + (logged.reason || 'none'),
     'reason: ' + (result.reason || ''),
-    'size: ' + (result.originalBytes || 0) + ' -> ' + (result.outputBytes || 0) + ' bytes',
-    'savings: ' + (Number.isFinite(result.savings) ? result.savings.toFixed(2) + '%' : 'unknown'),
+    'size: ' + (result.originalBytes || 0) + ' bytes'
+      + (hasProduct ? ' -> ' + (result.outputBytes || 0) + ' bytes' : ' -> no output written'),
+    'savings: ' + (hasProduct && Number.isFinite(result.savings) ? result.savings.toFixed(2) + '%' : 'unknown'),
     'elapsedMs: ' + (result.elapsedMs == null ? 'unknown' : result.elapsedMs),
     'encoderActual: ' + (result.encoderActual || 'unknown'),
     'backendActual: ' + (result.backendActual || 'unknown'),
@@ -1909,13 +2190,14 @@ function copyVideoLog(result) {
   showToast(ok ? localizeUiText('视频日志已复制到剪贴板') : localizeUiText('复制失败，请手动选中日志文本'));
 }
 
-function openVideoCompareForResult(result) {
+async function openVideoCompareForResult(result) {
   if (!result) return;
   var originalPath = result.outputMode === 'replace' ? result.backupPath : result.sourcePath;
   if (!originalPath || !result.outputPath) {
     showToast(localizeUiText('原视频或压缩结果已不存在'));
     return;
   }
+  if (!(await ensureOutputExists(result, result.file))) return;
   openVideoCompare(originalPath, result.outputPath, result.videoProbe || null);
 }
 
@@ -1926,6 +2208,11 @@ function findProbedVideo(records, path) {
 
 async function openVideoCompare(sourcePath, outputPath, sourceProbeHint) {
   if (!sourcePath || !outputPath) return;
+  // §52 同帧对比需要两侧都真的在盘上；少一侧就明说，不开一个永远加载不出的窗口。
+  if (!(await pathExists(sourcePath)) || !(await pathExists(outputPath))) {
+    showToast(localizeUiText('原视频或压缩结果已不存在'));
+    return;
+  }
   var backdrop = document.getElementById('videoCompareBackdrop');
   var dialog = document.getElementById('videoCompareDialog');
   var message = document.getElementById('videoCompareMessage');
@@ -2107,31 +2394,45 @@ function renderQueueResultActions(row, result) {
   actions.innerHTML = '';
   if (!result) return;
 
+  // §68 按钮清单由 resultCapabilities 一处决定：这里只负责把允许做的事画出来，
+  // 不再自己判"这一项到底有没有产物"。
+  var caps = resultCapabilities(result);
   var actionDefs = [];
-  if (result.success) {
+  if (caps.save) actionDefs.push({ action: 'save', title: localizeUiText('另存为'), icon: iconMarkup('save', true) });
+  if (caps.compare) actionDefs.push({ action: 'compare', title: localizeUiText('对比查看'), icon: iconMarkup('compare', true) });
+  if (caps.restore) {
     // 后缀 / 目录模式的原图从没被覆盖过：那一行按下去删的是这次生成的产物，
     // 按钮就不能写着「恢复原图」。历史页同一套判据（historyRowActionDefs）。
-    var undo = result.outputMode === 'replace'
-      ? { action: 'restore', title: localizeUiText('恢复原图'), icon: iconMarkup('restore', true) }
-      : { action: 'restore', title: localizeUiText('删除这次压缩结果'), icon: iconMarkup('trash', true), danger: true };
-    actionDefs = [
-      { action: 'save', title: localizeUiText('另存为'), icon: iconMarkup('save', true) },
-      { action: 'compare', title: localizeUiText('对比查看'), icon: iconMarkup('compare', true) },
-      undo,
-      { action: 'finder', title: localizeUiText('在访达中显示'), icon: iconMarkup('finder', true) },
-    ];
-  } else {
-    actionDefs = [
-      { action: 'retry', title: localizeUiText('重试'), icon: iconMarkup('recompress', true) },
-    ];
+    // §44：会话期间恢复会改写当前进度，按钮直接禁用并说明原因。
+    var restoreBlocked = restoreBlockedBySession();
+    var restoreTitle = result.outputMode === 'replace'
+      ? localizeUiText('恢复原图')
+      : localizeUiText('删除这次压缩结果');
+    actionDefs.push({
+      action: 'restore',
+      title: restoreBlocked ? restoreBlockedText() : restoreTitle,
+      icon: iconMarkup(result.outputMode === 'replace' ? 'restore' : 'trash', true),
+      danger: result.outputMode !== 'replace',
+      disabled: restoreBlocked,
+    });
   }
-  actionDefs.push({ action: 'log', title: localizeUiText('复制日志'), icon: iconMarkup('copy', true) });
+  if (caps.finder) actionDefs.push({ action: 'finder', title: localizeUiText('在访达中显示'), icon: iconMarkup('finder', true) });
+  if (caps.retry) {
+    // 没有产物 = 上面那几个一个都不该有：另存为、对比、"删除这次结果"、在访达中显示
+    // 指的都是磁盘上不存在的文件，按下去只会换来一句「找不到这条历史记录」。
+    // 会话期间与详情列同一判据：按下去只会被静默顶回，不如一开始就禁用。
+    var retryItem = queueItems.get(result.file);
+    actionDefs.push({ action: 'retry', title: localizeUiText('重试'), icon: iconMarkup('recompress', true),
+      disabled: isCompressing || (retryItem && retryItem.mediaKind === 'video' && !videoCapabilities.available) });
+  }
+  if (caps.log) actionDefs.push({ action: 'log', title: localizeUiText('复制日志'), icon: iconMarkup('copy', true) });
 
   actionDefs.forEach(function(def) {
     var btn = document.createElement('button');
     btn.className = 'queue-action-btn' + (def.danger ? ' danger' : '');
     btn.type = 'button';
     btn.title = def.title;
+    btn.disabled = !!def.disabled;
     btn.innerHTML = def.icon;
     btn.addEventListener('click', function(e) {
       e.stopPropagation();
@@ -2150,12 +2451,18 @@ function renderQueueResultActions(row, result) {
 
 function copyCompressLog(result) {
   var opts = result.compressOptions || {};
+  var logged = resultLogStatus(result);
+  var hasProduct = resultHasProduct(result);
+  var reasonLine = resultReasonText(result);
   var lines = [];
   lines.push(localizeUiText('版本: ') + BUILD_VARIANT);
   lines.push(localizeUiText('=== Sizqo \u538b\u7f29\u65e5\u5fd7 ==='));
   lines.push('');
   lines.push(localizeUiText('\u6587\u4ef6: ') + (result.file || ''));
-  lines.push(localizeUiText('\u72b6\u6001: ') + (result.success ? localizeUiText('\u6210\u529f') : localizeUiText('\u5931\u8d25')));
+  lines.push(localizeUiText('\u72b6\u6001: ') + resultStatusText(result));
+  lines.push('outcome: ' + logged.status);
+  lines.push('reasonCode: ' + (logged.reason || 'none'));
+  if (reasonLine) lines.push(localizeUiText('原因: ') + reasonLine);
   lines.push(localizeUiText('意图: ') + intentLabelForRun());
   lines.push('');
   lines.push(localizeUiText('--- 这一轮的请求 ---'));
@@ -2168,18 +2475,26 @@ function copyCompressLog(result) {
   lines.push('outputSuffix: ' + (opts.outputSuffix || localizeUiText('(未设置)')));
   lines.push('');
   lines.push(localizeUiText('--- \u538b\u7f29\u7ed3\u679c ---'));
-  if (result.success) {
-    lines.push(localizeUiText('\u539f\u59cb\u5927\u5c0f: ') + formatBytes(result.originalSize) + ' (' + result.originalSize + ' bytes)');
-    lines.push(localizeUiText('\u538b\u7f29\u540e\u5927\u5c0f: ') + formatBytes(result.compressedSize) + ' (' + result.compressedSize + ' bytes)');
-    lines.push(localizeUiText('\u538b\u7f29\u7387: ') + (result.savings >= 0 ? '-' : '+') + Math.abs(result.savings).toFixed(1) + '%');
+  if (hasProduct) {
+    lines.push(localizeUiText('原始大小: ') + formatBytes(result.originalSize) + ' (' + result.originalSize + ' bytes)');
+    lines.push(localizeUiText('压缩后大小: ') + formatBytes(result.compressedSize) + ' (' + result.compressedSize + ' bytes)');
+    // 与 savingsPercentText 同一道 isFinite 门：非有限数不许拼出 "+NaN%"。
+    lines.push(localizeUiText('压缩率: ') + (savingsPercentText(result) || localizeUiText('(未知)')));
     lines.push(localizeUiText('\u8f93\u51fa\u683c\u5f0f: ') + (result.type || localizeUiText('(\u672a\u77e5)')));
+    lines.push(localizeUiText('\u7b97\u6cd5: ') + (result.algorithm || localizeUiText('(\u672a\u77e5)')));
+    lines.push(localizeUiText('产物: ') + (result.outputPath || ''));
+  } else if (logged.status !== 'failed') {
+    // 引擎压出了有效字节，后端判定"不比原图小"就没落盘：
+    // 日志里不许写「压缩后大小」，那个数字对应的文件从没存在过。
+    lines.push(localizeUiText('未写出文件 · 原图保持原样'));
+    lines.push('engineBytes: ' + result.compressedSize + ' bytes');
     lines.push(localizeUiText('\u7b97\u6cd5: ') + (result.algorithm || localizeUiText('(\u672a\u77e5)')));
   } else {
     lines.push(localizeUiText('\u538b\u7f29\u5931\u8d25'));
   }
   lines.push('');
   lines.push(localizeUiText('--- \u9519\u8bef\u4fe1\u606f ---'));
-  lines.push(result.error ? result.error : localizeUiText('(\u65e0)'));
+  lines.push(result.error ? localizeBackendText(result.error) : localizeUiText('(\u65e0)'));
   var ok = copyTextToClipboard(lines.join('\n'));
   showToast(ok ? localizeUiText('\u538b\u7f29\u65e5\u5fd7\u5df2\u590d\u5236\u5230\u526a\u8d34\u677f') : localizeUiText('\u590d\u5236\u5931\u8d25\uff0c\u8bf7\u624b\u52a8\u9009\u4e2d\u65e5\u5fd7\u6587\u672c'));
 }
@@ -2219,11 +2534,24 @@ function renderRestoredActions(row, filePath) {
   actions.appendChild(btn);
 }
 
+/// 这一轮要发给后端的来源根 = 这轮里每个队列项自己的固定根。
+/// 不是 `inputPaths`（用户历次导入攒下来的清单）：换轮次、单文件重试时，
+/// 拿那份清单去推相对路径会得出和前一次不同的层级（§39 §40）。
+function sourceRootsForPaths(paths) {
+  var roots = [];
+  (paths || []).forEach(function(path) {
+    var item = queueItems.get(path);
+    var root = item && item.sourceRoot;
+    if (root && roots.indexOf(root) < 0) roots.push(root);
+  });
+  return roots;
+}
+
 /// 图片这一轮真正发给引擎的东西 = 意图编译出的参数 + 输出侧的落盘方式。
 /// 字段集合与 src-tauri/src/engine.rs 的 CompressOptions（camelCase）一一对应：
 /// 界面上不再提供、引擎也不再读的 backend / effort / smartMode / convertToWebp
 /// 已经从这条请求里消失了 —— smart 路由的真实载体是命令参数 use_smart。
-function getCurrentCompressionConfig() {
+function getCurrentCompressionConfig(paths) {
   const compiled = imageRequestFromIntent();
   const options = compiled.options;
   const outputMode = currentOutputMode();
@@ -2243,7 +2571,7 @@ function getCurrentCompressionConfig() {
       outputMode,
       outputSuffix: getOutputSuffix(),
       outputDir: outputMode === 'folder' ? outputDir : null,
-      sourceRoots: inputPaths.slice(),
+      sourceRoots: sourceRootsForPaths(paths),
     },
   };
 }
@@ -2280,7 +2608,7 @@ function intentLabelForRun() {
 
 function clearAllFiles() {
   if (files.length === 0 && !isCompressing) return;
-  if (!confirm(localizeUiText('确定要清空全部 ') + files.length + localizeUiText(' 个文件吗？'))) return;
+  if (!confirm(localizeUiText('确定要把 ') + files.length + localizeUiText(' 个文件移出清单吗？磁盘上的原图和压缩产物都不会删除。'))) return;
 
   // 正在跑的那次 invoke 不能提前作废：这里只把队列**标记**成不要了，
   // 真正把它收回来的仍然是发起它的那次调用（它会在 finally 里收尾）。
@@ -2292,6 +2620,15 @@ function clearAllFiles() {
     invoke('cancel_batch', { filePaths: executionSession.targetPaths.slice() }).catch(function() {});
   }
 
+  resetQueue();
+  updateQueueSummary();
+  renderDetailPane();
+  emitCompareResultsChanged();
+}
+
+/// 把这一轮的清单从界面上收走。磁盘上的原图、压缩产物、后端的历史与备份一概不动，
+/// 所以「回到导入」不需要确认框；「清除全部」用的是同一套收法，只是它可能撞在跑着的会话上。
+function resetQueue() {
   files = [];
   inputPaths = [];
   queueItems = new Map();
@@ -2301,9 +2638,19 @@ function clearAllFiles() {
   runIntentSnapshot = null;
   var list = document.getElementById('fileQueueList');
   if (list) list.innerHTML = '';
+}
+
+/// 一轮压完之后的出口：收走清单，回到「把文件拖进来」那一页。
+/// 只在真的没有待处理文件、且没有会话在跑时出现（见 updateBulkActionButtons）。
+function startNextRound() {
+  if (isCompressing) return;
+  queueRevision++;
+  resetQueue();
   updateQueueSummary();
   renderDetailPane();
   emitCompareResultsChanged();
+  showView('main');
+  showToast(localizeUiText('已回到导入页 · 这一轮的结果在历史里'));
 }
 
 // ─── Compression ────────────────────────────────────────────────
@@ -2320,10 +2667,16 @@ function clearAllFiles() {
 
 var executionSession = null;
 var sessionSeq = 0;
+// 界面的压缩态是否来自「从后端收养来的孤儿会话」（被 SESSION_BUSY 顶回后
+// 亲眼问到的 running）：那种会话没有属主 invoke 替它收尾，它的 idle 事件
+// 必须被采纳，否则界面永久卡在压缩态（见 applyCompressionStateEvent）。
+var adoptedOrphanBackendSession = false;
 
 /// 开一轮：目标 = 调用方给的这批（只会是 pending），并记下当时的队列版本。
 function beginExecutionSession(targetPaths) {
   sessionSeq += 1;
+  // 本地自己当属主了：孤儿收养标记不再作数。
+  adoptedOrphanBackendSession = false;
   executionSession = {
     id: 'session-' + sessionSeq + '-' + Date.now(),
     queueRevision: queueRevision,
@@ -2401,7 +2754,7 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
   setCompressionState(COMPRESSION_RUNNING, true);
   currentCompressOptions = null;
 
-  const config = imagePaths.length > 0 ? getCurrentCompressionConfig() : { options: {}, useSmartIpc: false };
+  const config = imagePaths.length > 0 ? getCurrentCompressionConfig(imagePaths) : { options: {}, useSmartIpc: false };
   if (config.error) {
     showToast(config.error);
     setCompressionState(COMPRESSION_IDLE, true);
@@ -2422,14 +2775,32 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
   var videoOptions = videoPaths.length > 0 ? videoOptionsFromControls() : null;
   if (videoPaths.length > 0) {
     var videoVerdict = await validateVideoBatch(videoPaths, videoOptions);
-    if (!videoVerdict.valid) {
-      var validationMessage = (videoVerdict.errors || []).join(' · ') || localizeUiText('视频设置无效');
-      var validationNote = document.getElementById('videoValidationNote');
-      if (validationNote) {
-        validationNote.textContent = validationMessage;
-        validationNote.classList.add('visible', 'warning');
+    var globalErrors = videoVerdict.globalErrors || [];
+    if (globalErrors.length) {
+      // 能力级失效（视频编码整体不可用）：整批都进不了，按会话级失败收场。
+      var capabilityMessage = globalErrors.join(' · ') || localizeUiText('视频设置无效');
+      var blockedNote = document.getElementById('videoValidationNote');
+      if (blockedNote) {
+        blockedNote.textContent = capabilityMessage;
+        blockedNote.classList.add('visible', 'warning');
       }
-      showToast(validationMessage);
+      showToast(capabilityMessage);
+      setCompressionState(COMPRESSION_IDLE, true);
+      updateQueueSummary();
+      return;
+    }
+    // §5.3 单个视频不兼容只标记它自己：其余有效视频照常开跑，坏的那行带着原因落定。
+    var incompatibleCount = markVideoPreflightFailures(videoVerdict.failures);
+    if (incompatibleCount > 0) {
+      var rejected = new Set((videoVerdict.failures || []).map(function(failure) { return failure.path; }));
+      videoPaths = videoPaths.filter(function(path) { return !rejected.has(path); });
+      batchPaths = batchPaths.filter(function(filePath) {
+        var item = queueItems.get(filePath);
+        return !item || item.mediaKind !== 'video' || videoPaths.indexOf(filePath) >= 0;
+      });
+      showToast(localizeUiText('有 ' + incompatibleCount + ' 个视频与当前设置不兼容，已标记为失败；其余任务照常开始'));
+    }
+    if (videoPaths.length === 0 && imagePaths.length === 0) {
       setCompressionState(COMPRESSION_IDLE, true);
       updateQueueSummary();
       return;
@@ -2450,17 +2821,27 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
     video: videoPaths.length > 0 ? videoRequestFromIntent() : null,
   };
   var session = beginExecutionSession(batchPaths);
+  // 会话真的开起来了：compressOneFile 靠这个返回值决定要不要把抹掉的状态放回去。
+  var started = true;
   var targetItems = new Map(batchPaths.map(function(filePath) { return [filePath, queueItems.get(filePath)]; }));
   var settled = new Set();
 
   updateQueueSummary();
 
   // 一轮开始 = 未暂停、未停止；按钮与文案全部由状态机说了算。
-  setCompressionState(COMPRESSION_RUNNING);
+  // 预会话等待窗口（目录授权 / 视频校验的 await 期间）里用户发出的暂停或停止
+  // 不许被这里无条件盖回 RUNNING —— 状态机没有防护时这就是一条潜在竞态。
+  var phaseState = (compressionState === COMPRESSION_PAUSED || compressionState === COMPRESSION_STOPPING)
+    ? compressionState : COMPRESSION_RUNNING;
+  setCompressionState(phaseState);
   setPauseButtonVisible(true);
-  session.phase = COMPRESSION_RUNNING;
+  session.phase = phaseState;
 
+  // §44 恢复按钮的可用性挂在 isCompressing 上：会话一开始就按新状态重画
+  // （行、详情列、历史页三处），别让用户对着一个按不动的旧按钮发愣。
   renderFileQueue();
+  renderDetailPane();
+  if (typeof currentView !== 'undefined' && currentView === 'history') renderHistory();
 
   /// 事件 → 队列状态。**每一层判据都来自 queueItems**，不看 DOM class：
   /// 从前"这一行是不是被取消过"要靠 row.classList.contains('cancelled')，
@@ -2479,9 +2860,12 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
     if (data.status === 'starting') {
       if (item.state !== 'pending') return;
       item.state = 'running';
+      // §41：attemptCount 只在真正开工时加一；重试不换 taskId，身份始终是同一个。
+      item.attemptCount = (item.attemptCount || 0) + 1;
       settled.delete(file);
       paintQueueRow(file);
-      applyQueueView();
+      // updateQueueSummary 内部就会跑一遍 applyQueueView：这里不再单独调一次，
+      // 否则每个 starting 事件都要做两遍全量排序。
       updateQueueSummary();
       return;
     }
@@ -2495,7 +2879,13 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
       settled.add(file);
       result.compressOptions = batchOptions;
       item.result = result;
-      item.state = result.success ? 'done' : 'failed';
+      // §2 §67 生命周期由结论派生：跳过、取消、未达目标都是"这一轮处理完了"（done），
+      // 只有 outcome=failed 才是 Failed。事件里的 status 只说明轮到结尾了。
+      item.state = taskStateFor(result);
+      // §42：这一轮的生命周期走完了 —— 闩锁一旦置上，之后的重试只改当前状态，
+      // 不会让「已处理」的分子倒退。补偿路径没收到 starting 时也补一个计数。
+      item.everProcessed = true;
+      if (!item.attemptCount) item.attemptCount = 1;
       paintQueueRow(file);
       if (file === selectedQueueFile) renderDetailPane();
       updateQueueSummary();
@@ -2546,19 +2936,26 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
     var stage = data.stage || 'queued';
     item.videoProgress = Object.assign({}, data, { stage: stage });
     if (stage === 'starting' || stage === 'encoding') {
-      if (item.state === 'pending') item.state = 'running';
+      var becameRunning = item.state === 'pending';
+      if (becameRunning) {
+        item.state = 'running';
+        // §41：编码阶段还会再来事件，计数只在 pending → running 这一刻加。
+        item.attemptCount = (item.attemptCount || 0) + 1;
+      }
       if (item.state !== 'running') return;
       paintQueueRow(path);
-      updateQueueSummary();
+      // §6.1：encoding 每 0.5 秒左右就来一条，只改这一行的进度读数 ——
+      // 队列摘要、排序、可见性都不受它影响，全量重排是纯浪费。
+      // starting（或漏掉 starting 的第一条 encoding）改变了运行态，才值得全量刷新。
+      if (stage === 'starting' || becameRunning) updateQueueSummary();
       return;
     }
-    if (stage === 'completed' || stage === 'failed' || stage === 'skippedLarger') {
+    if (stage === 'completed' || stage === 'failed') {
       if (settledVideoTasks.has(taskId)) return;
       var rawResult = data.result;
       if (!rawResult) return;
       if (item.state !== 'running' && !(data.fromSessionResult && item.state === 'pending')) return;
       settledVideoTasks.add(taskId);
-      if (stage === 'skippedLarger') rawResult = Object.assign({}, rawResult, { stage: 'skippedLarger', success: false, skippedLarger: true });
       var result = window.SizqoVideo.normalizeResult(rawResult, path, item.videoProbe, videoOptions);
       result.taskId = taskId;
       result.historyId = rawResult.historyId || result.historyId || null;
@@ -2568,7 +2965,15 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
       result.videoProbe = item.videoProbe;
       result.compressOptions = videoOptions;
       item.result = result;
-      item.state = stage === 'failed' || (!result.success && !result.skippedLarger) ? 'failed' : 'done';
+      // §2 §67 生命周期由结论派生，图片行与视频行共用同一处派生：跳过（没变小）是
+      // 「处理完了这一轮，但没有产物」，不是失败，也不需要另一种旗标来说这件事。
+      item.state = taskStateFor(result);
+      // 这一轮真的结束了：取消请求的闩锁必须解开，否则重试沿用同一 item 对象时
+      // 永远显示「正在取消…」且无法再次取消。
+      item.cancelRequested = false;
+      // §42：与图片线同一个闩锁 —— 重试不改写"至少处理过一次"这个事实。
+      item.everProcessed = true;
+      if (!item.attemptCount) item.attemptCount = 1;
       paintQueueRow(path);
       if (path === selectedQueueFile) renderDetailPane();
       updateQueueSummary();
@@ -2581,7 +2986,11 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
       item.result = null;
       item.videoProgress = null;
       item.state = 'pending';
-      pendingAutoCompress = false;
+      item.cancelRequested = false;
+      // 取消的是**这一个视频**，不是整批：自动续跑要继续，但被取消的这个
+      // 不许被「继续压缩」再拉回来 —— 用户刚明确说过不要它。
+      if (session.suppressedAutoPaths) session.suppressedAutoPaths.add(path);
+      else session.suppressedAutoPaths = new Set([path]);
       paintQueueRow(path);
       updateQueueSummary();
       showToast(localizeUiText('当前视频已取消，输入文件仍留在队列中'));
@@ -2599,6 +3008,7 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
 
   var unlisten = function() {};
   var unlistenVideo = function() {};
+  var sessionStayedBusy = false;
 
   try {
     unlisten = await listen('compress-progress', function(event) {
@@ -2614,7 +3024,7 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
         videoOptions: videoOptions,
         sessionId: session.id,
         queueRevision: session.queueRevision,
-        sourceRoots: inputPaths.slice(),
+        sourceRoots: sourceRootsForPaths(batchPaths),
         useSmart: !!config.useSmartIpc,
       });
     } else {
@@ -2636,7 +3046,7 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
         sessionId: resultSessionId,
         queueRevision: session.queueRevision,
         file: result.file,
-        status: result.success ? 'completed' : 'failed',
+        status: taskEventStatusFor(result),
         result: result,
         fromSessionResult: true,
       });
@@ -2647,48 +3057,80 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
         sessionId: resultSessionId,
         queueRevision: session.queueRevision,
         taskId: result.taskId,
-        stage: result.stage || (result.skippedLarger ? 'skippedLarger' : (result.success ? 'completed' : 'failed')),
+        stage: result.stage || taskEventStatusFor(result),
         result: result,
         fromSessionResult: true,
       });
     });
-    if (runRevision === queueRevision) {
-      // 收尾结果可能补偿丢失的事件：把每一行和详情列照最终状态重画一遍。
-      renderFileQueue();
-      renderDetailPane();
-    }
   } catch (err) {
     console.error('Compression error:', err);
-    showToast((systemModeForRun() ? localizeUiText('转换出错: ') : localizeUiText('压缩出错: ')) + (err.message || err));
+    // §37 后端顶回「已经有一轮在跑」不是这一轮压坏了，而是这一轮压根没开始。
+    if (isSessionBusyError(err)) {
+      sessionStayedBusy = true;
+      showToast(localizeUiText('已有一轮压缩正在运行，请等它结束或先停止'));
+    } else {
+      showToast((systemModeForRun() ? localizeUiText('转换出错: ') : localizeUiText('压缩出错: '))
+        + localizeBackendText(err.message || err));
+      // 整轮以错误收场（invoke 已返回，后端会话已结束）：收到了 starting 却没等到
+      // 终态事件的行会永远转圈。把它们放回 pending —— 磁盘没动过的事实没变，
+      // 下一轮重新来过比冻结成「压缩中」诚实。
+      targetItems.forEach(function(item, filePath) {
+        if (item && item.state === 'running') {
+          item.state = 'pending';
+          item.videoProgress = null;
+          paintQueueRow(filePath);
+        }
+      });
+      updateQueueSummary();
+    }
   } finally {
     try { unlisten(); } catch (e) {}
     try { unlistenVideo(); } catch (e) {}
     if (executionSession === session) endExecutionSession();
     // 用户按了停止：这一轮就地结束，绝不被"自动压缩"再拉起来跑下一批。
     var stoppedByUser = compressionState === COMPRESSION_STOPPING;
-    setCompressionState(COMPRESSION_IDLE);
-    setPauseButtonVisible(false);
+    // 抢会话输的那一方没有权利把界面写成空闲：真的还有一轮在跑时，暂停 / 停止
+    // 必须留在原地，否则用户只剩一个"看起来没在压、实际还在压"的窗口。
+    var liveState = sessionStayedBusy ? await backendCompressionState() : null;
+    setCompressionState(liveState || COMPRESSION_IDLE);
+    setPauseButtonVisible(!!liveState);
+    // 后端真还有一轮在跑、而本地没有它的属主 invoke：标记为收养的孤儿会话，
+    // 它结束时唯一的收尾事件（idle）必须能被采纳。
+    if (sessionStayedBusy && liveState) adoptedOrphanBackendSession = true;
+    // §44：先把最终状态落定再重画 —— 恢复按钮的可用性读的就是 isCompressing，
+    // 反过来（先画后落状态）会把刚放出来的按钮又画成禁用的。这一遍同时补偿
+    // 收尾结果里丢失的事件。
+    if (runRevision === queueRevision) {
+      renderFileQueue();
+      renderDetailPane();
+      if (typeof currentView !== 'undefined' && currentView === 'history') renderHistory();
+    }
     updateQueueSummary();
-    var shouldContinue = !stoppedByUser && pendingAutoCompress
-      && getRunnablePendingPaths().length > 0;
+    var autoPaths = getRunnablePendingPaths().filter(function(p) {
+      return !(session.suppressedAutoPaths && session.suppressedAutoPaths.has(p));
+    });
+    var shouldContinue = !stoppedByUser && !sessionStayedBusy
+      && pendingAutoCompress && autoPaths.length > 0;
     pendingAutoCompress = false;
     if (shouldContinue) {
-      startCompression(true);
+      startCompressionForPaths(true, autoPaths);
     } else {
       updateQueueSummary();
     }
     refreshHistoryIfOpen();
   }
+  return started;
 }
 
 // ─── 运行条 + 详情列（只从队列、状态机与结果派生）─────────────────
 
-/// 队列的体积账：只统计**真的落盘成功**的那些项。
-/// 图片与视频的结果字段名不同（compressedSize / outputBytes），在这里归成同一本账。
+/// 队列的体积账：只统计**此刻真在磁盘上的产物**。
+/// 「引擎压成功了」和「盘上有这个文件」是两件事：不比原图小的那些从没落盘，
+/// 已恢复的那些产物也早就不在了 —— 两个都不许记进这本账。
 function queueTotals() {
   var totals = { original: 0, output: 0, count: 0 };
-  queueResults().forEach(function(result) {
-    if (!result || !result.success) return;
+  queueProducts().forEach(function(result) {
+    // 图片与视频的字段名不同（compressedSize / outputBytes），在这里归成同一本账。
     var before = Number(result.originalSize !== undefined ? result.originalSize : result.originalBytes) || 0;
     var after = Number(result.compressedSize !== undefined ? result.compressedSize : result.outputBytes) || 0;
     totals.original += before;
@@ -2711,6 +3153,9 @@ function runPhaseText(p) {
   if (p.pending > 0 && p.processed > 0) return localizeUiText('已停止');
   if (p.pending > 0) return localizeUiText('未开始');
   if (p.failed > 0) return localizeUiText('结束');
+  // 一个产物都没落盘：这一轮完成的只是"试过"，不是"压出了文件"。
+  // 「压缩完成」在这种队列上是一句假话，行上、账上、历史里都找不到对应文件。
+  if (queueProducts().length === 0) return localizeUiText('未产出文件');
   return processingActionText('done');
 }
 
@@ -2826,7 +3271,8 @@ function detailPreviewFile(container, filePath) {
   img.alt = '';
   img.draggable = false;
   box.appendChild(img);
-  loadOriginalImage(img, filePath);
+  // Promise.resolve 包一层：真实实现返回 Promise，测试桩可能返回 undefined。
+  Promise.resolve(loadOriginalImage(img, filePath)).catch(function() { /* 详情预览加载失败不构成错误：占位还在。 */ });
 }
 
 /// 视频没有"原图"可读，能拿到的就是抽出来的封面帧：直接给它一个 src。
@@ -2874,14 +3320,32 @@ function renderDetailPane() {
   else buildImageDetail(body, filePath, item);
 }
 
+/// §69 详情列的状态词与行上是**同一个解释器**：有结论的（done/failed）一律走
+/// resultStatusText，只有"还没轮到结论"的处境（pending/running/已恢复/已移除）
+/// 才由队列状态回答。以前这里自己读一遍 skippedLarger、行上再读一遍，
+/// 于是同一项可以一边「已完成」一边「立即压缩」。
 function statusWord(state, result) {
   if (state === 'running') return taskStatusMarkup('running').text;
   if (state === 'pending') return taskStatusMarkup(waitingRowStatus()).text;
-  if (state === 'failed') return localizeUiText('失败');
   if (state === 'restored') return localizeUiText('已恢复');
   if (state === 'removed') return localizeUiText('已移除');
-  if (state === 'done') return result && result.skippedLarger ? localizeUiText('已跳过（更大）') : localizeUiText('已完成');
+  if (state === 'failed') return result ? resultStatusText(result) : localizeUiText('处理失败');
+  if (state === 'done') return result ? resultStatusText(result) : localizeUiText('已完成');
   return '';
+}
+
+/// §69 一项此刻完整的"呈现"：行、详情列、右键菜单都从这一份读，不再各判一次。
+function deriveTaskPresentation(item, result) {
+  var facts = mediaResultFacts(result);
+  return {
+    state: item ? item.state : '',
+    outcome: facts ? facts.outcome : null,
+    hasProduct: !!(facts && facts.hasProduct),
+    status: statusWord(item ? item.state : '', result),
+    reason: resultReasonText(result),
+    title: resultDetailTitle(result),
+    capabilities: resultCapabilities(result),
+  };
 }
 
 function buildImageDetail(body, filePath, item) {
@@ -2891,10 +3355,27 @@ function buildImageDetail(body, filePath, item) {
   detailText(body, 'detail-title', basename(filePath), filePath);
   detailPreviewFile(body, filePath);
 
-  if (result && result.success) {
+  if (resultHasProduct(result)) {
+    // §52 产物此刻不在盘上：详情列只说实话（原图与记录还在），不摆指向空文件的按钮。
+    if (mediaResultFacts(result).outputMissing) {
+      detailCallout(body, '', localizeUiText('压缩结果已不存在'));
+      detailSpecs(body, [
+        [localizeUiText('原始大小'), item.originalSize ? formatBytes(item.originalSize) : ''],
+        [localizeUiText('算法'), result.algorithm],
+        [localizeUiText('输出位置'), result.outputPath || ''],
+      ]);
+      detailActions(body, [
+        { label: localizeUiText(result.outputMode === 'replace' ? '恢复原图' : '删除这次结果'),
+          icon: result.outputMode === 'replace' ? 'restore' : 'trash',
+          disabled: restoreBlockedBySession(),
+          title: restoreBlockedBySession() ? restoreBlockedText() : '',
+          onClick: function() { restoreOriginal(filePath); } },
+        { label: localizeUiText('复制日志'), icon: 'copy', ghost: true, onClick: function() { copyCompressLog(result); } },
+      ]);
+      return;
+    }
     var hero = detailSection(body, 'detail-hero' + (result.savings > 0 ? ' is-good' : ''));
-    detailText(hero, 'detail-hero-number',
-      (result.savings >= 0 ? '-' : '+') + Math.abs(result.savings).toFixed(1) + '%');
+    detailText(hero, 'detail-hero-number', savingsPercentText(result));
     detailText(hero, 'detail-hero-note',
       formatBytes(result.originalSize) + ' → ' + formatBytes(result.compressedSize));
     var chain = detailSection(body, 'detail-chain');
@@ -2930,12 +3411,29 @@ function buildImageDetail(body, filePath, item) {
       { label: localizeUiText('对比查看'), icon: 'compare', onClick: function() { openCompareByFile(filePath); } },
       { label: localizeUiText(result.outputMode === 'replace' ? '恢复原图' : '删除这次结果'),
         icon: result.outputMode === 'replace' ? 'restore' : 'trash',
+        disabled: restoreBlockedBySession(),
+        title: restoreBlockedBySession() ? restoreBlockedText() : '',
         onClick: function() { restoreOriginal(filePath); } },
       { label: localizeUiText('在访达中显示'), icon: 'finder', onClick: function() { openInFinder(filePath); } },
       { label: localizeUiText('复制日志'), icon: 'copy', ghost: true, onClick: function() { copyCompressLog(result); } },
     ]);
+  } else if (state === 'done' && result) {
+    // 磁盘上什么都没发生（跳过 / 取消）：这里不许出现降幅大数字，
+    // 也不许给出一排指向不存在文件的按钮。那句"为什么"只按 reasonCode 说（§70），
+    // 不再把后端造的某一句话当状态用 —— 换句话就换个显示是它一直在出问题的方式。
+    detailCallout(body, '', localizeUiText('这次没有写出文件：')
+      + (resultReasonText(result) || localizeUiText('产物不比原图小，原图保持原样。')));
+    detailSpecs(body, [
+      [localizeUiText('原始大小'), item.originalSize ? formatBytes(item.originalSize) : ''],
+      [localizeUiText('算法'), result.algorithm],
+      [localizeUiText('耗时'), Number.isFinite(result.elapsedMs) ? (result.elapsedMs / 1000).toFixed(2) + ' s' : ''],
+    ]);
+    detailActions(body, [
+      { label: localizeUiText('重新压缩这一个'), icon: 'recompress', onClick: function() { compressOneFile(filePath); } },
+      { label: localizeUiText('复制日志'), icon: 'copy', ghost: true, onClick: function() { copyCompressLog(result); } },
+    ]);
   } else if (state === 'failed') {
-    detailCallout(body, 'is-error', (result && result.error) || localizeUiText('这次压缩没有成功'));
+    detailCallout(body, 'is-error', (result && resultDetailTitle(result)) || localizeUiText('这次压缩没有成功'));
     detailSpecs(body, [[localizeUiText('原始大小'), item.originalSize ? formatBytes(item.originalSize) : '']]);
     detailActions(body, [
       { label: localizeUiText('重试这一个'), icon: 'recompress', onClick: function() { compressOneFile(filePath); } },
@@ -2986,11 +3484,28 @@ function buildVideoDetail(body, filePath, item) {
   detailText(body, 'detail-title', basename(filePath), filePath);
   if (item.coverUrl) detailPreviewSrc(body, item.coverUrl);
 
-  if (result && result.success) {
-    var savings = Number.isFinite(result.savings) ? result.savings
-      : (result.originalBytes > 0 && result.outputBytes ? (result.originalBytes - result.outputBytes) / result.originalBytes * 100 : 0);
-    var hero = detailSection(body, 'detail-hero' + (savings > 0 ? ' is-good' : ''));
-    detailText(hero, 'detail-hero-number', (savings >= 0 ? '-' : '+') + Math.abs(savings).toFixed(1) + '%');
+  if (resultHasProduct(result)) {
+    if (mediaResultFacts(result).outputMissing) {
+      // §52 与图片详情同一条判据：产物不在盘上，列出的只能是还成立的事实。
+      detailCallout(body, '', localizeUiText('压缩结果已不存在'));
+      detailSpecs(body, [
+        [localizeUiText('原始大小'), item.originalSize ? formatBytes(item.originalSize) : ''],
+        [localizeUiText('编码器'), result.encoderActual || ''],
+        [localizeUiText('输出位置'), result.outputPath || ''],
+      ]);
+      detailActions(body, [
+        { label: localizeUiText(result.outputMode === 'replace' ? '恢复原视频' : '删除这次结果'),
+          icon: result.outputMode === 'replace' ? 'restore' : 'trash',
+          disabled: restoreBlockedBySession(),
+          title: restoreBlockedBySession() ? restoreBlockedText() : '',
+          onClick: function() { restoreVideoResult(result); } },
+        { label: localizeUiText('查看日志'), icon: 'copy', ghost: true, onClick: function() { copyVideoLog(result); } },
+      ]);
+      return;
+    }
+    var savings = savingsPercentText(result);
+    var hero = detailSection(body, 'detail-hero' + (result.savings > 0 ? ' is-good' : ''));
+    detailText(hero, 'detail-hero-number', savings);
     detailText(hero, 'detail-hero-note',
       formatBytes(result.originalBytes) + ' → ' + formatBytes(result.outputBytes || 0));
     var chain = detailSection(body, 'detail-chain');
@@ -3016,12 +3531,32 @@ function buildVideoDetail(body, filePath, item) {
         onClick: function() { openVideoCompareForResult(result); } },
       { label: localizeUiText(result.outputMode === 'replace' ? '恢复原视频' : '删除这次结果'),
         icon: result.outputMode === 'replace' ? 'restore' : 'trash',
+        disabled: restoreBlockedBySession(),
+        title: restoreBlockedBySession() ? restoreBlockedText() : '',
         onClick: function() { restoreVideoResult(result); } },
       { label: localizeUiText('在访达中显示'), icon: 'finder', onClick: function() { openInFinder(filePath); } },
       { label: localizeUiText('查看日志'), icon: 'copy', ghost: true, onClick: function() { copyVideoLog(result); } },
     ]);
+  } else if (item.state === 'done' && result) {
+    // 这一轮跑完了，盘上没有产物：不许出现降幅大数字，也不许给一排指向产物的按钮。
+    // 那句"为什么"按 reasonCode 选，后端原话跟在后面备查（§70）。
+    detailCallout(body, '', localizeUiText('这次没有写出文件：')
+      + (resultReasonText(result) || localizeUiText('产物不比原文件小，原文件保持原样。'))
+      + (result.reason ? '\n' + localizeBackendText(result.reason) : ''));
+    detailSpecs(body, [
+      [localizeUiText('原始大小'), item.originalSize ? formatBytes(item.originalSize) : ''],
+      [localizeUiText('编码器'), result.encoderActual || ''],
+      [localizeUiText('耗时'), window.SizqoVideo.formatDurationUs((result.elapsedMs || 0) * 1000)],
+    ]);
+    detailActions(body, [
+      { label: localizeUiText('重新压缩这一个'), icon: 'recompress', disabled: !videoCapabilities.available,
+        onClick: function() { compressOneFile(filePath); } },
+      { label: localizeUiText('查看日志'), icon: 'copy', ghost: true, onClick: function() { copyVideoLog(result); } },
+    ]);
   } else if (item.state === 'failed') {
-    detailCallout(body, 'is-error', (result && (result.reason || result.error)) || videoWarningText(item));
+    var videoFailure = (result && localizeBackendText(result.reason || result.error)) || videoWarningText(item);
+    detailCallout(body, 'is-error', resultReasonText(result)
+      ? localizeUiText('原因: ') + resultReasonText(result) + '\n' + videoFailure : videoFailure);
     detailActions(body, [
       { label: localizeUiText('重试这一个'), icon: 'recompress', disabled: !videoCapabilities.available,
         onClick: function() { compressOneFile(filePath); } },
@@ -3055,19 +3590,71 @@ function buildVideoDetail(body, filePath, item) {
 
 /// 单个文件重新压一次 = 把它放回 pending，然后开一轮只含它的会话。
 /// 失败文件走的就是这条路（显式「重试」），普通「继续压缩」不碰失败项。
+///
+/// §41：重试**不换身份** —— queueItems 里是同一个对象，taskId 原样保留，
+/// 只由开工事件把 attemptCount 加一。删掉旧项再建新项会让历史、进度和事件
+/// 对不上号。§42：everProcessed 也不清，所以「已处理」的分子不会倒退。
 async function compressOneFile(filePath) {
   if (isCompressing) return;
   var item = queueItems.get(filePath);
   if (!item) return;
+  var previousResult = item.result;
+  var previousState = item.state;
   item.result = null;
   item.state = 'pending';
+  // 上一次的「正在取消…」不带到这一轮：重新压缩就是一个新的开始。
+  item.cancelRequested = false;
   paintQueueRow(filePath);
   emitCompareResultsChanged();
-  await startCompressionForPaths(true, [filePath]);
+  var started = await startCompressionForPaths(true, [filePath]);
+  if (!started) {
+    // 没能开跑（视频能力不可用 / 目录没选 / 校验失败……）：把抹掉的状态原样
+    // 放回去。否则一个已完成的行会被静默改成 pending，下一轮「继续压缩」
+    // 会在用户没有预期的情况下重新压它。
+    item.result = previousResult;
+    item.state = previousState;
+    paintQueueRow(filePath);
+    emitCompareResultsChanged();
+    return;
+  }
   var after = queueItems.get(filePath);
   if (after && after.state === 'done') {
     showToast(localizeUiText('已重新压缩: ') + basename(filePath));
   }
+}
+
+/// §52 提交过的产物可能已经在访达里被删掉。前端不缓存"它还在"这个事实：
+/// 每次另存 / 对比 / 访达 / 播放之前重新问一次磁盘，不在就把结果本身标成
+/// `outputMissing` —— 行、详情、按钮都读这一条，而不是各弹一次错。
+async function pathExists(filePath) {
+  if (!filePath) return false;
+  try {
+    var exists = await invoke('path_exists', { filePath: filePath });
+    // 测试桩或旧后端没有这个命令时，不能把真实产物冤杀：只有明确的 false 才算不在。
+    return typeof exists === 'boolean' ? exists : true;
+  } catch (_) {
+    return true;
+  }
+}
+
+function markQueueOutputMissing(filePath, silent) {
+  var item = queueItems.get(filePath);
+  if (!item || !item.result || item.result.outputMissing) return false;
+  item.result.outputMissing = true;
+  paintQueueRow(filePath);
+  updateQueueSummary();
+  emitCompareResultsChanged();
+  renderDetailPane();
+  if (!silent) showToast(localizeUiText('压缩结果已不存在'));
+  return true;
+}
+
+/// 指向产物的入口共用的那道复核。返回 false = 已经按"不在盘上"收口，调用方不必再动作。
+async function ensureOutputExists(result, filePath) {
+  if (!result || !result.outputPath) return false;
+  if (await pathExists(result.outputPath)) return true;
+  markQueueOutputMissing(filePath || result.file);
+  return false;
 }
 
 async function saveResult(filePath) {
@@ -3075,20 +3662,33 @@ async function saveResult(filePath) {
   const result = item && item.result;
   if (!result || !result.outputPath) {
     showToast(localizeUiText('无法保存：找不到压缩文件'));
+    if (result) markQueueOutputMissing(filePath, true);
     return;
   }
-  const savedPath = await invoke('save_file', { sourcePath: result.outputPath });
-  if (savedPath) {
-    showToast(localizeUiText('已保存到: ') + basename(savedPath));
+  if (!(await ensureOutputExists(result, filePath))) return;
+  try {
+    const savedPath = await invoke('save_file', { sourcePath: result.outputPath });
+    if (savedPath) showToast(localizeUiText('已保存到: ') + basename(savedPath));
+  } catch (error) {
+    const message = String((error && error.message) || error);
+    // §53 后端在复制前发现源已不在：这是"产物没了"，不是对话框失败。
+    if (message.indexOf('output_missing:') >= 0) markQueueOutputMissing(filePath);
+    else showToast(localizeUiText('保存失败: ') + message);
   }
 }
 
-function openInFinder(filePath) {
-  // Reveal the compressed output if available, else the original
+async function openInFinder(filePath) {
+  // Reveal the compressed output if available, else the original.
   const item = queueItems.get(filePath);
   const result = item && item.result;
   const target = (result && result.outputPath) ? result.outputPath : filePath;
-  invoke('open_in_finder', { filePath: target });
+  if (!(await pathExists(target))) {
+    if (result && target === result.outputPath) markQueueOutputMissing(filePath);
+    else showToast(localizeUiText('文件不存在或已被移动'));
+    return;
+  }
+  try { await invoke('open_in_finder', { filePath: target }); }
+  catch (error) { showToast(localizeUiText('在访达中显示失败: ') + ((error && error.message) || error)); }
 }
 
 // 压缩后又用别的 App 改过图：恢复会覆盖那个新版本，必须先问。
@@ -3105,6 +3705,10 @@ function afterRestore(filePath, skipRefresh) {
 }
 
 async function restoreOriginal(filePath, force) {
+  if (restoreBlockedBySession()) {
+    showToast(restoreBlockedText());
+    return;
+  }
   var outcome;
   try {
     outcome = await invoke('restore_original', { filePath: filePath, force: !!force });
@@ -3118,17 +3722,28 @@ async function restoreOriginal(filePath, force) {
     return;
   }
   if (!outcome.success) {
-    showToast(outcome.error || localizeUiText('恢复失败'));
+    showToast(localizeBackendText(outcome.error) || localizeUiText('恢复失败'));
     return;
   }
   // 「这条记录到底是什么模式」以后端说的为准：缓存里的 result 可能已经不是这一批的了。
   var cachedItem = queueItems.get(filePath);
   var mode = outcome.outputMode
     || (cachedItem && cachedItem.result ? cachedItem.result.outputMode : null);
-  showToast(mode === 'replace'
-    ? localizeUiText('已恢复原图: ') + basename(filePath)
-    : localizeUiText('已删除这次压缩结果: ') + basename(filePath));
+  // §46 已经恢复过（或产物早已删除）不是失败，也不是"刚刚做了改动"。
+  showRestoreOutcome(outcome, outcome.alreadyRestored
+    ? localizeUiText('之前已经完成过这一步，这次没有再做改动')
+    : (mode === 'replace'
+      ? localizeUiText('已恢复原图: ') + basename(filePath)
+      : localizeUiText('已删除这次压缩结果: ') + basename(filePath)));
   afterRestore(outcome.filePath || filePath);
+}
+
+/// §48 恢复成功与"产物没删掉"的告警同时成立：一句 toast 里两件都说，
+/// 不把告警藏进日志，也不因为告警就把已经成功的恢复说成失败。
+function showRestoreOutcome(outcome, baseText) {
+  var text = baseText;
+  if (outcome && outcome.warning) text += '\n' + localizeBackendText(outcome.warning);
+  showToast(text);
 }
 
 function markQueueRowRestored(filePath) {
@@ -3140,8 +3755,35 @@ function markQueueRowRestored(filePath) {
   }
 }
 
+/// §78 §79 批量摘要只按计数说话：成功 / 失败 / 文件不存在 / 跳过分别报，
+/// 一个坏文件不会让整批看起来全失败，也不会被一句"完成"盖过去。
+/// 后端也有一句中文摘要，但界面语言是前端的事实，这里按同一份计数重新措辞。
+function bulkSummaryText(outcome, operation) {
+  if (!outcome) return '';
+  var isRestore = operation === 'restore';
+  var text = (isRestore ? localizeUiText('恢复完成 · 成功 ') : localizeUiText('导出完成 · 成功 '))
+    + (outcome.successCount || 0);
+  if (outcome.failedCount > 0) text += localizeUiText(' · 失败 ') + outcome.failedCount;
+  if (outcome.missingCount > 0) {
+    text += (isRestore ? localizeUiText(' · 记录不存在 ') : localizeUiText(' · 文件不存在 '))
+      + outcome.missingCount;
+  }
+  if (outcome.warningCount > 0) {
+    text += localizeUiText(' · 已恢复但压缩产物未能删除 ') + outcome.warningCount;
+  }
+  if (outcome.skippedCount > 0) {
+    text += localizeUiText(' · 跳过没有产物的项 ') + outcome.skippedCount;
+  }
+  return text;
+}
+
 async function restoreAllOriginals() {
-  var stash = queueResults();
+  if (restoreBlockedBySession()) {
+    showToast(restoreBlockedText());
+    return;
+  }
+  // §77 只有真的有产物的项才进批量恢复：跳过 / 失败 / 取消 / 已恢复都不在里面。
+  var stash = queueProducts();
   if (stash.length === 0) return;
   if (!confirm(localizeUiText('确定要恢复全部已压缩成功的原图吗？'))) return;
   var outcome;
@@ -3151,28 +3793,45 @@ async function restoreAllOriginals() {
     showToast(localizeUiText('恢复失败: ') + (error.message || error));
     return;
   }
-  showToast(outcome.message);
+  if (!outcome) return;
+  showToast(bulkSummaryText(outcome, 'restore'));
+  // 后端说哪些源文件真的被恢复了，就只标记哪些 —— 不按"提交过"猜。
   (outcome.restoredFiles || []).forEach(function(filePath) {
     afterRestore(filePath, true);
   });
   renderDetailPane();
   updateQueueSummary();
   emitCompareResultsChanged();
+  refreshHistoryIfOpen();
 }
 
 async function exportAll() {
-  var stash = queueResults();
+  var stash = queueProducts();
   if (stash.length === 0) return;
   const suffix = getResultOutputSuffix(stash[0]);
-  const count = await invoke('export_all', { results: stash, outputSuffix: suffix });
-  showToast(localizeUiText('已导出 ') + count + localizeUiText(' 个文件到原目录（') + suffix + localizeUiText(' 后缀）'));
+  var outcome;
+  try {
+    outcome = await invoke('export_all', { results: stash, outputSuffix: suffix });
+  } catch (error) {
+    showToast(localizeUiText('导出失败: ') + ((error && error.message) || error));
+    return;
+  }
+  if (!outcome) return;
+  showToast(bulkSummaryText(outcome, 'export'));
+  // §52 导出时后端重新看了磁盘：不在的产物同步标到行上，下一次点击不会再撞一次。
+  (outcome.items || []).forEach(function(row) {
+    if (!row.success && row.reasonCode === 'output_missing') markQueueOutputMissing(row.file, true);
+  });
 }
 
 function formatBytes(bytes) {
+  // NaN / undefined / 负数都不是体积：宁可写「?」也不许把 "NaNMB" 摆上界面。
+  if (!isFinite(bytes) || bytes < 0) return '?';
   if (bytes === 0) return '0B';
   if (bytes < 1024) return bytes.toFixed(1) + 'B';
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'KB';
-  return (bytes / (1024 * 1024)).toFixed(1) + 'MB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + 'MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + 'GB';
 }
 
 // ─── 页面导航（本轮 / 历史 / 设置）───────────────────────────────
@@ -3219,6 +3878,23 @@ var COMPRESSION_PAUSED = 'paused';
 var COMPRESSION_STOPPING = 'stopping';
 var COMPRESSION_STATES = [COMPRESSION_IDLE, COMPRESSION_RUNNING, COMPRESSION_PAUSED, COMPRESSION_STOPPING];
 
+/// §37 §38 三条入口（图片 / 视频 / 混合）共用同一个会话凭证，凭证抢不到时 Rust 回的
+/// 就是这句原话（src-tauri/src/commands.rs 的 SESSION_BUSY_MESSAGE，tests/compression-session.cjs
+/// 钉住两边一字不差）。前端只认这一句来区分"顶回来的是并发会话"和"这一轮压坏了"。
+var SESSION_BUSY_MESSAGE = 'Another media session is already running';
+
+function isSessionBusyError(error) {
+  return String((error && error.message) || error || '').indexOf(SESSION_BUSY_MESSAGE) >= 0;
+}
+
+/// 后端此刻确实占着会话时返回那个阶段，否则返回 null。
+/// 问不到就按空闲处理 —— 报不出真状态时宁可什么都不说。
+async function backendCompressionState() {
+  var state = null;
+  try { state = await invoke('get_compression_state'); } catch (e) {}
+  return COMPRESSION_STATES.indexOf(state) >= 0 && state !== COMPRESSION_IDLE ? state : null;
+}
+
 var compressionState = COMPRESSION_IDLE;
 // 下面两个是 compressionState 的派生镜像，供既有读点使用。
 // **只有 setCompressionState 能写它们**（tests/pause-resume.cjs 钉住这条），
@@ -3237,12 +3913,36 @@ function setCompressionState(next, silent) {
   return true;
 }
 
+/// §44 压缩会话与恢复是两条生命周期：会话期间恢复会把当前队列的一行改成
+/// restored（total 变小、分子不变），进度就从 5/10 跳成 5/9。所有恢复入口
+/// （行、详情列、全部恢复、历史页、视频）都从这里拒绝；按钮在渲染时同时禁用。
+/// 定义放在状态机旁边：判据只读 isCompressing，队列摘要 / 历史行 / 恢复入口共用。
+function restoreBlockedBySession() {
+  return !!isCompressing;
+}
+
+function restoreBlockedText() {
+  return localizeUiText('压缩进行中，暂不能恢复；请先停止或等这一轮结束');
+}
+
 /// 后端阶段变化的确认。批次的收尾由发起它的那次 invoke 负责，所以：
 /// - 非 idle 的状态只在本地确实有批次时采纳（否则是上一批的迟到事件）；
-/// - idle **永远不采纳**，绝不把一个刚起跑的新批次打回空闲。
+/// - idle 只在「界面这轮 running 是从后端收养来的孤儿会话」时才采纳：被
+///   SESSION_BUSY 顶回的那一轮没有属主 invoke 替它收尾，孤儿会话真结束时
+///   只剩一条 idle 事件，不收下界面就永久停在 running / STOPPING（主按钮、
+///   停止按钮全部失效）。正常批次（本地有属主）的迟到 idle 仍然拒收。
 function applyCompressionStateEvent(payload) {
   if (!payload || COMPRESSION_STATES.indexOf(payload.state) < 0) return;
-  if (payload.state === COMPRESSION_IDLE || !isCompressing) return;
+  if (!isCompressing) return;
+  if (payload.state === COMPRESSION_IDLE) {
+    if (executionSession || !adoptedOrphanBackendSession) return;
+    adoptedOrphanBackendSession = false;
+    setCompressionState(COMPRESSION_IDLE);
+    setPauseButtonVisible(false);
+    renderPauseControls();
+    renderFileQueue();
+    return;
+  }
   setCompressionState(payload.state);
 }
 
@@ -3392,10 +4092,19 @@ function renderStartButton() {
     return;
   }
   if (p.total > 0 && p.failed > 0) {
+    // 这一轮没有下一步可按了：按钮就只是"这轮结束了、有几个没成"的实况，
+    // 按下去不会发起任何会话，所以它必须是按不动的。重试在行上，导出在上方。
+    startBtn.disabled = true;
     btnText.innerHTML = iconMarkup('warning', true) + localizeUiText(' 处理完成 · ') + p.failed + localizeUiText(' 个失败');
     return;
   }
   if (p.total > 0) {
+    startBtn.disabled = true;
+    if (queueProducts().length === 0) {
+      // 和运行条同一句判据：这一轮什么都没落盘，按钮上就不许挂对勾说「压缩完成」。
+      btnText.innerHTML = iconMarkup('warning', true) + localizeUiText(' 未产出文件');
+      return;
+    }
     startBtn.classList.add('done');
     btnText.innerHTML = '<svg class="symbol-icon"><use href="#icon-check"/></svg> ' + processingActionText('done');
     return;
@@ -3469,20 +4178,32 @@ function canRestoreHistory(entry) {
   // recoveryAvailable = history.json 损坏后从备份目录重建出来的条目：
   // 压缩明细已经无从得知，但备份确实还在，原图仍然可以一键恢复。
   if (entry.status === 'recoveryAvailable') {
-    return !!entry.backupExists && !!entry.sourceExists;
+    return !!entry.backupExists;
   }
+  // §76 恢复只取决于「原图备份还在不在」：产物（覆盖模式下就是源位置）
+  // 被外部删掉之后，备份正是把它写回去的唯一依据，不能因此把恢复入口收走。
   return entry.status === 'compressed'
     && entry.outputMode === 'replace'
-    && !!entry.backupExists
-    && !!entry.sourceExists;
+    && !!entry.backupExists;
 }
 
 function historyStatusText(entry) {
-  if (entry.status === 'restored') {
-    return localizeUiText('已恢复') + (entry.restoredAt ? ' · ' + historyTime(entry.restoredAt) : '');
+  if (entry.status === 'restored' || entry.status === 'restoredWithWarning') {
+    var restored = localizeUiText('已恢复') + (entry.restoredAt ? ' · ' + historyTime(entry.restoredAt) : '');
+    // §48 原图已写回是事实，清理失败也要在这行上留痕，不能只算一次普通成功。
+    return entry.status === 'restoredWithWarning'
+      ? restored + ' · ' + localizeUiText('压缩结果未能删除')
+      : restored;
   }
   if (entry.status === 'recoveryAvailable') {
     return entry.backupExists ? localizeUiText('检测到可恢复的原图备份') : localizeUiText('原图备份已清理');
+  }
+  // §76 产物被外部删掉之后，这行必须先说"产物没了"，而不是照旧报「已压缩」。
+  // 备份还在 = 仍可恢复；备份也没了 = 记录不完整，恢复入口不许再出现。
+  if (!entry.outputExists) {
+    return entry.backupExists || (entry.outputMode !== 'replace' && entry.sourceExists)
+      ? localizeUiText('输出文件不存在')
+      : localizeUiText('记录不完整 · 原图备份已清理');
   }
   if (entry.outputMode !== 'replace') return localizeUiText('原图未覆盖');
   if (!entry.sourceExists) return localizeUiText('原文件位置不存在');
@@ -3499,23 +4220,49 @@ function historyRowActionDefs(entry) {
   // 「原图还摸得着吗」按模式判：覆盖模式只有备份算数（源位置此刻躺着的是压缩结果），
   // 后缀 / 目录模式的源文件本身就没被动过。
   var originalAvailable = isReplace ? !!entry.backupExists : !!entry.sourceExists;
+  // 只有仍处于「压缩结果」状态的记录才有产物：已恢复的记录里 outputPath 指向的
+  // 是写回后的原图；重建条目连压缩明细都没有。拿它们做另存为/对比是把原图冒充成产物。
+  var hasResult = !!entry.outputExists
+    && entry.status !== 'restored'
+    && entry.status !== 'restoredWithWarning'
+    && entry.status !== 'recoveryAvailable';
   var defs = [];
-  if (entry.outputExists) {
+  if (hasResult) {
     defs.push({ action: 'save', title: localizeUiText('另存为'), icon: 'save' });
   }
   var originalPath = isReplace ? (entry.backupExists ? entry.backupPath : null) : (entry.sourceExists ? entry.sourcePath : null);
   if (isVideo && originalPath) defs.push({ action: 'playOriginal', title: localizeUiText('播放原视频'), icon: 'play' });
-  if (isVideo && entry.outputExists) defs.push({ action: 'playOutput', title: localizeUiText('播放输出视频'), icon: 'play' });
+  if (isVideo && hasResult) defs.push({ action: 'playOutput', title: localizeUiText('播放输出视频'), icon: 'play' });
   // 两边都真实存在才比得出差别 —— 备份没了还挂一个「对比」，比的是那张压缩图和它自己。
-  if (entry.outputExists && originalAvailable) {
+  if (hasResult && originalAvailable) {
     defs.push({ action: 'compare', title: localizeUiText(isVideo ? '同帧对比' : '对比查看'), icon: 'compare' });
   }
   if (canRestoreHistory(entry)) {
-    defs.push({ action: 'restore', title: localizeUiText(isVideo ? '恢复原视频' : '恢复原图'), icon: 'restore' });
+    var restoreLabel = localizeUiText(isVideo ? '恢复原视频' : '恢复原图');
+    // §44：会话期间恢复会改写当前队列进度 —— 历史页也不许绕过去。
+    var restoreBlocked = restoreBlockedBySession();
+    defs.push({
+      action: 'restore',
+      title: restoreBlocked ? restoreBlockedText() : restoreLabel,
+      label: restoreLabel,
+      icon: 'restore',
+      disabled: restoreBlocked,
+    });
   } else if (entry.status === 'compressed' && !isReplace && entry.outputExists) {
-    defs.push({ action: 'deleteOutput', title: localizeUiText('删除这次压缩结果'), icon: 'trash' });
+    // 后缀 / 目录模式的「删除这次压缩结果」走的是同一个 restore_history_entry 服务。
+    var deleteBlocked = restoreBlockedBySession();
+    defs.push({
+      action: 'deleteOutput',
+      title: deleteBlocked ? restoreBlockedText() : localizeUiText('删除这次压缩结果'),
+      label: localizeUiText('删除这次压缩结果'),
+      icon: 'trash',
+      disabled: deleteBlocked,
+    });
   }
-  defs.push({ action: 'finder', title: localizeUiText('在访达中显示'), icon: 'finder' });
+  // §76 产物和源文件都不在时，「在访达中显示」只会打开一个空目录：它同样指向不存在的文件。
+  if (entry.outputExists || entry.sourceExists) {
+    defs.push({ action: 'finder', title: localizeUiText('在访达中显示'), icon: 'finder' });
+  }
   defs.push({ action: 'log', title: localizeUiText('复制日志'), icon: 'copy' });
   return defs;
 }
@@ -3527,7 +4274,8 @@ function historyRowActionDefs(entry) {
 function historyCompareResult(entry) {
   return {
     file: entry.sourcePath,
-    success: true,
+    // 这条记录能被打开，前提就是调用方刚核过「产物在盘上」（openCompareFromHistory）。
+    outcome: OUTCOME_COMMITTED,
     originalSize: entry.originalSize,
     compressedSize: entry.compressedSize,
     originalSizeFormatted: formatBytes(entry.originalSize),
@@ -3572,8 +4320,16 @@ async function saveHistoryOutput(entry) {
     refreshHistory();
     return;
   }
-  const savedPath = await invoke('save_file', { sourcePath: entry.outputPath });
-  if (savedPath) showToast(localizeUiText('已保存到: ') + basename(savedPath));
+  try {
+    const savedPath = await invoke('save_file', { sourcePath: entry.outputPath });
+    if (savedPath) showToast(localizeUiText('已保存到: ') + basename(savedPath));
+  } catch (error) {
+    const message = String((error && error.message) || error);
+    if (message.indexOf('output_missing:') >= 0) showToast(localizeUiText('压缩结果已不存在'));
+    else showToast(localizeUiText('保存失败: ') + message);
+    // 记录里的 outputExists 是上次读盘时的快照：失败后重新问一次，让这一行说实话。
+    refreshHistory();
+  }
 }
 
 /// 后缀 / 目录模式的对等「反悔」= 删掉这次生成的压缩结果。
@@ -3662,6 +4418,7 @@ function historyRow(entry) {
     btn.className = 'queue-action-btn';
     btn.type = 'button';
     btn.title = def.title;
+    btn.disabled = !!def.disabled;
     btn.setAttribute('aria-label', def.title);
     btn.dataset.historyAction = def.action;
     btn.innerHTML = iconMarkup(def.icon, true);
@@ -3720,8 +4477,7 @@ function renderHistoryDetail() {
 
   if (!isRecovery) {
     var hero = detailSection(body, 'detail-hero' + (entry.savings > 0 ? ' is-good' : ''));
-    detailText(hero, 'detail-hero-number',
-      (entry.savings >= 0 ? '-' : '+') + Math.abs(entry.savings).toFixed(1) + '%');
+    detailText(hero, 'detail-hero-number', savingsPercentText(entry));
     detailText(hero, 'detail-hero-note',
       formatBytes(entry.originalSize) + ' → ' + formatBytes(entry.compressedSize));
     var chain = detailSection(body, 'detail-chain');
@@ -3752,7 +4508,13 @@ function renderHistoryDetail() {
     detailCallout(body, '', localizeUiText('压缩结果已不在磁盘上（可能被手动删除）。'));
   }
   detailActions(body, historyRowActionDefs(entry).map(function(def) {
-    return { label: def.title, icon: def.icon, onClick: function() { runHistoryAction(entry, def.action); } };
+    return {
+      label: def.label || def.title,
+      icon: def.icon,
+      disabled: def.disabled,
+      title: def.disabled ? def.title : '',
+      onClick: function() { runHistoryAction(entry, def.action); },
+    };
   }));
   detailText(body, 'detail-path', entry.sourcePath);
 }
@@ -3767,8 +4529,18 @@ function runHistoryAction(entry, action) {
   if (action === 'restore') { restoreFromHistory(entry); return; }
   if (action === 'deleteOutput') { deleteHistoryOutput(entry); return; }
   if (action === 'log') { copyHistoryLog(entry); return; }
+  // §52 历史行上的路径同样是一段过去的事实：先问磁盘，再交给访达。
   var target = entry.outputExists ? (entry.outputPath || entry.sourcePath) : entry.sourcePath;
-  invoke('open_in_finder', { filePath: target }).catch(function() {});
+  pathExists(target).then(function(exists) {
+    if (!exists) {
+      showToast(localizeUiText('文件不存在或已被移动'));
+      refreshHistory();
+      return;
+    }
+    return invoke('open_in_finder', { filePath: target });
+  }).catch(function(error) {
+    showToast(localizeUiText('在访达中显示失败: ') + ((error && error.message) || error));
+  });
 }
 
 function renderHistory() {
@@ -3816,6 +4588,10 @@ function refreshHistoryIfOpen() {
 }
 
 async function restoreFromHistory(entry, force) {
+  if (restoreBlockedBySession()) {
+    showToast(restoreBlockedText());
+    return;
+  }
   var outcome;
   try {
     outcome = await invoke('restore_history_entry', { historyId: entry.id, force: !!force });
@@ -3829,14 +4605,16 @@ async function restoreFromHistory(entry, force) {
     return;
   }
   if (!outcome.success) {
-    showToast(outcome.error || localizeUiText('恢复失败'));
+    showToast(localizeBackendText(outcome.error) || localizeUiText('恢复失败'));
     return;
   }
   // 非 replace 模式的原图从没被盖过，后端做的是"删掉这次的压缩产物" ——
   // 报「已恢复原图」等于把一件没发生过的事说给用户听。
-  showToast(entry.outputMode === 'replace'
-    ? localizeUiText('已恢复原图: ') + basename(entry.fileName)
-    : localizeUiText('已删除这次压缩结果: ') + basename(entry.fileName));
+  showRestoreOutcome(outcome, outcome.alreadyRestored
+    ? localizeUiText('之前已经完成过这一步，这次没有再做改动')
+    : (entry.outputMode === 'replace'
+      ? localizeUiText('已恢复原图: ') + basename(entry.fileName)
+      : localizeUiText('已删除这次压缩结果: ') + basename(entry.fileName)));
   afterRestore(outcome.filePath || entry.sourcePath);
 }
 
@@ -4032,10 +4810,17 @@ async function saveCpuThreadLimit(limit) {
 // 本侧只负责组装载荷、打开/聚焦窗口，并把结果集变化推送给该窗口。
 
 function comparableResults() {
-  return queueResults().filter(function(r) { return r && r.success; });
+  // §50 对比窗口只比图片：视频有自己的同帧对比，混进来只会得到一次失败的读取。
+  // §52 已经被确认不在盘上的产物也不再送进去（后端开窗前还会再核一遍磁盘）。
+  return queueProducts().filter(function(result) {
+    var facts = mediaResultFacts(result);
+    return facts && facts.hasProduct && !facts.outputMissing && result.mediaKind !== 'video';
+  });
 }
 
-function openCompare(result) {
+async function openCompare(result) {
+  // 点中的那一项先复核磁盘；同批其它项由后端 sanitize_compare_payload 统一过滤。
+  if (result && result.file && !(await ensureOutputExists(result, result.file))) return;
   const okResults = comparableResults();
   if (!okResults.length) {
     showToast(localizeUiText('没有可对比的结果'));
@@ -4069,19 +4854,33 @@ listen('compare-recompressed', function(event) {
   if (!item || !item.result) return;
   const existing = item.result;
   item.result = Object.assign({}, existing, updated, {
-    // compress_single writes a temporary preview. Keep the real output
-    // and backup metadata so Restore still targets the original result.
+    // compress_single writes a temporary preview. Keep the real output and
+    // backup metadata so Restore still targets the original result —
+    // and keep the official numbers too: the preview's size/savings/outcome
+    // describe a throwaway temp file, not the committed product. Merging
+    // them in would put preview numbers into the queue row and totals.
     outputPath: existing.outputPath,
     backupPath: existing.backupPath,
     outputMode: existing.outputMode,
+    outcome: existing.outcome,
+    reasonCode: existing.reasonCode,
+    savings: existing.savings,
+    compressedSize: existing.compressedSize,
+    outputBytes: existing.outputBytes,
   });
+  paintQueueRow(payload.filePath);
 });
 
 listen('compare-restored', function(event) {
   const filePath = event.payload && event.payload.filePath;
   if (!filePath) return;
+  // 后缀/目录模式恢复的其实是「删掉这次产物」，措辞要和做的事一致。
+  const item = queueItems.get(filePath);
+  const outputMode = item && item.result && item.result.outputMode;
   afterRestore(filePath);
-  showToast(localizeUiText('已恢复原图: ') + basename(filePath));
+  showToast(outputMode === 'replace' || !outputMode
+    ? localizeUiText('已恢复原图: ') + basename(filePath)
+    : localizeUiText('已删除这次压缩结果: ') + basename(filePath));
 });
 
 document.addEventListener('keydown', (e) => {
@@ -4366,6 +5165,7 @@ function resetSettings() {
 
   renderVideoCapabilities();
   loadVideoCapabilities();
+  loadImageCapabilities();
   // 队列摘要里的「CPU 4/10」需要在进入设置页之前就拿到，所以启动即检测一次。
   loadCpuSetting().then(function() { updateQueueSummary(); }).catch(function() {});
   // 启动一次画齐：chips、目标行、高级列、输出方式、运行条、详情列。

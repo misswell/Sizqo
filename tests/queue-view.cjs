@@ -9,9 +9,12 @@ const states = ['done', 'failed', 'done', 'pending'];
 const queueItems = new Map(files.map((file, i) => [file, {
   path: file, state: states[i],
   result: [
-    {file: files[0], success: true, originalSize: 100, compressedSize: 90, savings: 10},
-    {file: files[1], success: false, originalSize: 2000},
-    {file: files[2], success: true, originalSize: 300, compressedSize: 30, savings: 90},
+    {file: files[0], originalSize: 100, compressedSize: 90, savings: 10, outputPath: '/image10_compressed.png', outcome: 'committed'},
+    {file: files[1], originalSize: 2000, outcome: 'failed', reasonCode: 'source_read_failed'},
+    // 后端判定"没有值得提交的收益"（§6.2）：引擎压出了字节，但一个文件都没落盘。
+    // 这一行在"压缩后大小/压缩率"上没有读数，不许凭那串从没写出去的数字排到最前面。
+    {file: files[2], originalSize: 300, compressedSize: 30, savings: 90, outputPath: null,
+      outcome: 'skipped_no_benefit', reasonCode: 'output_larger_than_source'},
     null,
   ][i],
   originalSize: [100, 2000, 300, undefined][i],
@@ -48,8 +51,9 @@ sort('name'); assert.deepEqual(order(), [files[2],files[1],files[0],files[3]]);
 sort('name',true); assert.deepEqual(order(), [files[3],files[0],files[1],files[2]]);
 sort('original'); assert.deepEqual(order(), [files[0],files[2],files[1],files[3]]);
 sort('original',true); assert.deepEqual(order(), [files[1],files[2],files[0],files[3]]);
-sort('compressed'); assert.deepEqual(order(), [files[2],files[0],files[1],files[3]]);
-sort('ratio',true); assert.deepEqual(order(), [files[2],files[0],files[1],files[3]]);
+// files[2] 那个 90% 从没落盘，所以它不占首位；没读数的一律沉到最后（仍按导入次序）。
+sort('compressed'); assert.deepEqual(order(), [files[0], files[1], files[2], files[3]]);
+sort('ratio',true); assert.deepEqual(order(), [files[0], files[1], files[2], files[3]]);
 sort('status'); assert.deepEqual(order(), [files[1],files[3],files[0],files[2]]);
 controls.queueFailedOnly.checked = true;
 context.applyQueueView(); assert.deepEqual(order(), [files[1]]);

@@ -45,12 +45,13 @@ func sameFile(_ a: String, _ b: String) -> Bool {
 }
 
 /// 落盘到"崩溃后还在"：写完立刻 fsync，数据先于 rename 生效。
-func syncFile(at path: String) {
+/// false = open / fsync 没成功。调用方必须当成"没落盘"，不许照常改名。
+@discardableResult
+func syncFile(at path: String) -> Bool {
     let fd = Darwin.open(path, O_RDONLY)
-    if fd >= 0 {
-        _ = Darwin.fsync(fd)
-        Darwin.close(fd)
-    }
+    guard fd >= 0 else { return false }
+    defer { Darwin.close(fd) }
+    return Darwin.fsync(fd) == 0
 }
 
 /// 覆盖式复制：FileManager.copyItem 目标存在即失败，此处对齐 Rust fs::copy 的覆盖语义。
@@ -63,21 +64,31 @@ func copyFileOverwriting(from src: String, to dst: String) -> Bool {
     return (try? fm.copyItem(atPath: src, toPath: dst)) != nil
 }
 
-/// 截断重写会让崩溃留下半个 history.json；先写 tmp、再 rename。
-func writeAtomic(path: String, data: Data) -> Bool {
-    let parent = (path as NSString).deletingLastPathComponent
-    try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
-    let tmp = "\(path).tmp-\(SizqoClock.nowNanos)"
-    do {
-        try data.write(to: URL(fileURLWithPath: tmp), options: .atomic)
-    } catch {
+/// 另存为到用户挑的位置：同目录临时文件 → fsync → 原子改名。
+/// 目标已存在时也只会在完整复制之后才被替换 —— 复制失败既不留下半个文件，
+/// 也不先把用户原来的文件删掉（`copyFileOverwriting` 那条路只给全新的占位名用）。
+func atomicCopyFile(from src: String, to dst: String) -> Bool {
+    let parent = (dst as NSString).deletingLastPathComponent
+    guard let tmp = StagedTemp.claim(in: parent, prefix: ".sizqo-save") else { return false }
+    guard copyFileOverwriting(from: src, to: tmp), syncFile(at: tmp) else {
+        try? FileManager.default.removeItem(atPath: tmp)
         return false
     }
-    if Darwin.rename(tmp, path) != 0 {
+    guard Darwin.rename(tmp, dst) == 0 else {
         try? FileManager.default.removeItem(atPath: tmp)
         return false
     }
     return true
+}
+
+/// 截断重写会让崩溃留下半个 history.json；先写 tmp、再 rename。
+///
+/// 暂存实现与压缩结果共用一份（随机名 + fsync + 原子改名，§30）：历史文件、设置、
+/// 备份来历都从这一处走，谁都不再自己拼时间戳。
+func writeAtomic(path: String, data: Data) -> Bool {
+    let parent = (path as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
+    return StagedWrite.write(target: path, bytes: data) != nil
 }
 
 // MARK: - 稳定哈希
@@ -197,7 +208,11 @@ struct HistoryEntry: Codable, Identifiable {
         outType = try box.decodeIfPresent(String.self, forKey: .outType) ?? ""
         algorithm = try box.decodeIfPresent(String.self, forKey: .algorithm) ?? ""
         backupPath = try box.decodeIfPresent(String.self, forKey: .backupPath)
-        status = try box.decodeIfPresent(HistoryStatus.self, forKey: .status) ?? .compressed
+        // 前向兼容：未来版本新增的 status 取值不许让旧版把整份 history.json 判成
+        // 损坏（那会走隔离重建，suffix/folder 模式的记录就无处可回）。认不出的
+        // raw value 按 compressed 兜底 —— 条目还在，用户还能恢复。
+        let statusRaw = try box.decodeIfPresent(String.self, forKey: .status)
+        status = statusRaw.flatMap(HistoryStatus.init(rawValue:)) ?? .compressed
         restoredAt = try box.decodeIfPresent(Int64.self, forKey: .restoredAt)
         outputModifiedAt = try box.decodeIfPresent(Int64.self, forKey: .outputModifiedAt)
         sourceExists = try box.decodeIfPresent(Bool.self, forKey: .sourceExists) ?? true
@@ -328,6 +343,14 @@ struct RestoreOutcome {
     let error: String?
     /// 一起被标记为「已恢复」的历史记录：同一张图重压多次会共享那份真正原图。
     let historyIds: [String]
+    /// 原图已经写回，但压缩结果没能清理。success 仍为 true，告警必须给用户看（§48）。
+    let warning: String?
+}
+
+/// 恢复的完整结果。`restore` 返回它，是为了让"恢复成功但清理失败"不被吞成普通成功。
+struct RestoreResult {
+    let historyIds: [String]
+    let warning: String?
 }
 
 // MARK: - 历史存储
@@ -641,6 +664,14 @@ final class HistoryStore: @unchecked Sendable {
     /// 只认得出"谁的备份"靠的就是这份 meta。缺一半等于没备份 —— 返回 nil，调用方
     /// 必须放弃这次覆盖（宁可压缩失败，也不能出现"覆盖了但没原图"）。
     func ensureBackup(for source: String) -> String? {
+        ensureBackupVerified(for: source, currentSha256: nil)
+    }
+
+    /// 与 [ensureBackup(for:)] 同一入口，但复用旧备份前先核对「这次要盖掉的原图」
+    /// 的指纹：两轮压缩之间用户改过原图时，旧备份已经是更早一轮的字节，复用它
+    /// 会让「恢复原图」静默回滚掉用户后来的编辑 —— 指纹对不上就往后挪一个槽位
+    /// 给当前字节另写一份；旧备份原样留给引用它的历史条目，绝不覆盖。
+    func ensureBackupVerified(for source: String, currentSha256: String?) -> String? {
         lock.lock(); defer { lock.unlock() }
         let canonical = canonicalPath(source)
         guard fileExists(at: canonical) else { return nil }
@@ -652,9 +683,13 @@ final class HistoryStore: @unchecked Sendable {
             let key = index == 0 ? baseKey : "\(baseKey)-\(index)"
             let dir = backupDir(key)
             if let meta = readMeta(key) {
-                // 命中同一源路径：复用，不重新拷贝。
+                // 命中同一源路径：备份的字节仍是这一次要盖掉的那份才复用。
                 if meta.sourcePath == canonical, let existing = existingBackupFile(key) {
-                    return existing
+                    if backupMatchesCurrent(canonical, meta: meta, currentSha256: currentSha256)
+                        || replacedBytesAreOwnProduct(canonical) {
+                        return existing
+                    }
+                    continue
                 }
                 // 备份文件被外部删掉了：重新写一份真正原图（下方继续）。
                 // 哈希撞上了别的文件则往后挪一个槽位。
@@ -666,24 +701,44 @@ final class HistoryStore: @unchecked Sendable {
             guard (try? FileManager.default.createDirectory(
                 atPath: dir, withIntermediateDirectories: true)) != nil else { return nil }
             let backupPath = (dir as NSString).appendingPathComponent("original.\(extensionName)")
-            // 先写临时名再 rename：崩溃不许留下半个 original.xxx 冒充有效备份。
-            let staged = (dir as NSString).appendingPathComponent(".original.\(extensionName).tmp")
-            guard copyFileOverwriting(from: canonical, to: staged) else {
+            // §27 快照的两份指纹：源文件的先取，副本的后取，中间夹着一次复制。
+            // 对不上就是复制过程把字节改坏了 —— 那份东西不能当原图用，也不许留下冒充备份。
+            guard case .success(let sourceSha256) = sha256OfFile(canonical) else {
                 _ = removeDirectory(dir)
                 return nil
             }
-            syncFile(at: staged)
+            // 先写临时名再 rename：崩溃不许留下半个 original.xxx 冒充有效备份。
+            // 临时名随机（§30）：两张图同时首次备份时，固定名会互相把对方的半成品盖掉。
+            guard let staged = StagedTemp.claim(in: dir, prefix: ".original"),
+                  copyFileOverwriting(from: canonical, to: staged) else {
+                _ = removeDirectory(dir)
+                return nil
+            }
+            guard syncFile(at: staged) else {
+                _ = removeDirectory(dir)
+                return nil
+            }
             guard Darwin.rename(staged, backupPath) == 0 else {
                 _ = removeDirectory(dir)
                 return nil
             }
+            guard case .success(let backupSha256) = sha256OfFile(backupPath) else {
+                _ = removeDirectory(dir)
+                return nil
+            }
+            guard backupSha256 == sourceSha256 else {
+                _ = removeDirectory(dir)
+                return nil
+            }
             let meta = BackupMeta(
-                version: 2,
+                version: 3,
                 sourcePath: canonical,
                 createdAt: SizqoClock.nowMillis,
                 originalSize: max(0, fileLength(backupPath)),
                 originalModifiedAt: fileMtimeMillis(canonical),
-                originalExtension: extensionName
+                originalExtension: extensionName,
+                sourceSha256: sourceSha256,
+                backupSha256: backupSha256
             )
             guard let data = try? JSONEncoder().encode(meta),
                   writeAtomic(
@@ -702,6 +757,63 @@ final class HistoryStore: @unchecked Sendable {
             return backupPath
         }
         return nil
+    }
+
+    /// 复用一份旧备份前回答：它记录的字节，还是不是这次要盖掉的那份原图？
+    ///
+    /// - 有内容指纹（编码前就由 baseline 算好）按指纹判，最严格；
+    /// - 没有指纹退到「大小 + mtime」：备份时记录的就是源文件这两项，真实改动
+    ///   至少会动其中一项；
+    /// - 老备份（version < 3）连指纹都没存：证明不了它过期就沿用旧行为复用，
+    ///   不把升级用户的既有备份一律判死刑。
+    private func backupMatchesCurrent(_ source: String, meta: BackupMeta, currentSha256: String?) -> Bool {
+        if let current = currentSha256 {
+            guard let recorded = meta.sourceSha256 else { return true }
+            return recorded == current
+        }
+        return fileLength(source) == meta.originalSize
+            && fileMtimeMillis(source) == meta.originalModifiedAt
+    }
+
+    /// 这次要盖掉的字节是不是 Sizqo 自己上一轮的产物（历史条目里记着它的大小 + mtime）。
+    ///
+    /// 是 → 复用最早的备份：同一张图连压多次，「恢复原图」永远给真正的原图
+    /// （既有语义，不许把上一版压缩结果当成"原图"存进新槽位）。
+    /// 不是 → 用户在两轮之间自己改过文件：那份字节必须有属于自己的一份快照，
+    /// 否则 replace 一提交它就再也找不回来了。
+    ///
+    /// 调用方已持有 `lock`：这里只读原始条目，不得再进任何加锁入口（NSLock 不可重入）。
+    private func replacedBytesAreOwnProduct(_ canonical: String) -> Bool {
+        let size = fileLength(canonical)
+        let mtime = fileMtimeMillis(canonical)
+        return readRaw().contains { entry in
+            entry.sourcePath == canonical && entry.compressedSize == size && entry.outputModifiedAt == mtime
+        }
+    }
+
+    /// 覆盖之后、记历史之前最后一次确认：这份备份里的字节真是这次被盖掉的原图吗（§27）。
+    ///
+    /// 恢复入口的全部意义是"点下去拿得回原图"。版本 3 的来历记录存了源文件与副本两份
+    /// 指纹，这里重算一次副本指纹：既能查出副本被谁换过，也能查出当年复制时就对不上。
+    ///
+    /// 返回 nil = 可信；返回字符串 = 这份东西不能当原图用，调用方必须放弃这次覆盖。
+    /// 它**不删备份**：留着才能让用户自己看清是谁动过。老记录（没有指纹）按
+    /// "无法证明"处理 —— 沿用旧行为，不把升级用户的既有备份一律判成死刑。
+    func backupIsFaithful(_ backup: String) -> String? {
+        guard fileExists(at: backup) else { return "原图备份已经不在磁盘上了" }
+        let key = ((backup as NSString).deletingLastPathComponent as NSString).lastPathComponent
+        guard let meta = readMeta(key),
+              let sourceSha256 = meta.sourceSha256, let recordedSha256 = meta.backupSha256
+        else { return nil }
+        if sourceSha256 != recordedSha256 {
+            return "备份的来历记录自相矛盾（源 \(sourceSha256) ≠ 副本 \(recordedSha256)）"
+        }
+        switch sha256OfFile(backup) {
+        case .success(let actual) where actual == recordedSha256: return nil
+        case .success(let actual):
+            return "备份文件已经不是当初那份字节（\(recordedSha256) → \(actual)）"
+        case .failure(let error): return "读不出备份的指纹：\(error.message)"
+        }
     }
 
     // ─── 退出清理（唯一的清理时机）───────────────────────────────
@@ -848,7 +960,9 @@ final class HistoryStore: @unchecked Sendable {
 
     /// 恢复前的安全检查：压缩结果被外部改过就不要静默覆盖。
     static func hasConflict(_ entry: HistoryEntry) -> Bool {
-        guard entry.outputMode == "replace" else { return false }
+        // replace：产物就是源文件，冲突 = 恢复会覆盖用户改过的字节；
+        // 后缀/目录：撤销 = 删产物，冲突 = 产物被用户编辑过，删掉等于丢编辑。
+        // 两种模式用同一份指纹判据，逻辑一致。
         let target = entry.outputPath ?? entry.sourcePath
         guard fileExists(at: target) else { return false }
         if fileLength(target) != entry.compressedSize { return true }
@@ -862,14 +976,19 @@ final class HistoryStore: @unchecked Sendable {
     /// `restore` 和事务回滚共用这一个实现 —— 恢复原图这件事绝不允许有两套写法。
     static func writeBackupBack(to target: String, backup: String) throws {
         let parent = (target as NSString).deletingLastPathComponent
-        let tmp = (parent as NSString).appendingPathComponent(
-            ".sizqo-restore-\(SizqoClock.nowNanos).tmp"
-        )
+        // §30 随机临时名：恢复全部 / 事务回滚可能同时在多个文件上写回原图。
+        guard let tmp = StagedTemp.claim(in: parent, prefix: ".sizqo-restore") else {
+            throw RestoreError.io("无法写入恢复临时文件")
+        }
         guard copyFileOverwriting(from: backup, to: tmp) else {
+            try? FileManager.default.removeItem(atPath: tmp)
             throw RestoreError.io("无法写入恢复临时文件")
         }
         // 写回原图这一步不能只留在内核缓存里：崩溃后用户看到的必须真是原图。
-        syncFile(at: tmp)
+        guard syncFile(at: tmp) else {
+            try? FileManager.default.removeItem(atPath: tmp)
+            throw RestoreError.io("恢复临时文件未能落盘")
+        }
         if Darwin.rename(tmp, target) != 0 {
             // 覆盖到一半失败时保留原目标文件，只清掉临时文件。
             try? FileManager.default.removeItem(atPath: tmp)
@@ -879,10 +998,17 @@ final class HistoryStore: @unchecked Sendable {
 
     /// 跨格式 replace（PNG → JPG）时压缩结果是个新文件，恢复后不该留下孤儿。
     /// 同格式 replace 的输出就是源文件本身，绝不许删。
-    private static func removeGeneratedOutput(_ entry: HistoryEntry) {
-        guard let output = entry.outputPath else { return }
-        guard !sameFile(output, entry.sourcePath) else { return }
-        try? FileManager.default.removeItem(atPath: output)
+    /// 返回非 nil = 原图已经写回，但产物没能删掉：恢复算成功，清理失败必须让用户看见。
+    private static func removeGeneratedOutput(_ entry: HistoryEntry) -> String? {
+        guard let output = entry.outputPath else { return nil }
+        guard !sameFile(output, entry.sourcePath) else { return nil }
+        guard fileExists(at: output) else { return nil }
+        do {
+            try FileManager.default.removeItem(atPath: output)
+            return nil
+        } catch {
+            return "原图已恢复，但压缩结果未能删除：\(output)"
+        }
     }
 
     /// 统一恢复入口：主队列 / 历史页 / 恢复全部 都走这里，
@@ -892,10 +1018,12 @@ final class HistoryStore: @unchecked Sendable {
     /// 反过来（先删备份再写历史）一旦历史写失败，历史会显示「已压缩」而备份已经没了 ——
     /// 用户看到一条永远恢复不了的记录。现在最坏只留下一个没人引用的孤儿目录。
     @discardableResult
-    func restore(entry: HistoryEntry, force: Bool) throws -> [String] {
+    func restore(entry: HistoryEntry, force: Bool) throws -> RestoreResult {
         guard entry.status != .restored else { throw RestoreError.notRestorable }
         guard entry.outputMode == "replace" else {
             // 后缀/目录模式原图从未被改动：撤销 = 删掉这次生成的压缩结果。
+            // 产物被用户改过时先要 force：与 replace 模式同一份判据，不许静默丢编辑。
+            if !force && Self.hasConflict(entry) { throw RestoreError.conflict }
             if let output = entry.outputPath, fileExists(at: output) {
                 do {
                     try FileManager.default.removeItem(atPath: output)
@@ -904,7 +1032,7 @@ final class HistoryStore: @unchecked Sendable {
                 }
             }
             try removeIds([entry.id])
-            return [entry.id]
+            return RestoreResult(historyIds: [entry.id], warning: nil)
         }
         if !force && Self.hasConflict(entry) { throw RestoreError.conflict }
         guard let backup = entry.backupPath, fileExists(at: backup) else {
@@ -917,22 +1045,23 @@ final class HistoryStore: @unchecked Sendable {
             // 文件已经回到原图，但状态没落盘：备份必须留着，用户重试即可收敛。
             throw RestoreError.io("文件已恢复，但历史记录状态保存失败，原图备份已保留")
         }
-        Self.removeGeneratedOutput(entry)
+        let warning = Self.removeGeneratedOutput(entry)
         if let dir = backupDirectory {
             // 备份在 App Support 内，不需要任何沙盒授权。删不掉只是孤儿，下次退出扫。
             _ = removeDirectory(dir)
         }
-        return ids
+        return RestoreResult(historyIds: ids, warning: warning)
     }
 
     /// restore 的对外门面：把异常翻成与 Tauri 线一致的 RestoreOutcome，
     /// 调用方只需要判断 success / conflict。
     func restoreOutcome(entry: HistoryEntry, force: Bool) -> RestoreOutcome {
         do {
-            let ids = try restore(entry: entry, force: force)
+            let result = try restore(entry: entry, force: force)
             return RestoreOutcome(
                 success: true, conflict: false,
-                filePath: entry.sourcePath, error: nil, historyIds: ids
+                filePath: entry.sourcePath, error: nil,
+                historyIds: result.historyIds, warning: result.warning
             )
         } catch let error as RestoreError {
             return RestoreOutcome(
@@ -940,12 +1069,14 @@ final class HistoryStore: @unchecked Sendable {
                 conflict: error.isConflict,
                 filePath: entry.sourcePath,
                 error: error.detail,
-                historyIds: []
+                historyIds: [],
+                warning: nil
             )
         } catch {
             return RestoreOutcome(
                 success: false, conflict: false, filePath: entry.sourcePath,
-                error: RestoreError.io(error.localizedDescription).detail, historyIds: []
+                error: RestoreError.io(error.localizedDescription).detail, historyIds: [],
+                warning: nil
             )
         }
     }
@@ -959,7 +1090,8 @@ extension RestoreError {
 }
 
 private struct BackupMeta: Codable {
-    /// 1 = 只有 sourcePath/createdAt（老版本）；2 = 带大小、mtime、扩展名。
+    /// 1 = 只有 sourcePath/createdAt（老版本）；2 = 带大小、mtime、扩展名；
+    /// 3 = §27 的快照指纹。
     /// 老文件必须还能读：`history.json` 损坏时就靠这份记录重建恢复入口。
     var version: Int = 2
     var sourcePath: String
@@ -967,6 +1099,14 @@ private struct BackupMeta: Codable {
     var originalSize: Int64 = 0
     var originalModifiedAt: Int64? = nil
     var originalExtension: String = ""
+    /// §27 备份本身就是"本次任务开始时的原始文件快照"：
+    /// 快照当时源文件的指纹 + 快照文件自己的指纹。
+    ///
+    /// 两者必须相等，不等就是复制过程把字节改坏了，这份东西不配叫备份。
+    /// 老记录（version < 3）里是 nil：校验时**跳过**，绝不因为"证明不了"
+    /// 就拒绝把用户的原图写回去。
+    var sourceSha256: String? = nil
+    var backupSha256: String? = nil
 }
 
 // MARK: - 历史页每一行能做什么
@@ -1028,10 +1168,13 @@ func historyRowActions(_ entry: HistoryEntry) -> [HistoryRowAction] {
     let originalAvailable = entry.outputMode == "replace"
         ? entry.backupExists
         : entry.sourceExists
-    if entry.outputExists { actions.append(.saveAs) }
+    // 只有仍处于压缩结果状态的记录才有产物：已恢复记录的 outputPath 指向的是
+    // 写回后的原图；重建条目连压缩明细都没有。拿它们做另存为 / 对比是把原图冒充成产物。
+    let hasResult = entry.outputExists && (entry.status == .compressed || entry.status == .missing)
+    if hasResult { actions.append(.saveAs) }
     // 两边都是真实存在、且不是同一个文件才比得出差别 —— 备份没了还挂一个「对比」，
     // 比的是那张压缩图和它自己。
-    if entry.outputExists && originalAvailable { actions.append(.compare) }
+    if hasResult && originalAvailable { actions.append(.compare) }
     if historyCanRestore(entry) {
         actions.append(.restore)
     } else if entry.status == .compressed && entry.outputMode != "replace" && entry.outputExists {

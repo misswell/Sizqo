@@ -651,10 +651,10 @@ struct IntentBarView: View {
                     set: { appState.setOutputFormat($0) }
                 )) {
                     Text("保持原格式").tag(OutputFormat.original)
-                    Text("JPEG").tag(OutputFormat.jpg)
-                    Text("PNG").tag(OutputFormat.png)
-                    Text("WebP").tag(OutputFormat.webp)
-                    Text("AVIF").tag(OutputFormat.avif)
+                    // §22：选项来自能力表，少了哪个编码器就不出现哪一项。
+                    ForEach(OutputFormat.advancedTargets, id: \.self) { format in
+                        Text(format.label).tag(format)
+                    }
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
@@ -710,9 +710,9 @@ struct IntentBarView: View {
                     .frame(width: 56, alignment: .leading)
                 Picker("", selection: $appState.options.outputFormat) {
                     Text("原格式").tag(OutputFormat.original)
-                    Text("JPEG").tag(OutputFormat.jpg)
-                    Text("PNG").tag(OutputFormat.png)
-                    Text("HEIF").tag(OutputFormat.heic)
+                    ForEach(OutputFormat.systemTargets, id: \.self) { format in
+                        Text(format.label).tag(format)
+                    }
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
@@ -859,9 +859,10 @@ struct FileRowView: View {
                     SizqoIcon(name: SizqoIconName.warning, size: 10, color: .yellow)
                         .help((item.result?.warnings ?? []).joined(separator: "\n"))
                 }
-                if let err = item.result?.error, !err.isEmpty {
+                // §70 后端原话只进这里和日志：句子由契约按 reasonCode 选，原话跟在后面备查。
+                if let why = item.result?.contractDetailText, !why.isEmpty {
                     SizqoIcon(name: SizqoIconName.warning, size: 10, color: .yellow)
-                        .help(err)
+                        .help(why)
                 }
             }
             .frame(minWidth: 44, alignment: .trailing)
@@ -873,7 +874,9 @@ struct FileRowView: View {
                     SizqoIcon(name: action.icon, size: 13)
                 }
                 .buttonStyle(RowActionButtonStyle())
-                .help(action.title)
+                .disabled(action.disabled)
+                .opacity(action.disabled ? 0.45 : 1)
+                .help(action.blockedReason ?? action.title)
             }
         }
         .padding(.horizontal, 8)
@@ -911,7 +914,12 @@ struct FileRowView: View {
                     .scaleEffect(0.5)
                     .frame(width: 24, height: 24)
             case .done:
-                SizqoIcon(name: SizqoIconName.check, size: 13, color: .green)
+                // §69 图形与措辞同源：没产物或产物没达标都挂三角，绿勾只留给真有产物的完成。
+                if item.result?.contractShowsWarning == true {
+                    SizqoIcon(name: SizqoIconName.warning, size: 13, color: .yellow)
+                } else {
+                    SizqoIcon(name: SizqoIconName.check, size: 13, color: .green)
+                }
             case .failed:
                 SizqoIcon(name: SizqoIconName.close, size: 13, color: .red)
             case .removed:
@@ -923,16 +931,19 @@ struct FileRowView: View {
     }
 
     private var sizeText: String {
-        if item.status == .done, let r = item.result {
+        if item.status == .done, let r = item.result, r.hasProduct {
             return "\(r.originalSizeFormatted) → \(r.compressedSizeFormatted)"
         }
+        // 没产物时报的是原图大小 —— 那串从没写出去的数字不是这一行的事实。
         return CompressResult.formatBytesJS(item.fileSize)
     }
 
     private var rowBackground: Color {
         switch item.status {
         case .running: return SizqoPalette.accentSoft
-        case .done: return SizqoPalette.success.opacity(0.08)
+        // §69 「有这一项但没产物」不是好消息，不许铺成功的底色。
+        case .done: return item.result?.contractShowsWarning == true
+            ? SizqoPalette.caution.opacity(0.10) : SizqoPalette.success.opacity(0.08)
         case .failed: return SizqoPalette.danger.opacity(0.08)
         default: return selected ? SizqoPalette.emphasisSoft : Color.clear
         }
@@ -955,9 +966,13 @@ struct FileRowView: View {
             if appState.compressionPaused || appState.compressionStopping { return "收尾中…" }
             return appState.options.processingMode == .system ? "转换中…" : "压缩中…"
         case .done:
-            if let r = item.result { return r.savingsSignedText }
-            return "完成"
-        case .failed: return "失败"
+            guard let r = item.result else { return "完成" }
+            // §70 「已完成」由绿色对勾表达，行上留降幅那个读数；结论不是"完成"的
+            // （已跳过 / 未达目标 / 未产出文件）必须把结论词本身写出来。
+            let status = r.contractStatusText
+            if status == "已完成" { return r.savingsSignedText }
+            return status
+        case .failed: return item.result?.contractStatusText ?? "处理失败"
         case .removed: return "已移除"
         case .restored: return "已恢复"
         }
@@ -967,7 +982,8 @@ struct FileRowView: View {
         switch item.status {
         case .pending, .removed, .restored: return SizqoPalette.tertiaryText
         case .running: return .accentColor
-        case .done: return .green
+        // §69 红色只留给真的坏了；三角留给"这一项没有产物 / 产物没达标"。
+        case .done: return item.result?.contractShowsWarning == true ? .yellow : .green
         case .failed: return .red
         }
     }
@@ -979,6 +995,8 @@ struct ItemAction: Identifiable {
     let id = UUID()
     let icon: String
     let title: String
+    var disabled = false
+    var blockedReason: String? = nil
     let run: () -> Void
 }
 
@@ -992,22 +1010,45 @@ enum ItemActions {
             out.append(ItemAction(icon: SizqoIconName.close, title: "移除",
                                   run: { appState.removeItem(path: item.path) }))
         case .done:
-            if let r = item.result, r.success {
-                out.append(ItemAction(icon: SizqoIconName.save, title: "另存为",
-                                      run: { appState.saveResult(path: item.path) }))
-                out.append(ItemAction(icon: SizqoIconName.compare, title: "对比查看",
-                                      run: {
-                    CompareWindowController.show(
-                        appState: appState, originalPath: item.path, result: r,
-                        allResults: appState.comparableResults)
-                }))
-                out.append(ItemAction(icon: SizqoIconName.restore, title: "恢复原图",
-                                      run: { appState.restoreFile(path: item.path) }))
-                out.append(ItemAction(icon: SizqoIconName.finder, title: "在访达中显示",
-                                      run: { appState.openInFinder(path: r.outputPath ?? item.path) }))
+            if let r = item.result {
+                // §8 §68 按钮集只由结果契约回答一次：没有产物 = 指向那个文件的按钮一个都不许出现，
+                // 而不是"点了再报错"。以前这里读 r.success，于是"没落盘的成功"照样给
+                // 另存为 / 对比 / 恢复，按下去换来一句「找不到这条历史记录」。
+                let caps = r.capabilities
+                if caps.save {
+                    out.append(ItemAction(icon: SizqoIconName.save, title: "另存为",
+                                          run: { appState.saveResult(path: item.path) }))
+                }
+                if caps.compare {
+                    out.append(ItemAction(icon: SizqoIconName.compare, title: "对比查看",
+                                          run: {
+                        CompareWindowController.show(
+                            appState: appState, originalPath: item.path, result: r,
+                            allResults: appState.comparableResults)
+                    }))
+                }
+                if caps.restore {
+                    // §44 会话期间只禁用不隐藏：按钮消失会让人以为这项没有原图可恢复，
+                    // 说明写在 help 里，告诉用户这是时间问题。
+                    let blocked = appState.restoreBlockedBySession
+                    out.append(ItemAction(icon: SizqoIconName.restore, title: "恢复原图",
+                                          disabled: blocked,
+                                          blockedReason: blocked ? appState.restoreBlockedText : nil,
+                                          run: { appState.restoreFile(path: item.path) }))
+                }
+                if caps.finder {
+                    out.append(ItemAction(icon: SizqoIconName.finder, title: "在访达中显示",
+                                          run: { appState.openInFinder(path: r.outputPath ?? item.path) }))
+                }
+                if caps.retry {
+                    out.append(ItemAction(icon: SizqoIconName.recompress, title: "重新压缩",
+                                          run: { appState.retryFile(path: item.path) }))
+                }
+                if caps.log {
+                    out.append(ItemAction(icon: SizqoIconName.copy, title: "复制日志",
+                                          run: { appState.copyLog(path: item.path) }))
+                }
             }
-            out.append(ItemAction(icon: SizqoIconName.copy, title: "复制日志",
-                                  run: { appState.copyLog(path: item.path) }))
         case .failed:
             out.append(ItemAction(icon: SizqoIconName.recompress, title: "重试",
                                   run: { appState.retryFile(path: item.path) }))
@@ -1020,7 +1061,7 @@ enum ItemActions {
             break
         }
         // compact 时行宽有限：done 行保留 恢复/对比/访达/日志 之外的都收进详情栏
-        if compact, item.status == .done, item.result?.success == true {
+        if compact, item.status == .done, item.result?.hasProduct == true {
             out = out.filter { $0.title != "另存为" }
         }
         return out
@@ -1091,7 +1132,10 @@ private struct ItemDetailView: View {
     }
 
     @ViewBuilder private var preview: some View {
-        let path = item.result?.outputPath ?? item.path
+        // 预览取的是**真在盘上的那个文件**：没产物时 outputPath 是空的，
+        // 拿它去 LoadFile 会把原图当成"压缩结果"预览。
+        let product = (item.result?.hasProduct == true) ? (item.result?.outputPath ?? "") : ""
+        let path = product.isEmpty ? item.path : product
         if let img = NSImage(contentsOfFile: path) {
             Image(nsImage: img)
                 .resizable()
@@ -1116,14 +1160,16 @@ private struct ItemDetailView: View {
 
     private var rows: some View {
         VStack(alignment: .leading, spacing: 5) {
-            if item.status == .done, let r = item.result {
+            if item.status == .done, let r = item.result, r.hasProduct {
                 detailRow("体积", "\(CompressResult.formatBytesJS(r.originalSize)) → \(CompressResult.formatBytesJS(r.compressedSize))")
                 detailRow("节省", r.savingsSignedText, r.savings >= 0 ? .green : .orange)
                 detailRow("尺寸", dimensionsText(r))
                 detailRow("算法", r.algorithm.isEmpty ? "(未知)" : r.algorithm)
                 if let ms = r.elapsedMs { detailRow("耗时", "\(ms) ms") }
                 detailRow("输出格式", r.outType.isEmpty ? "(未知)" : r.outType)
+                if let out = r.outputPath, !out.isEmpty { detailRow("输出位置", out) }
             } else {
+                // §6.1 没产物就没有"压缩后大小"这回事：那一串数字从没写出去过。
                 detailRow("体积", CompressResult.formatBytesJS(item.fileSize))
                 detailRow("状态", statusLine)
             }
@@ -1135,7 +1181,11 @@ private struct ItemDetailView: View {
         switch item.status {
         case .pending: return appState.compressionPaused ? "已暂停（等待中的文件不会前进）" : "等待中"
         case .running: return appState.compressionStopping ? "收尾中…" : "压缩中…"
-        case .failed: return "失败 — \(item.result?.error ?? "")"
+        // §69 详情栏与行上是同一个解释器：结论 + 为什么，不再各读一遍旗标。
+        case .done: return item.result?.contractDetailText ?? "—"
+        case .failed:
+            let why = item.result?.contractDetailText ?? ""
+            return why.isEmpty ? "处理失败" : why
         default: return "—"
         }
     }
@@ -1219,6 +1269,9 @@ private struct ItemDetailView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .disabled(action.disabled)
+                        .opacity(action.disabled ? 0.45 : 1)
+                        .help(action.blockedReason ?? action.title)
                     }
                 }
             }

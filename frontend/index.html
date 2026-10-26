@@ -120,8 +120,9 @@
             </div>
             <div class="intent-chips" id="imageIntentChips" role="group" aria-label="图片意图"></div>
             <p class="intent-note" id="imageIntentNote" role="status"></p>
-            <!-- 输出方式是正交项：图片与视频各配各的，切换意图不重置。 -->
-            <div class="intent-output" role="group" aria-label="图片输出">
+            <!-- 落盘是这一类媒体自己的状态：摆在意图旁边，切意图不碰它。 -->
+            <div class="intent-dest">
+              <span class="intent-dest-label">图片输出方式</span>
               <div class="output-mode-switch" role="radiogroup" aria-label="图片输出方式">
                 <label class="radio-label"><input type="radio" name="outputMode" value="replace" checked><span class="radio-custom"></span>覆盖原文件</label>
                 <label class="radio-label"><input type="radio" name="outputMode" value="suffix"><span class="radio-custom"></span>加后缀</label>
@@ -149,15 +150,18 @@
               <svg class="symbol-icon symbol-icon-small"><use href="#icon-video"/></svg>
               <span class="intent-title">视频目标</span>
               <span class="intent-summary" id="videoIntentSummary"></span>
-              <button type="button" class="intent-info" id="videoPresetBtn" onclick="applyVideoPresetToIntent()"
+              <!-- 预留的「存为预设」入口：applyVideoPresetToIntent 尚未实现，
+                   不挂 onclick —— 否则一旦取消 hidden 就会 ReferenceError。 -->
+              <button type="button" class="intent-info" id="videoPresetBtn" data-deferred="true"
                 title="把当前高级选项存成视频预设" hidden>
                 <svg class="symbol-icon symbol-icon-small"><use href="#icon-save"/></svg><span>存为预设</span>
               </button>
             </div>
             <div class="intent-chips" id="videoIntentChips" role="group" aria-label="视频意图"></div>
             <p class="intent-note" id="videoIntentNote" role="status"></p>
-            <!-- 视频的落盘方式独立配置：默认同目录加后缀，不与图片共用。 -->
-            <div class="intent-output" role="group" aria-label="视频输出">
+            <!-- 视频落盘和图片落盘是两份状态：这里改不到图片，图片那组也改不到视频。 -->
+            <div class="intent-dest">
+              <span class="intent-dest-label">视频输出方式</span>
               <div class="output-mode-switch" role="radiogroup" aria-label="视频输出方式">
                 <label class="radio-label"><input type="radio" name="videoOutputMode" value="replace"><span class="radio-custom"></span>覆盖原文件</label>
                 <label class="radio-label"><input type="radio" name="videoOutputMode" value="suffix" checked><span class="radio-custom"></span>加后缀</label>
@@ -165,7 +169,8 @@
               </div>
               <div class="output-detail" id="videoSuffixRow">
                 <label for="videoOutputSuffix">后缀</label>
-                <input id="videoOutputSuffix" class="settings-text-input suffix-input" value="_compressed" maxlength="64" spellcheck="false">
+                <input type="text" id="videoOutputSuffix" class="settings-text-input suffix-input" value="_compressed" placeholder="_compressed" maxlength="64" spellcheck="false">
+                <span class="settings-hint">例如 _small</span>
               </div>
               <div class="output-detail" id="videoDirectoryRow" hidden>
                 <span id="videoOutputDirDisplay" class="dir-display">未选择</span>
@@ -574,8 +579,11 @@
           <button class="btn btn-small btn-ghost" type="button" id="addMoreBtn" onclick="selectFiles()" title="追加文件">
             <svg class="symbol-icon symbol-icon-small"><use href="#icon-add-images"/></svg>追加
           </button>
-          <button class="btn btn-small btn-ghost" type="button" id="clearQueueBtn" onclick="clearAllFiles()" title="清空队列">
-            <svg class="symbol-icon symbol-icon-small"><use href="#icon-trash"/></svg>清除全部
+          <button class="btn btn-small btn-secondary" type="button" id="nextRoundBtn" onclick="startNextRound()" title="结束这一轮，回到拖入文件那一页；磁盘上的文件和压缩产物都不动" hidden>
+            <svg class="symbol-icon symbol-icon-small"><use href="#icon-add-images"/></svg>回到导入
+          </button>
+          <button class="btn btn-small btn-ghost" type="button" id="clearQueueBtn" onclick="clearAllFiles()" title="把这些文件移出清单，不删除磁盘上的文件">
+            <svg class="symbol-icon symbol-icon-small"><use href="#icon-minus"/></svg>移出清单
           </button>
           <button class="btn btn-small btn-secondary" type="button" id="restoreAllBtn" onclick="restoreAllOriginals()" hidden>
             <svg class="symbol-icon symbol-icon-small"><use href="#icon-restore"/></svg>恢复全部原图
@@ -644,6 +652,7 @@
   </div>
 
   <script>window.SizqoI18n.applyToDocument(document);</script>
+  <script src="result_state.js"></script>
   <script src="intents.js"></script>
   <script src="video-settings.js"></script>
   <script src="app.js"></script>

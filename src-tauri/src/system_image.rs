@@ -15,18 +15,30 @@ use objc2_image_io::{
 };
 
 use crate::engine::{CompressOptions, EngineResult};
+use crate::result_model::{EncodeVerdict, ReasonCode};
 
 const LARGE_MAX_PIXEL: isize = 1280;
 const MEDIUM_MAX_PIXEL: isize = 640;
 const SMALL_MAX_PIXEL: isize = 320;
 
-fn fail(original: Vec<u8>, out_type: &str, message: impl Into<String>) -> EngineResult {
+/// `verdict` 由调用点决定，不是由文案猜：ImageIO 明确不接这个格式是 `Rejected`，
+/// 解码到一半坏了 / 编不出来是 `Failed`。两者对用户都是"没有产物"，但原因不同，
+/// 而 UI 要说的正是原因（§59）。
+fn fail(
+    original: Vec<u8>,
+    out_type: &str,
+    verdict: EncodeVerdict,
+    reason: ReasonCode,
+    message: impl Into<String>,
+) -> EngineResult {
     EngineResult {
         success: false,
         compressed: original,
         out_type: out_type.into(),
         algorithm: "macOS ImageIO".into(),
         error: Some(message.into()),
+        encode: verdict,
+        reason,
         ..Default::default()
     }
 }
@@ -100,45 +112,87 @@ fn normalized_properties(
     Some(properties)
 }
 
+fn source_read_failure(error: &std::io::Error, out_type: &str) -> EngineResult {
+    let reason = match error.kind() {
+        std::io::ErrorKind::NotFound => ReasonCode::SourceNotFound,
+        std::io::ErrorKind::PermissionDenied => ReasonCode::PermissionDenied,
+        _ => ReasonCode::SourceReadFailed,
+    };
+    fail(
+        Vec::new(),
+        out_type,
+        EncodeVerdict::Failed,
+        reason,
+        error.to_string(),
+    )
+}
+
 pub fn convert(file: &Path, options: &CompressOptions) -> EngineResult {
     let original = match fs::read(file) {
         Ok(data) => data,
-        Err(error) => return fail(Vec::new(), &options.output_format, error.to_string()),
+        Err(error) => return source_read_failure(&error, &options.output_format),
     };
-
-    // 原格式：从文件扩展名推断输入图片格式
-    let (uti, out_type): (&str, &str) = if options.output_format == "original" {
-        let ext = file
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
-        match ext.as_str() {
-            "jpg" | "jpeg" => ("public.jpeg", "jpg"),
-            "png" => ("public.png", "png"),
-            "heic" | "heif" => ("public.heic", "heic"),
-            // 其他格式（如 webp、avif、gif、tiff 等）回退到 JPEG
-            _ => ("public.jpeg", "jpg"),
-        }
-    } else {
-        match target_type(&options.output_format) {
-            Some((uti, out_type)) => (uti, out_type),
-            None => {
-                return fail(
-                    original,
-                    &options.output_format,
-                    "系统转换仅支持 JPEG、PNG 和 HEIF",
-                );
-            }
-        }
-    };
+    let source_format = crate::engine::detect_image_format(&original);
 
     let input = CFData::from_bytes(&original);
     let Some(source) = (unsafe { CGImageSource::with_data(&input, None) }) else {
-        return fail(original, out_type, "macOS 无法读取此图像");
+        return fail(original, source_format, EncodeVerdict::Failed, ReasonCode::DecodeFailed, "macOS 无法读取此图像");
     };
+
+    // §23：ImageIO 这条路径只取 index 0。多帧输入必须明确拒绝，不能静默只留第一帧。
+    let frame_count = unsafe { source.count() };
+    if frame_count > 1 {
+        return fail(
+            original,
+            source_format,
+            EncodeVerdict::Rejected,
+            ReasonCode::UnsupportedFormat,
+            format!(
+                "系统转换不支持动图（{frame_count} 帧）：只会保留第一帧。已拒绝这次降级，原文件未改动"
+            ),
+        );
+    }
+
+    // 原格式：目标容器由**源文件真实 UTI** 决定，不再按扩展名猜，也绝不回退成 JPEG。
+    // 输出标签取字节头判定，保证落盘扩展名与字节说的是同一件事（§19 §20）。
+    let (target_uti, out_type): (CFRetained<CFString>, &'static str) =
+        if options.output_format == "original" {
+            if source_format == "unknown" {
+                return fail(
+                    original,
+                    "original",
+                    EncodeVerdict::Rejected,
+                    ReasonCode::UnsupportedFormat,
+                    "无法从字节识别源图格式，系统转换不会替你换一个格式",
+                );
+            }
+            let Some(uti) = (unsafe { source.r#type() }) else {
+                return fail(
+                    original,
+                    source_format,
+                    EncodeVerdict::Rejected,
+                    ReasonCode::UnsupportedFormat,
+                    "macOS 没有给出源图的类型标识，无法按原格式输出",
+                );
+            };
+            (uti, source_format)
+        } else {
+            match target_type(&options.output_format) {
+                Some((uti, out_type)) => (CFString::from_str(uti), out_type),
+                None => {
+                    return fail(
+                        original,
+                        &options.output_format,
+                        EncodeVerdict::Rejected,
+                        ReasonCode::UnsupportedFormat,
+                        "系统转换仅支持 JPEG、PNG 和 HEIF",
+                    );
+                }
+            }
+        };
+
     let Some(full_image) = (unsafe { source.image_at_index(0, None) }) else {
-        return fail(original, out_type, "macOS 无法解码此图像");
+        return fail(original, out_type, EncodeVerdict::Failed, ReasonCode::DecodeFailed, "macOS 无法解码此图像");
     };
 
     let longest_edge =
@@ -150,19 +204,20 @@ pub fn convert(file: &Path, options: &CompressOptions) -> EngineResult {
     let typed_thumbnail_options: &CFDictionary<CFType, CFType> = &thumbnail_options;
     let thumbnail_options: &CFDictionary = typed_thumbnail_options.as_ref();
     let Some(image) = (unsafe { source.thumbnail_at_index(0, Some(thumbnail_options)) }) else {
-        return fail(original, out_type, "macOS 无法调整图像尺寸");
+        return fail(original, out_type, EncodeVerdict::Failed, ReasonCode::EncodeFailed, "macOS 无法调整图像尺寸");
     };
 
     let Some(output) = CFMutableData::new(None, 0) else {
-        return fail(original, out_type, "无法创建系统转换缓冲区");
+        return fail(original, out_type, EncodeVerdict::Failed, ReasonCode::EncodeFailed, "无法创建系统转换缓冲区");
     };
-    let target_uti = CFString::from_str(uti);
     let Some(destination) =
         (unsafe { CGImageDestination::with_data(&output, &target_uti, 1, None) })
     else {
         return fail(
             original,
             out_type,
+            EncodeVerdict::Rejected,
+            ReasonCode::UnsupportedFormat,
             format!("此 macOS 版本不支持 {} 输出", out_type),
         );
     };
@@ -172,13 +227,28 @@ pub fn convert(file: &Path, options: &CompressOptions) -> EngineResult {
         destination.add_image(&image, properties.as_deref().map(AsRef::as_ref));
     }
     if !unsafe { destination.finalize() } {
-        return fail(original, out_type, "macOS 系统转换失败");
+        return fail(original, out_type, EncodeVerdict::Failed, ReasonCode::EncodeFailed, "macOS 系统转换失败");
+    }
+
+    // §19 §20：ImageIO 说"写完了"不等于写出来的是我们要的容器。
+    // 最终字节说了算；对不上就当作没有产物，绝不按 out_type 换个扩展名落盘。
+    let bytes = output.to_vec();
+    let actual = crate::engine::detect_image_format(&bytes);
+    if !crate::engine::same_kind(actual, out_type) {
+        return fail(
+            original,
+            out_type,
+            EncodeVerdict::Failed,
+            ReasonCode::OutputValidationFailed,
+            format!("系统转换请求 {out_type}，实际产出的是 {actual}；已拒绝落盘"),
+        );
     }
 
     EngineResult {
         success: true,
-        compressed: output.to_vec(),
+        compressed: bytes,
         out_type: out_type.into(),
+        encode: EncodeVerdict::Candidate,
         algorithm: format!(
             "macOS ImageIO · {}",
             match options.system_image_size.as_str() {
@@ -279,5 +349,88 @@ mod tests {
         assert!(heif.success, "{:?}", heif.error);
         assert_eq!(heif.out_type, "heic");
         assert!(!heif.compressed.is_empty());
+    }
+
+    #[test]
+    fn a_missing_source_is_reported_as_not_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = convert(
+            &temp.path().join("gone.png"),
+            &CompressOptions::default(),
+        );
+        assert_eq!(result.encode, EncodeVerdict::Failed);
+        assert_eq!(result.reason, ReasonCode::SourceNotFound);
+        assert!(result.compressed.is_empty(), "读不到源文件时不许交回任何字节");
+    }
+
+    /// §19：系统转换的「原格式」过去按扩展名猜，webp/gif/avif 一律回退成 JPEG，
+    /// 于是 photo.webp 会被写成一份 JPEG 字节。现在目标容器由源 UTI 决定，
+    /// 写不出来就明确拒绝 —— 任何情况下都不许把 JPEG 冒充成原格式。
+    #[test]
+    fn original_format_never_falls_back_to_jpeg() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input.gif");
+        image::RgbImage::from_pixel(120, 90, image::Rgb([40, 160, 90]))
+            .save(&input)
+            .unwrap();
+
+        let mut options = CompressOptions::default();
+        options.processing_mode = "system".into();
+        options.output_format = "original".into();
+        let result = convert(&input, &options);
+
+        if result.success {
+            assert_eq!(
+                result.out_type, "gif",
+                "原格式是 GIF，标签不能变成别的：{:?}",
+                result.error
+            );
+            assert_eq!(
+                crate::engine::detect_image_format(&result.compressed),
+                "gif",
+                "交回的字节必须是源格式，不能偷偷换成 JPEG"
+            );
+        } else {
+            assert_ne!(
+                result.out_type, "jpg",
+                "写不出来时要拒绝，不能把 JPEG 冒充成原格式：{:?}",
+                result.error
+            );
+            assert_eq!(result.encode, EncodeVerdict::Rejected);
+        }
+    }
+
+    /// §23：ImageIO 只取 index 0。多帧输入必须明确拒绝，不许静默只留第一帧。
+    #[test]
+    fn an_animated_gif_is_rejected_instead_of_losing_its_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("animated.gif");
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            let frame = |tint: u8| image::Frame::new({
+                let mut img = image::RgbaImage::from_pixel(32, 32, image::Rgba([tint, 80, 200, 255]));
+                img.put_pixel(0, 0, image::Rgba([255, 255, 255, 255]));
+                img
+            });
+            encoder
+                .encode_frames(vec![frame(10), frame(200), frame(120)])
+                .unwrap();
+        }
+        fs::write(&input, &bytes).unwrap();
+
+        let mut options = CompressOptions::default();
+        options.processing_mode = "system".into();
+        options.output_format = "jpg".into();
+        let result = convert(&input, &options);
+
+        assert_eq!(result.encode, EncodeVerdict::Rejected, "{:?}", result.error);
+        assert_eq!(result.reason, ReasonCode::UnsupportedFormat);
+        assert_eq!(result.compressed, bytes, "拒绝时交回的必须是原图本身");
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("帧"),
+            "必须说清是帧数问题：{:?}",
+            result.error
+        );
     }
 }

@@ -1,9 +1,12 @@
 //! Closed parameter contract: every selectable field is validated before argv generation.
-use super::{VideoOptions,capabilities::CapabilityMatrix,probe::VideoProbe};
+use super::{VideoOptions,MetadataPolicy,capabilities::CapabilityMatrix,probe::VideoProbe};
 use serde::Serialize;
 use std::path::Path;
 #[derive(Debug,Clone,Serialize)]#[serde(rename_all="camelCase")]
-pub struct EncodePlan {pub encoder:String,pub container:String,pub bitrate_kbps:Option<u64>,pub crf:Option<f64>,pub width:u32,pub height:u32,pub passes:u32,pub threads:usize,pub warnings:Vec<String>,pub vfr_rate:Option<String>,pub options:VideoOptions}
+pub struct EncodePlan {pub encoder:String,pub container:String,pub bitrate_kbps:Option<u64>,pub crf:Option<f64>,pub width:u32,pub height:u32,pub passes:u32,pub threads:usize,pub warnings:Vec<String>,pub vfr_rate:Option<String>,
+    /// §55 已解析的策略；序列化给前端时仍看 `options.metadataPolicy`，这里不额外暴露一份。
+    #[serde(skip)] pub metadata_policy:MetadataPolicy,
+    pub options:VideoOptions}
 fn member(value:&str,allowed:&[&str],what:&str)->Result<(),String>{if allowed.contains(&value){Ok(())}else{Err(format!("Invalid {what}: {value}"))}}
 pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budget:usize)->Result<EncodePlan,String>{
     if !caps.available{return Err(caps.reason.clone().unwrap_or("Video unavailable".into()));}
@@ -11,22 +14,25 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
     member(&options.output_mode,&["suffix","directory","folder","replace"],"output mode")?;
     member(&options.audio_policy,&["copy","aac","opus","mp3","flac","none"],"audio policy")?;
     member(&options.subtitle_policy,&["copy","drop"],"subtitle policy")?;
-    member(&options.metadata_policy,&["preserve","stripPrivate","strip"],"metadata policy")?;
+    let metadata_policy=MetadataPolicy::parse(&options.metadata_policy).ok_or_else(||format!("Invalid metadata policy: {}",options.metadata_policy))?;
     if options.output_mode=="directory"||options.output_mode=="folder" {if options.output_dir.as_deref().filter(|s|!s.is_empty()).is_none(){return Err("Select an output directory".into());}}
     if probe.hdr_kind!="sdr"{return Err(format!("{} input skipped: verified HDR / dynamic metadata preservation is unavailable",probe.hdr_kind));}
     let video=probe.video().ok_or("No video stream")?;
-    if video.pixel_format.contains("10")||video.pixel_format.contains("12")||video.pixel_format.contains("16") {return Err("High bit-depth input requires a verified preservation path".into());}
-    if video.pixel_format.starts_with("yuva")||video.pixel_format.contains("rgba")||video.pixel_format.contains("gbrap"){return Err("Alpha video preservation is unavailable".into());}
+    // 高位深除子串匹配的 10/12/16 外还有 32bit 浮点（grayf32le/gbrpf32le 不含数字字样）；
+    // 打包 alpha（bgra/argb/abgr）也不含 "rgba"。漏掉它们会被后面硬编码的 yuv420p
+    // 静默降级（丢 alpha / 掉位深），违反"先拒绝或说明，绝不无声转换"。
+    if video.pixel_format.contains("10")||video.pixel_format.contains("12")||video.pixel_format.contains("16")||video.pixel_format.contains("f32") {return Err("High bit-depth input requires a verified preservation path".into());}
+    if video.pixel_format.starts_with("yuva")||video.pixel_format.contains("rgba")||video.pixel_format.contains("gbrap")||["bgra","argb","abgr"].contains(&video.pixel_format.as_str()){return Err("Alpha video preservation is unavailable".into());}
     if !["","unknown","progressive"].contains(&video.field_order.as_str()){return Err("Interlaced input needs an explicitly validated deinterlace plan".into());}
     if probe.streams.iter().filter(|s|s.codec_type=="video"&&s.disposition["attached_pic"].as_u64()!=Some(1)).count()!=1{return Err("Multiple video streams cannot be silently discarded".into());}
     if probe.streams.iter().any(|s|s.codec_type=="video"&&s.disposition["attached_pic"].as_u64()==Some(1)){return Err("Attached picture preservation is not yet validated".into());}
     if probe.audio().count()>16{return Err("More than 16 audio tracks require manual review".into());}
-    if probe.streams.iter().any(|s|s.codec_type=="data"){return Err("Input contains data tracks whose preservation is not validated".into());}
+    if probe.streams.iter().any(|s|s.codec_type=="data"&&!s.is_chapter_carrier()){return Err("Input contains data tracks whose preservation is not validated".into());}
     if probe.streams.iter().any(|s|s.codec_type=="attachment")&&options.container!="mkv"{return Err("Attachments require MKV; no silent discarding".into());}
-    if !probe.chapters.is_empty()&&options.metadata_policy=="preserve"&&["webm","ts"].contains(&options.container.as_str()){return Err("Chapter preservation in WebM/TS is unavailable; choose MKV".into());}
+    if !probe.chapters.is_empty()&&metadata_policy!=MetadataPolicy::StripAll&&["webm","ts"].contains(&options.container.as_str()){return Err("Chapter preservation in WebM/TS is unavailable; choose MKV".into());}
     let mut warnings=probe.warnings.clone();
     let vfr_rate=if options.frame_rate.is_none()&&probe.variable_frame_rate {video.raw["avg_frame_rate"].as_str().map(str::to_string)}else{None};
-    if options.metadata_policy=="stripPrivate" { warnings.push("Privacy mode removes optional metadata to avoid retaining unknown GPS tags; color and timing remain encoded in the video stream".into()); }
+    if metadata_policy==MetadataPolicy::StripPrivate { warnings.push("Privacy mode removes GPS, location and device-model tags; ordinary metadata and chapters are preserved".into()); }
     let encoder=if options.encoder=="auto" {
         let preference=if options.container=="webm"{vec!["libsvtav1","libvpx-vp9"]}else if options.mode=="twoPass"||options.mode=="targetSize"{vec!["libx264"]}else if options.mode=="crf"{vec!["libx265","libx264","libvpx-vp9"]}else{vec!["hevc_videotoolbox","libx265","h264_videotoolbox","libx264"]};
         let selected=preference.iter().find(|id|caps.encoder(id).is_some()).ok_or("No suitable encoder available")?;
@@ -62,6 +68,8 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
     let (sw,sh)=if probe.rotation.rem_euclid(180)!=0{(probe.height,probe.width)}else{(probe.width,probe.height)};
     let scale=if options.resolution==0{1.0}else{(options.resolution as f64/sw.max(sh) as f64).min(1.0)};
     let width=((sw as f64*scale) as u32/2*2).max(2);let height=((sh as f64*scale) as u32/2*2).max(2);
+    // 用户没要求缩放却发生了 1px 取整（yuv420p 只接受偶数）时必须说明，不许静默变形。
+    if options.resolution==0&&(sw%2!=0||sh%2!=0){warnings.push(format!("Source dimensions {sw}×{sh} are not even; yuv420p requires even numbers, output rounded to {width}×{height}"));}
     let audio_bits=if options.audio_policy=="none"{0}else if options.audio_policy=="copy"{probe.audio().try_fold(0u64,|n,s|s.bit_rate.and_then(|b|n.checked_add(b))).unwrap_or(0)}else{options.audio_bitrate_kbps*1000*probe.audio().count() as u64};
     let bitrate_kbps=if options.mode=="targetSize" {
         if options.audio_policy=="copy"&&probe.audio().any(|s|s.bit_rate.is_none()){return Err("Target size needs known audio bitrate; choose AAC/Opus".into());}
@@ -69,13 +77,17 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
         let target=options.target_mi_b.ok_or("Set target MiB")?;if !target.is_finite()||target<=0.0||target>1e7{return Err("Invalid target size".into());}
         let available=target*1024.0*1024.0*8.0/seconds*0.97-audio_bits as f64;
         if available<32000.0{return Err("Target is smaller than audio and container overhead plus minimum video bitrate".into());}
-        warnings.push("Target size is an estimate; audio, muxing and rate control cause deviations".into());Some((available/1000.0) as u64)
+        // 推导出的码率同样受 32…500000 kbps 契约约束：目标过大 / 时长过短会推出
+        // 离谱的码率，ffmpeg 会照单全收，这里必须像 abr/twoPass 分支一样拦下。
+        let kbps=(available/1000.0) as u64;
+        if !(32..=500000).contains(&kbps){return Err("Target size implies a video bitrate outside 32…500000 kbps; raise the target or pick a longer source".into());}
+        warnings.push("Target size is an estimate; audio, muxing and rate control cause deviations".into());Some(kbps)
     }else if options.mode=="abr"||options.mode=="twoPass"{
         let estimated=((width as f64*height as f64*probe.frame_rate.unwrap_or(30.0)*0.07)/1000.0) as u64;
         let source=video.bit_rate.or(probe.bit_rate).unwrap_or(estimated*1000)/1000;
         let b=options.bitrate_kbps.unwrap_or(estimated.min(source*3/4).max(200));if !(32..=500000).contains(&b){return Err("Video bitrate range is 32…500000 kbps".into());}Some(b)
     }else{None};
-    Ok(EncodePlan {encoder,container:options.container.clone(),bitrate_kbps,crf,width,height,passes:if ["twoPass","targetSize"].contains(&options.mode.as_str()){2}else{1},threads:if options.threads==0{budget.max(1)}else{options.threads.max(1).min(budget.max(1))},warnings,vfr_rate,options:options.clone()})
+    Ok(EncodePlan {encoder,container:options.container.clone(),bitrate_kbps,crf,width,height,passes:if ["twoPass","targetSize"].contains(&options.mode.as_str()){2}else{1},threads:if options.threads==0{budget.max(1)}else{options.threads.max(1).min(budget.max(1))},warnings,vfr_rate,metadata_policy,options:options.clone()})
 }
 impl EncodePlan {
     pub fn argv(&self,input:&Path,output:&Path,pass:u32,passlog:&Path)->Vec<String>{
@@ -90,7 +102,21 @@ impl EncodePlan {
         if self.options.audio_policy=="none"{a.push("-an".into());}else{a.extend(["-map".into(),"0:a?".into(),"-c:a".into(),match self.options.audio_policy.as_str(){"copy"=>"copy","opus"=>"libopus","mp3"=>"libmp3lame","flac"=>"flac",_=>"aac"}.into()]);if self.options.audio_policy!="copy"&&self.options.audio_policy!="flac"{a.extend(["-b:a".into(),format!("{}k",self.options.audio_bitrate_kbps)]);}}
         if self.options.subtitle_policy=="copy"{a.extend(["-map".into(),"0:s?".into(),"-c:s".into(),"copy".into()]);}else{a.push("-sn".into());}
         if self.container=="mkv"{a.extend(["-map".into(),"0:t?".into(),"-c:t".into(),"copy".into()]);}
-        if self.options.metadata_policy=="strip"||self.options.metadata_policy=="stripPrivate"{a.extend(["-map_metadata".into(),"-1".into(),"-map_chapters".into(),"-1".into()]);}else{a.extend(["-map_metadata".into(),"0".into(),"-map_chapters".into(),"0".into()]);if self.options.metadata_policy=="stripPrivate"{for key in ["location","location-eng","com.apple.quicktime.location.ISO6709","GPSCoordinates"]{a.extend(["-metadata".into(),format!("{key}=")]);}}}
+        match self.metadata_policy {
+            // §55 只有"全部移除"才配 -map_metadata -1 / -map_chapters -1。
+            MetadataPolicy::StripAll=>{a.extend(["-map_metadata".into(),"-1".into(),"-map_chapters".into(),"-1".into()]);}
+            MetadataPolicy::KeepAll=>{a.extend(["-map_metadata".into(),"0".into(),"-map_chapters".into(),"0".into()]);}
+            MetadataPolicy::StripPrivate=>{
+                // 普通 metadata 与章节照常保留；只把隐私键清空。作用域要覆盖全局、
+                // 视频、音频、字幕四层 —— 手机拍的文件经常把位置写进流标签。
+                a.extend(["-map_metadata".into(),"0".into(),"-map_chapters".into(),"0".into()]);
+                for key in crate::video::PRIVATE_METADATA_KEYS {
+                    for scope in ["",":s:v",":s:a",":s:s"] {
+                        a.extend([format!("-metadata{scope}"),format!("{key}=")]);
+                    }
+                }
+            }
+        }
         if self.container=="mp4"||self.container=="mov"{a.extend(["-movflags".into(),"+faststart".into()]);}
         a.extend(["-progress".into(),"pipe:1".into(),"-nostats".into(),"-f".into(),match self.container.as_str(){"mkv"=>"matroska","ts"=>"mpegts",other=>other}.into(),output.to_string_lossy().into()]);a
     }
@@ -124,4 +150,66 @@ impl EncodePlan {
         let mut o5=VideoOptions::default();o5.container="mkv".into();o5.encoder="libx264".into();o5.audio_policy="flac".into();let p5=build(&o5,&probe(),&caps(),3).unwrap();let a5=p5.argv(Path::new("in.mp4"),Path::new("out.mkv"),1,Path::new("st"));assert!(a5.windows(2).any(|w|w==["-c:a","flac"]));assert!(!a5.contains(&"-b:a".into()));
         let mut o6=VideoOptions::default();o6.container="ts".into();o6.encoder="libx264".into();o6.audio_policy="mp3".into();let p6=build(&o6,&probe(),&caps(),3).unwrap();let a6=p6.argv(Path::new("in.mp4"),Path::new("out.ts"),1,Path::new("st"));assert!(a6.windows(2).any(|w|w==["-c:a","libmp3lame"]));assert!(a6.windows(2).any(|w|w==["-f","mpegts"]));
         let mut o7=VideoOptions::default();o7.container="mp4".into();o7.encoder="libx264".into();o7.audio_policy="mp3".into();assert!(build(&o7,&probe(),&caps(),3).is_ok());}
+
+    /// §55 隐私模式不是"全部删掉"：章节和普通 metadata 留下，只清隐私键。
+    #[test]
+    fn privacy_mode_keeps_metadata_and_chapters_but_clears_private_tags() {
+        let mut o=VideoOptions::default();
+        o.encoder="libx264".into();o.mode="crf".into();o.metadata_policy="stripPrivate".into();
+        let p=build(&o,&probe(),&caps(),3).unwrap();
+        assert_eq!(p.metadata_policy,MetadataPolicy::StripPrivate);
+        let a=p.argv(Path::new("in.mp4"),Path::new("out.mp4"),1,Path::new("st"));
+        assert!(a.windows(2).any(|w|w==["-map_metadata","0"]),"普通 metadata 必须保留");
+        assert!(a.windows(2).any(|w|w==["-map_chapters","0"]),"章节不是隐私数据");
+        assert!(!a.windows(2).any(|w|w==["-map_metadata","-1"]),"隐私模式不等于全部删除");
+        assert!(!a.windows(2).any(|w|w==["-map_chapters","-1"]));
+        for key in ["location","make","model"] {
+            assert!(a.windows(2).any(|w|w[0]=="-metadata"&&w[1]==format!("{key}=")),"缺少全局清除 {key}");
+            assert!(a.windows(2).any(|w|w[0]=="-metadata:s:v"&&w[1]==format!("{key}=")),"缺少视频流清除 {key}");
+            assert!(a.windows(2).any(|w|w[0]=="-metadata:s:a"&&w[1]==format!("{key}=")),"缺少音频流清除 {key}");
+        }
+    }
+
+    #[test]
+    fn strip_all_is_the_only_policy_that_drops_chapters_and_all_metadata() {
+        let mut o=VideoOptions::default();
+        o.encoder="libx264".into();o.mode="crf".into();o.metadata_policy="strip".into();
+        let p=build(&o,&probe(),&caps(),3).unwrap();
+        let a=p.argv(Path::new("in.mp4"),Path::new("out.mp4"),1,Path::new("st"));
+        assert!(a.windows(2).any(|w|w==["-map_metadata","-1"]));
+        assert!(a.windows(2).any(|w|w==["-map_chapters","-1"]));
+        assert!(!a.windows(2).any(|w|w==["-map_metadata","0"]));
+    }
+
+    #[test]
+    fn preserve_is_the_default_and_keeps_both_metadata_and_chapters() {
+        let mut o=VideoOptions::default();
+        o.encoder="libx264".into();o.mode="crf".into();
+        let p=build(&o,&probe(),&caps(),3).unwrap();
+        assert_eq!(p.metadata_policy,MetadataPolicy::KeepAll);
+        let a=p.argv(Path::new("in.mp4"),Path::new("out.mp4"),1,Path::new("st"));
+        assert!(a.windows(2).any(|w|w==["-map_metadata","0"]));
+        assert!(a.windows(2).any(|w|w==["-map_chapters","0"]));
+    }
+
+    /// MP4 的章节轨道在 ffprobe 里就是一条 `data` 流（样本项 `text`），
+    /// 不能因为"数据轨未验证"把带章节的普通 MP4 全部拒之门外；时间码轨仍然拒绝。
+    #[test]
+    fn mp4_chapter_carrier_is_accepted_but_other_data_tracks_are_not() {
+        let mut root=serde_json::json!({
+            "streams":[
+                {"index":0,"codec_type":"video","width":720,"height":1280,"codec_name":"h264","pix_fmt":"yuv420p","avg_frame_rate":"30/1"},
+                {"index":1,"codec_type":"data","codec_name":"bin_data","codec_tag_string":"text","tags":{"handler_name":"SubtitleHandler"}}
+            ],
+            "format":{"duration":"10","format_name":"mp4"},
+            "chapters":[{"id":0,"tags":{"title":"Intro"}}]
+        });
+        let p=VideoProbe::parse(root.clone(),1234).unwrap();
+        assert!(p.streams[1].is_chapter_carrier());
+        assert!(build(&VideoOptions::default(),&p,&caps(),3).is_ok(),"带章节的 MP4 必须可以处理");
+        root["streams"][1]["codec_tag_string"]=serde_json::json!("tmcd");
+        let p=VideoProbe::parse(root,1234).unwrap();
+        assert!(!p.streams[1].is_chapter_carrier());
+        assert!(build(&VideoOptions::default(),&p,&caps(),3).is_err(),"时间码数据轨仍要拒绝");
+    }
 }

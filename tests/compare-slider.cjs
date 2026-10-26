@@ -67,4 +67,21 @@ assert.equal(context.compareSliderFrame, 0, '帧跑完要复位，否则后续 m
 assert.match(source, /outer\.addEventListener\('mousemove'/, '拖拽分割线的监听不能被删掉');
 assert.match(source, /compareViewer\.drag\) return/, '平移图片时不能同时拖动分割线');
 
+// ── 5. §44 压缩会话期间恢复按钮必须变灰并说明原因 ─────────────────
+assert.match(read('frontend/compare.html'), /id="restoreCompareBtn"/,
+  '恢复按钮没有 id，事件到达时找不到它');
+const restoreAction = source.slice(
+  source.indexOf('async function restoreFromCompare('),
+  source.indexOf('function closeCompareWindow('));
+assert.match(restoreAction, /if \(compareRestoreBlocked\)/,
+  '恢复入口必须自己拦一道，不能只靠按钮 disabled');
+assert.match(restoreAction, /压缩进行中，暂不能恢复/,
+  '被拦下时要说明这是会话时间问题，不是恢复失败');
+assert.match(source, /btn\.disabled = compareRestoreBlocked/,
+  '会话期间恢复按钮必须真的禁用');
+assert.match(source, /listen\('compression-state-change'/,
+  '对比窗口没有跟随后端阶段，按钮会一直停在打开窗口时的那一态');
+assert.match(source, /invoke\('get_compression_state'\)/,
+  '窗口打开时没有先问一次真实阶段');
+
 console.log('PASS: 对比窗口底部白线已移除，分割仍由拖拽驱动，状态改由 compareSplitPercent 承载');

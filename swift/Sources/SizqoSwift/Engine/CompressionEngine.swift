@@ -55,7 +55,8 @@ enum CompressionEngine {
             let original = (try? Data(contentsOf: URL(fileURLWithPath: file))) ?? Data()
             return EngineResult(
                 success: false, compressed: original, outType: imgType,
-                algorithm: "none", error: "不支持的图片类型: \(imgType)"
+                algorithm: "none", error: "不支持的图片类型: \(imgType)",
+                verdict: .rejected, reason: .unsupportedFormat
             )
         }
     }
@@ -195,6 +196,8 @@ enum CompressionEngine {
         if originalSize <= budget {
             var kept = noImprovement(original: original, outType: sourceType,
                                      algorithm: "指定体积", originalSize: original.count)
+            // 这一支压根没进编码：原图已经在用户要的体积之内。它不是"压完没收益"。
+            kept.reason = .alreadyUnderTarget
             kept.targetBytes = budget
             kept.targetMet = true
             kept.warnings.append("原图 \(CompressResult.formatBytesJS(originalSize)) 已在目标 \(CompressResult.formatBytesJS(budget)) 以内，未做无谓的重编码")
@@ -260,7 +263,8 @@ enum CompressionEngine {
             let original = (try? Data(contentsOf: URL(fileURLWithPath: file))) ?? Data()
             return EngineResult(
                 success: false, compressed: original, outType: target,
-                algorithm: "none", error: "不支持的目标格式: \(target)"
+                algorithm: "none", error: "不支持的目标格式: \(target)",
+                verdict: .rejected, reason: .unsupportedFormat
             )
         }
     }
@@ -494,10 +498,50 @@ enum CompressionEngine {
 
     // MARK: - HEIC
 
+    /// 用 macOS 自带的 sips 直接写 HEIC（与 Rust 线 sips_heic_bytes 同一份契约）。
+    ///
+    /// 旧实现先把 HEIF 转成 JPEG 再"当作压缩结果"：磁盘上扩展名还是 .heic、字节
+    /// 却是 JFIF —— replace 模式据此删掉真正的 .heic 原图，产物还打不开。sips 能写
+    /// `public.heic`，这里只接受**字节真的是 HEIC** 的结果，JPEG 冒充一律不认。
+    private static func sipsHEICBytes(file: String, quality: Int) -> Data? {
+        let out = scratchFile("heic")
+        defer { try? FileManager.default.removeItem(atPath: out) }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sips")
+        process.arguments = ["-s", "format", "heic", "-s", "formatOptions", String(quality), file, "--out", out]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0,
+                  let data = FileManager.default.contents(atPath: out),
+                  !data.isEmpty,
+                  detectImageType(of: data) == "heic" else { return nil }
+            return data
+        } catch { return nil }
+    }
+
     static func compressHEIC(file: String, options: CompressOptions) -> EngineResult {
         let original = (try? Data(contentsOf: URL(fileURLWithPath: file))) ?? Data()
         let originalSize = original.count
 
+        // 原格式 / 显式 HEIC：原地重编码，产物必须真的是 HEIC 字节，
+        // 不许把"用户要 HEIC"悄悄兑现成一张 JPEG。
+        if options.outputFormat == .original || options.outputFormat == .heic {
+            // quality 0 是"由引擎推测"的旧约定；HEIC 编码器没有推测档，给一个稳妥的 75。
+            let quality = options.quality == 0 ? 75 : min(options.quality, 100)
+            if let data = sipsHEICBytes(file: file, quality: quality),
+               data.count < originalSize {
+                return EngineResult(
+                    success: true, compressed: data, outType: "heic",
+                    algorithm: "sips-heic", error: nil, verdict: .candidate
+                )
+            }
+            return noImprovement(original: original, outType: "heic", algorithm: "sips-heic", originalSize: originalSize)
+        }
+
+        // 显式换格式（JPG/PNG/WebP/AVIF）走转换语义：JPEG 只是像素中转，产物格式由用户点选。
         let tmp = scratchFile("jpg")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sips")
@@ -514,10 +558,13 @@ enum CompressionEngine {
                 case .webp: result = compressToWebP(file: tmp, options: options)
                 case .avif: result = compressToAVIF(file: tmp, options: options)
                 case .png: result = compressPNG(file: tmp, options: options)
-                case .jpg, .original:
-                    result = compressJPG(file: tmp, options: options)
-                default:
-                    result = compressJPG(file: tmp, options: options)
+                case .jpg: result = compressJPG(file: tmp, options: options)
+                case .original, .heic:
+                    // 上面已经分流处理；到这里说明枚举新增了未覆盖的值，按失败说清楚。
+                    result = EngineResult(
+                        success: false, compressed: original, outType: options.outputFormat.rawValue,
+                        algorithm: "sips", error: "未支持的目标格式: \(options.outputFormat.rawValue)",
+                        verdict: .rejected, reason: .unsupportedFormat)
                 }
                 if result.success {
                     try? FileManager.default.removeItem(atPath: tmp)
@@ -551,11 +598,16 @@ enum CompressionEngine {
 
     static func noImprovement(original: Data, outType: String, algorithm: String, originalSize: Int) -> EngineResult {
         let msg: String
-        if original.count >= originalSize {
+        // 交回的是原图字节本身，判据必须是 keptOriginal —— 说 success=true 就等于
+        // 让调用方去猜「没收益」和「压成了」的区别，而这一支一个字节都没打算落盘。
+        let verdict: EncodeVerdict = .keptOriginal
+        if original.count > originalSize {
             msg = "压缩后 \(CompressResult.formatBytes(Int64(original.count))) > 原始 \(CompressResult.formatBytes(Int64(originalSize)))，原图已是最优压缩"
-        } else {
-            msg = "压缩后体积未减小"
+            return EngineResult(success: true, compressed: original, outType: outType, algorithm: algorithm,
+                                error: msg, verdict: verdict, reason: .outputLargerThanSource)
         }
-        return EngineResult(success: true, compressed: original, outType: outType, algorithm: algorithm, error: msg)
+        msg = "压缩后体积未减小"
+        return EngineResult(success: true, compressed: original, outType: outType, algorithm: algorithm,
+                            error: msg, verdict: verdict, reason: .noSizeReduction)
     }
 }

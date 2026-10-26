@@ -24,6 +24,9 @@ serde_json = "1"
 # 不给 oxipng 开 parallel。它们的 rayon 全局池一旦初始化就调不动运行时上限。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 base64 = "0.22"
+# §26 关键 Commit 前的源文件内容指纹（sha2 已经在依赖树里，由 tauri 构建期带入；
+# 这里把它提成正文依赖，不新增第三方代码）。
+sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["process", "rt-multi-thread", "macros", "fs", "io-util", "time"] }
 log = "0.4"
