@@ -1036,6 +1036,50 @@ StripPrivate 语义由真实编码输出探测背书。
   与签名沙盒运行检查、发布门禁**：本轮未执行，维持"未通过/未验证"状态；
   发布前必须按 AGENTS.md Release gate 补齐。
 
+## Release: v0.3.5（2026-10-27）
+
+压缩事务与文件安全重构随 0.3.5 发布。提交：`eb24576`（重构主体，rebase 到
+v0.3.4 之上）+ `075edcd`（版本 0.3.5）。CI run [`40362381159`](https://github.com/misswell/Sizqo/actions/runs/40362381159)
+8 个作业全部 success（compression-parity、build-linux、build-macos arm64 与
+x86_64、verify-appstore、build-windows、build-macos-universal、release），
+耗时约 42 分钟。Release 于 2026-10-26T17:27:20Z 创建，非 draft / 非
+prerelease，为 Latest：
+[`v0.3.5`](https://github.com/misswell/Sizqo/releases/tag/v0.3.5)。
+
+云端签名证据（`gh run view 40362381159 --log`）：
+
+- universal 作业内 6 次 notarytool 提交全部 `status: Accepted`（3 个 `.app`
+  + 3 个 DMG；日志 Accepted 行 ×12 是每笔提交的双行输出）。
+- staple/validate `worked` ×6；签名身份 Developer ID Application: Guofeng Liu，
+  hardened runtime。
+
+线上资产（字节）：universal DMG 66,328,208；arm64 DMG 30,571,082；
+x86_64 DMG 36,891,672；universal `.app.tar.gz` 60,110,863；`.sig` 432；
+`latest.json` 1,309；Linux AppImage 87,947,768；deb 5,157,650；
+Windows exe 2,998,527；msi 3,854,336。`latest.json` 的 `version` 为 `0.3.5`，
+两个 darwin 平台的 `url` 都指向
+`v0.3.5/Sizqo_v0.3.5_macos_universal.app.tar.gz`，`signature` 字段与 432 B
+的 `.sig` 资产逐字符相同。
+
+下载线上字节复核（`/tmp/sizqo-v035-verify`）：
+
+| 对象 | 结果 |
+| --- | --- |
+| universal DMG（挂载） | `hdiutil verify` 校验和 VALID；`Sizqo.app` 0.3.5、`x86_64 arm64`、hardened runtime、TeamIdentifier `U8U443D7ZL`；`codesign --verify --deep --strict` 通过；`spctl` accepted (Notarized Developer ID)；`stapler validate` worked；`Resources/resources/bin` 7 个图片 CLI，`Resources/video/bin` ffmpeg/ffprobe |
+| universal 更新包 | `tar -xzf` 后同样 0.3.5/universal/9 个引擎，`stapler validate` worked |
+| 更新签名 | `scripts/verify_updater_signature.sh` → OK；翻转第 1000 字节后 → `Error: InvalidSignature` |
+
+```
+sha256 2cc4076e21cf4ca45b632fe71ad1dc95c7a5e451b39281a40dfbc72a3394b737  .app.tar.gz
+sha256 da8bd8ef4ca6f40881a940839d3366c0e97f7545a70592848acd2b46eafda3c7  .app.tar.gz.sig
+```
+
+真实视频 fixture 回归（`metadata_policies_hold_on_real_encoded_fixtures` 等，
+bundled FFmpeg 实编实探）随 cargo 套件在发布前通过，覆盖元数据三策略语义；
+§11 fixture 矩阵的其余条目、签名包内新工作台的肉眼点击验收、App Store 沙盒
+运行时、FFmpeg GPL 对应源码义务仍未做（与 v0.3.1–v0.3.4 相同）。本轮按用户
+「做完就发版」的指示发布，未把上述未验证项标成已通过。
+
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
 Before any tag/Release: full three-track build, signed Direct runtime check,
