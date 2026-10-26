@@ -997,6 +997,31 @@ npm run test:frontend                                     → 25/25 PASS（含 2
 bash scripts/test_swift_history.sh                        → 全部通过（含 [21b]）
 ```
 
+### 与远端 v0.3.2–v0.3.4 的整合（2026-10-27）
+
+本地修复基于 v0.3.1 提交；期间远端已发布 v0.3.2（tag `17e1ab8`，VFR 时长修复）
+与 v0.3.3/v0.3.4（发布链路修复）。整合方式：工作区整体固化为提交后
+`git rebase origin/main`，冲突手工合并：
+
+- `video/plan.rs`：远端 VFR 归一化（`vfr_rate` 字段与 `-fps_mode cfr` argv）
+  与本地元数据三策略（`metadata_policy` + StripPrivate 警告文案）**双方都保留**；
+  `validation.rs` 的测试构造器补上 `vfr_rate: None`。
+- `docs/validation.md`：双方各自的发布/重构记录按时间序并存。
+
+rebase 后全部门禁重跑（2026-10-27，全部 EXIT=0）：
+
+```text
+cargo test                                                 → 208 passed / 0 failed（+集成 6）
+cargo test --features inproc-backends                      → 210 passed / 0 failed（+集成 6）
+cargo test --no-default-features --features inproc-backends → 210 passed / 0 failed（+集成 6）
+npm run test:frontend                                      → 25/25 PASS
+bash scripts/test_swift_history.sh                         → 全部通过
+```
+
+仓库既有真实视频 fixture 回归（`metadata_policies_hold_on_real_encoded_fixtures`
+等，bundled FFmpeg 实编实探）随 cargo 套件一并执行并通过——元数据三策略与
+StripPrivate 语义由真实编码输出探测背书。
+
 ### 残留与阻塞（不冒充通过）
 
 - **§2.7 文件级操作互斥协调器**：未新建。现有会话级闸门
