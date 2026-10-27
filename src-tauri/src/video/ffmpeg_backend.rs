@@ -177,4 +177,124 @@ mod tests {
         let mp4_kept=encode_policy(dir.path(),&mp4,&mp4_probe,&caps,"preserve","mp4");
         assert_eq!(mp4_kept.chapters.len(),1,"MP4 保留策略丢了章节");
     }
+
+    fn encode_with(dir:&Path,source:&Path,options:&VideoOptions)->super::super::probe::VideoProbe{
+        let caps=capabilities::capabilities();
+        let source_probe=probe::probe(source).unwrap();
+        let plan=plan::build(options,&source_probe,&caps,2).unwrap();
+        let out=dir.join(format!("out-{}.{}",std::process::id(),options.container));
+        let cancel=AtomicBool::new(false);
+        for pass in 1..=plan.passes{
+            let args=plan.argv(source,&out,pass,&dir.join(format!("stats-{}-{}",std::process::id(),pass)));
+            run(&args,&dir.join(format!("matrix-{}.log",std::process::id())),&cancel,|_|{}).unwrap();
+        }
+        let encoded=probe::probe(&out).unwrap();
+        validation::validate(&source_probe,&encoded,&plan).expect("输出必须通过 §56 全量校验");
+        encoded
+    }
+
+    fn make_fixture(root:&Path,name:&str,args:&[&str])->PathBuf{
+        let path=root.join(name);
+        let mut cmd=super::super::process::command("ffmpeg").unwrap();
+        cmd.args(["-hide_banner","-v","error","-nostdin","-y"]).args(args).arg(&path);
+        super::super::process::capture(cmd,Duration::from_secs(120),16*1024*1024)
+            .unwrap_or_else(|e|panic!("夹具 {name} 生成失败: {e}"));
+        path
+    }
+
+    /// §9.3 §11 真实媒体矩阵：拒绝与接受路径都由真实文件、真实编码产物背书，
+    /// 不再只用合成的 probe 值说话。需要内置 ffmpeg/ffprobe，显式运行：
+    /// `cargo test --lib s11_real_media_matrix -- --ignored`
+    #[test]
+    #[ignore="requires bundled ffmpeg/ffprobe; run explicitly for release validation"]
+    fn s11_real_media_matrix(){
+        assert!(super::super::process::tool("ffmpeg").is_ok()&&super::super::process::tool("ffprobe").is_ok(),"需要内置 ffmpeg/ffprobe");
+        let dir=tempfile::tempdir().unwrap();
+        let root=dir.path();
+        let caps=capabilities::capabilities();
+        assert!(caps.encoder("libx264").is_some()&&caps.encoder("libx265").is_some(),"内置 ffmpeg 必须有 libx264/libx265");
+        let base=VideoOptions{encoder:"libx264".into(),mode:"crf".into(),crf:Some(23.0),preset:"ultrafast".into(),audio_policy:"copy".into(),metadata_policy:"preserve".into(),container:"mkv".into(),threads:2,..Default::default()};
+
+        // ① SDR 双音轨 + 字幕 + 章节：copy 策略下轨道全部活着，输出过全量校验。
+        let meta=root.join("matrix-meta.txt");
+        fs::write(&meta,";FFMETADATA1\ntitle=Matrix\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1500\ntitle=Intro\n").unwrap();
+        let subs=root.join("matrix.srt");
+        fs::write(&subs,"1\n00:00:00,000 --> 00:00:01,000\nhello\n\n2\n00:00:01,000 --> 00:00:02,000\nmatrix\n").unwrap();
+        let multi=make_fixture(root,"multi.mkv",&[
+            "-f","lavfi","-i","testsrc2=size=160x120:rate=24:duration=2",
+            "-f","lavfi","-i","sine=frequency=440:duration=2",
+            "-f","lavfi","-i","sine=frequency=880:duration=2",
+            "-i",meta.to_str().unwrap(),"-i",subs.to_str().unwrap(),
+            "-map","0:v","-map","1:a","-map","2:a","-map","4:s",
+            "-c:v","libx264","-preset","ultrafast","-pix_fmt","yuv420p",
+            "-c:a","aac","-c:s","webvtt",
+            "-map_chapters","3","-map_metadata","3","-shortest"]);
+        let multi_probe=probe::probe(&multi).unwrap();
+        assert_eq!(multi_probe.audio().count(),2,"夹具必须真的有双音轨");
+        assert_eq!(multi_probe.subtitles().count(),1,"夹具必须真的有字幕");
+        assert_eq!(multi_probe.chapters.len(),1,"夹具必须真的有章节");
+        let multi_encoded=encode_with(root,&multi,&base);
+        assert_eq!(multi_encoded.audio().count(),2,"双音轨丢了");
+        assert_eq!(multi_encoded.subtitles().count(),1,"字幕丢了");
+        assert_eq!(multi_encoded.chapters.len(),1,"章节丢了");
+
+        // ② VFR 源：探得 VFR，计划带归一化帧率，产物时长与源一致（v0.3.2 修复的真实文件证明）。
+        // 用 mp4 + passthrough：mkv 会把丢帧后的时间戳归一化，探不出 r≠avg。
+        let vfr=make_fixture(root,"vfr.mp4",&[
+            "-f","lavfi","-i","testsrc2=size=160x120:rate=30:duration=2",
+            "-vf","select='not(mod(n\\,5))'","-fps_mode","passthrough",
+            "-c:v","libx264","-preset","ultrafast"]);
+        let vfr_probe=probe::probe(&vfr).unwrap();
+        assert!(vfr_probe.variable_frame_rate,"夹具必须真的是 VFR（r≠avg）");
+        let mut vfr_options=base.clone();vfr_options.audio_policy="none".into();vfr_options.container="mp4".into();
+        let vfr_plan=plan::build(&vfr_options,&vfr_probe,&caps,2).unwrap();
+        assert!(vfr_plan.vfr_rate.is_some(),"VFR 源未指定帧率时计划必须带归一化帧率");
+        let vfr_encoded=encode_with(root,&vfr,&vfr_options);
+        // 归一化的意义就是输出变成 CFR：平均帧率必须等于计划里的源平均帧率，
+        // 时长漂移不超过 §56 校验自身的容差（max(1%, 250ms)）。
+        let src_secs=vfr_probe.duration_us.unwrap() as f64/1e6;
+        let out_secs=vfr_encoded.duration_us.unwrap() as f64/1e6;
+        let tolerance=(src_secs*0.01).max(0.25);
+        assert!((src_secs-out_secs).abs()<=tolerance,"VFR 产物时长漂移超容差：{src_secs} → {out_secs}");
+        let expected=probe::rational(vfr_plan.vfr_rate.as_deref().unwrap()).unwrap();
+        assert!((vfr_encoded.frame_rate.unwrap()-expected).abs()<1e-6,"产物平均帧率应等于源平均帧率");
+
+        // ③ 带透明通道：argb/qtrle 必须在编码前被拒，绝不静默去掉 alpha。
+        let alpha=make_fixture(root,"alpha.mov",&[
+            "-f","lavfi","-i","testsrc2=size=160x120:rate=10:duration=1",
+            "-vf","format=argb","-c:v","qtrle"]);
+        let alpha_probe=probe::probe(&alpha).unwrap();
+        let alpha_err=plan::build(&base,&alpha_probe,&caps,2).unwrap_err();
+        assert!(alpha_err.contains("Alpha"),"alpha 输入必须被拒：{alpha_err}");
+
+        // ④ 10bit + HDR10 VUI：高位深与 HDR 输入在编码前被拒。
+        let hdr=make_fixture(root,"hdr.mp4",&[
+            "-f","lavfi","-i","testsrc2=size=160x120:rate=24:duration=1",
+            "-c:v","libx265","-preset","ultrafast","-pix_fmt","yuv420p10le",
+            "-x265-params","colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc"]);
+        let hdr_probe=probe::probe(&hdr).unwrap();
+        assert!(hdr_probe.hdr_kind!="sdr","夹具必须被探成 HDR（实际 {}）",hdr_probe.hdr_kind);
+        assert!(plan::build(&base,&hdr_probe,&caps,2).is_err(),"HDR/高位深输入必须被拒");
+
+        // ⑤ 隔行扫描：编码前被拒。
+        let interlaced=make_fixture(root,"interlaced.mkv",&[
+            "-f","lavfi","-i","testsrc2=size=160x120:rate=24:duration=1",
+            "-vf","tinterlace=interleave_top","-c:v","libx264","-preset","ultrafast",
+            "-flags","+ilme+ildct"]);
+        let inter_probe=probe::probe(&interlaced).unwrap();
+        assert!(plan::build(&base,&inter_probe,&caps,2).is_err(),"隔行输入必须被拒");
+
+        // ⑥ 损坏文件：probe 干净地失败，不 panic、不冒充成功。
+        let good=fixture(root,"mkv");
+        let corrupt=root.join("corrupt.mkv");
+        let mut bytes=fs::read(&good).unwrap();
+        for b in &mut bytes[..40] { *b=b'X'; }
+        fs::write(&corrupt,&bytes).unwrap();
+        assert!(probe::probe(&corrupt).is_err(),"被覆盖魔数的文件必须被探出来");
+
+        // ⑦ 目标体积不可达：对真实文件在 plan 阶段给出明确失败。
+        let mut tiny=base.clone();tiny.mode="targetSize".into();tiny.audio_policy="none".into();tiny.container="mp4".into();tiny.target_mi_b=Some(0.0001);
+        let sdr_probe=probe::probe(&good).unwrap();
+        assert!(plan::build(&tiny,&sdr_probe,&caps,2).is_err(),"不可达的目标体积必须被拒");
+    }
 }

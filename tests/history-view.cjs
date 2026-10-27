@@ -450,11 +450,12 @@ const actionsOf = row => row.querySelector('.media-actions').children
   const rustCommands = fs.readFileSync(
     require('node:path').join(__dirname, '..', 'src-tauri', 'src', 'commands.rs'), 'utf8');
   const restoreService = (rustCommands.match(/fn restore_entry[\s\S]*?let mut reauth/) || [''])[0];
-  assert.match(restoreService, /if restore_blocked_by_session\(&state\.compression\)/,
-    '§44 统一恢复服务必须在落盘前拒绝进行中的会话');
-  const restoreGateBody = (rustCommands.match(/fn restore_blocked_by_session[\s\S]*?\n\}/) || [''])[0];
-  assert.match(restoreGateBody, /state\(\) != CompressionState::Idle/,
-    '§44 会话闸门必须覆盖 paused / stopping，而不只是 running');
+  // §2.7：闸门已升级为维护租约 —— 与会话启动在同一原子状态上仲裁，
+  // "检查时空闲、动手前批次开跑"的窗口从结构上不存在。
+  assert.match(restoreService, /state\.compression\.begin_maintenance\(\)/,
+    '§44 统一恢复服务必须持有维护租约，才能与压缩会话真正互斥');
+  assert.match(restoreService, /RestoreError::SessionBusy/,
+    '§44 租约拿不到时仍然返回 SessionBusy');
 
   context.setCompressionState('idle', true);
   context.renderHistory();

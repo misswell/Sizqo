@@ -57,6 +57,10 @@ pub struct ReplaceTransaction {
     /// 老日志没有这两个字段：按 legacy 启发式（体积对账）处理。
     #[serde(default)]
     pub output_sha256: Option<String>,
+    /// 输出占位文件的 `(dev,ino)`。恢复时它是"这个 0 字节文件是我们的占位"的凭证；
+    /// 没有凭证的空文件一律不删（§2.5 同款身份门）。
+    #[serde(default)]
+    pub placeholder_identity: Option<(u64, u64)>,
     pub created_at: i64,
     /// PNG → JPG 这类跨格式 replace：压缩结果是个新文件，回滚时要一并删掉。
     pub cross_format: bool,
@@ -67,6 +71,21 @@ pub struct ReplaceTransaction {
 
 fn default_mode() -> TransactionMode {
     TransactionMode::ReplaceExisting
+}
+
+/// 文件系统身份 `(dev,ino)`。非 unix 平台拿不到：所有依赖它的凭证在那些平台上
+/// 退化为旧行为，不做平台差异性的安全承诺。
+pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 pub const TRANSACTIONS_DIR: &str = "transactions";
@@ -144,8 +163,23 @@ impl TransactionStore {
         found
     }
 
+    /// 读不懂的事务日志（.unparsed）：无法证明它背后的覆盖没有发生过。
+    fn unparsed_count(&self) -> usize {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("unparsed"))
+            .count()
+    }
+
     pub fn has_pending(&self) -> bool {
-        !self.list().is_empty()
+        // 先 list()：它会把半个日志改名成 .unparsed；随后计数才看得到它。
+        // 半个日志文件也算未完成事务：它背后的覆盖可能发生过，相关备份绝不能
+        // 因为"没有可解析的未完成事务"而被当成孤儿清掉（§4 审查意见）。
+        let pending = !self.list().is_empty();
+        self.unparsed_count() > 0 || pending
     }
 
     /// 启动时第一件事：把上次没走完的事务结清。
@@ -155,6 +189,13 @@ impl TransactionStore {
     /// 回滚成真正原图（宁可丢掉一次压缩结果，也不能丢掉原图），CreateNew 只删这次新建的文件。
     pub fn recover(&self, history: &HistoryStore) -> RecoveryReport {
         let mut report = RecoveryReport::default();
+        let unparsed = self.unparsed_count();
+        if unparsed > 0 {
+            report.warnings.push(format!(
+                "{unparsed} 个事务日志无法解析（已保留为 .unparsed）：无法证明其覆盖是否发生，\
+                 相关原图备份不会被任何清理触碰，请在恢复原图后人工确认"
+            ));
+        }
         for txn in self.list() {
             if history.contains_committed(&txn.history_id) {
                 self.finish(&txn.id);
@@ -244,11 +285,24 @@ fn remove_generated_output(txn: &ReplaceTransaction) {
     let source = PathBuf::from(&txn.source_path);
     if txn.cross_format || !crate::history::same_file(&PathBuf::from(&txn.output_path), &source) {
         let output = Path::new(&txn.output_path);
-        let ours = match txn.output_sha256.as_deref() {
-            // 新日志只删内容指纹对得上的产物；别人占的位置不动。
-            Some(expected) => crate::source_identity::sha256_of(output).ok().as_deref() == Some(expected),
-            // 老日志没有指纹：维持升级前契约，未提交事务的产物照原样清。
-            None => true,
+        let ours = match fs::metadata(output) {
+            // 空占位：与新建模式同款凭证 —— journal 里的 (dev,ino) 对得上才删。
+            Ok(meta) if meta.len() == 0 => {
+                matches!(
+                    (&txn.placeholder_identity, file_identity(output)),
+                    (Some(expected), Some(actual)) if expected == &actual
+                )
+            }
+            Ok(_) => match txn.output_sha256.as_deref() {
+                // 新日志只删内容指纹对得上的产物；别人占的位置不动。
+                Some(expected) => crate::source_identity::sha256_of(output)
+                    .ok()
+                    .as_deref()
+                    == Some(expected),
+                // 老日志没有指纹：维持升级前契约，未提交事务的产物照原样清。
+                None => true,
+            },
+            Err(_) => false,
         };
         if ours {
             let _ = fs::remove_file(output);
@@ -259,14 +313,33 @@ fn remove_generated_output(txn: &ReplaceTransaction) {
 
 /// 新建模式清账：只删**能证明是这次生成的**那个文件。
 ///
-/// 名字是独占申请来的，申请那一刻它不存在，所以空占位和"正好是我们承诺的体积"这两种
-/// 都归这次事务；其它体积说明这位置已经被别人的内容占了，宁可留个来历不明的文件，
-/// 也不许拿它当自己的半成品删（删用户文件永远不是恢复的选项）。
+/// 空占位要出示凭证：journal 里记的 `(dev,ino)` 与磁盘上的实际身份对得上才算数 ——
+/// 大小为零不构成身份，外部在崩溃后放进同一路径的空文件分文不动。
+/// 非空产物按内容指纹对账（§2.5 同款身份门）：大小相同不等于内容还是我们写出去的
+/// 那份，用户恰好改成了同样大小的内容时绝不能删。没有指纹可对账的日志一律保留。
 fn retire_generated_output(txn: &ReplaceTransaction) {
     let output = Path::new(&txn.output_path);
     match fs::metadata(output) {
-        Ok(meta) if meta.len() == 0 || meta.len() == txn.expected_output_size => {
-            let _ = fs::remove_file(output);
+        Ok(meta) if meta.len() == 0 => {
+            let ours = match (&txn.placeholder_identity, file_identity(output)) {
+                (Some(expected), Some(actual)) => expected == &actual,
+                _ => false,
+            };
+            if ours {
+                let _ = fs::remove_file(output);
+            }
+        }
+        Ok(meta) if meta.len() == txn.expected_output_size => {
+            let ours = match txn.output_sha256.as_deref() {
+                Some(expected) => crate::source_identity::sha256_of(output)
+                    .ok()
+                    .as_deref()
+                    == Some(expected),
+                None => false,
+            };
+            if ours {
+                let _ = fs::remove_file(output);
+            }
         }
         Ok(_) => {}
         Err(_) => {}
@@ -337,6 +410,10 @@ impl OutputNaming {
 /// 拿到就等于**已经占住**了这个名字：磁盘上多了一个我们建的 0 字节文件。
 pub struct ClaimedOutput {
     path: PathBuf,
+    /// 占位文件的 `(dev,ino)`（非 unix 平台为 None）。有了它，"这个路径上现在
+    /// 躺着的还是不是我们认领的那个占位"就有了可验证的凭证 —— 外部程序即使
+    /// 删掉占位又建了自己的同名文件，提交和清理也都不会碰它。
+    identity: Option<(u64, u64)>,
 }
 
 impl ClaimedOutput {
@@ -344,13 +421,31 @@ impl ClaimedOutput {
         &self.path
     }
 
+    /// 占位文件的文件系统身份（dev,ino）。
+    pub fn identity(&self) -> Option<(u64, u64)> {
+        self.identity
+    }
+
     pub fn into_path(self) -> PathBuf {
         self.path
     }
 
     /// 后端名字归调用方持有，但落盘前的某一步没做成：撤掉占位，别给用户留空文件。
+    /// 只有当路径上仍然是**我们认领的那个 inode** 才动手；外部放进去的内容分文不动。
     pub fn release(self) {
-        let _ = fs::remove_file(&self.path);
+        if self.still_ours() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn still_ours(&self) -> bool {
+        match (self.identity, file_identity(&self.path)) {
+            (Some(expected), Some(actual)) => expected == actual,
+            // 没有身份可比（非 unix / 文件已消失）：文件已消失时删除无意义也无害；
+            // 非 unix 平台退化为旧行为，维持平台覆盖面。
+            (None, None) => !self.path.exists(),
+            _ => false,
+        }
     }
 
     #[cfg(test)]
@@ -377,7 +472,11 @@ impl OutputNameAllocator {
                 .open(&path)
             {
                 // 句柄在这里就丢掉：我们要的只是"这个名字已经名花有主"这件事。
-                Ok(_) => return Ok(ClaimedOutput { path }),
+                // 顺手记下占位的 (dev,ino)：它就是"这个路径上是谁的文件"的凭证。
+                Ok(_) => {
+                    let identity = file_identity(&path);
+                    return Ok(ClaimedOutput { path, identity });
+                }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
                 Err(error) => {
                     return Err(format!("{}: {error}", directory.display()));
@@ -482,6 +581,27 @@ impl StagedOutput {
             .map_err(|e| format!("{} → {}: {e}", self.temp.display(), target.display()))
     }
 
+    /// 带**占位凭证**的提交：目标路径上必须还是我们认领的那个 inode 才允许 rename。
+    ///
+    /// 占位创建之后、提交之前，外部程序仍可能删掉 0 字节占位、在同一个路径上放进
+    /// 自己的文件 —— 没有这道凭证，rename 会把别人的文件整个盖掉（§2 审查意见 A）。
+    /// 凭证不可用（非 unix）时退化为普通 rename，维持平台覆盖面。
+    pub fn publish_claimed(
+        &self,
+        target: &Path,
+        identity: Option<(u64, u64)>,
+    ) -> Result<(), String> {
+        if let (Some(expected), Some(actual)) = (identity, file_identity(target)) {
+            if expected != actual {
+                return Err(format!(
+                    "输出位置已被外部改动（{} 不是本次认领的占位文件），放弃提交以保护它",
+                    target.display()
+                ));
+            }
+        }
+        self.publish(target)
+    }
+
     /// 占名 + 写入 + 改名一条龙：调用方不需要在中途记任何东西时使用。
     fn stage(
         target: &Path,
@@ -547,6 +667,7 @@ mod tests {
             expected_output_size: 10,
             original_sha256: None,
             output_sha256: None,
+            placeholder_identity: None,
             created_at: now_millis(),
             cross_format: false,
             mode: TransactionMode::ReplaceExisting,
@@ -723,6 +844,7 @@ mod tests {
             expected_output_size: expected,
             original_sha256: None,
             output_sha256: None,
+            placeholder_identity: None,
             created_at: now_millis(),
             cross_format: false,
             mode: TransactionMode::CreateNew,
@@ -743,6 +865,8 @@ mod tests {
 
         let mut record = create_new(&output, "gone", 10);
         record.source_path = source.to_string_lossy().into_owned();
+        // 真实事务在记账时就带着产物指纹（来自这次压缩的字节）。
+        record.output_sha256 = Some(crate::source_identity::sha256_bytes(b"compressed"));
         store.prepare(&record).unwrap();
 
         let report = store.recover(&history);
@@ -801,10 +925,12 @@ mod tests {
 
         let mut record = create_new(&output, "gone", 10);
         record.source_path = dir.path().join("photo.jpg").to_string_lossy().into_owned();
+        // 真实事务在记账时带着认领占位的 (dev,ino) —— 空占位凭这个凭证清账。
+        record.placeholder_identity = file_identity(&output);
         store.prepare(&record).unwrap();
 
         store.recover(&history);
-        assert!(!output.exists(), "空占位是这次申请的，除了它没人在乎");
+        assert!(!output.exists(), "空占位凭身份凭证清账，没人在乎但它得走");
     }
 
     /// 上一版写的日志里没有 `mode`：那些事务只可能来自覆盖模式，必须按覆盖模式恢复，
@@ -989,5 +1115,48 @@ mod tests {
         store.prepare(&record).unwrap();
         store.recover(&history);
         assert!(!output.exists(), "老日志的产物清理维持升级前契约");
+    }
+
+    /// §2.5 身份门在新建模式清账上的对称面：同大小、不同内容的"产物"绝不是
+    /// 我们的半成品 —— 恢复时保留现场，绝不凭体积删除。
+    #[test]
+    fn retire_never_deletes_a_same_size_file_whose_content_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (history, store) = stores(dir.path());
+        let output = dir.path().join("photo_compressed.jpg");
+        let mut record = create_new(&output, "same-size-edit", 10);
+        record.output_sha256 = Some(crate::source_identity::sha256_bytes(b"0123456789"));
+        store.prepare(&record).unwrap();
+        // 崩溃后用户把输出文件换成了同样 10 字节的别的内容。
+        fs::write(&output, b"USER EDITS").unwrap();
+
+        store.recover(&history);
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            b"USER EDITS",
+            "同大小不同内容 = 别人的文件，绝不能删"
+        );
+
+        // 内容对得上指纹的才归这次事务，照删。
+        fs::write(&output, b"0123456789").unwrap();
+        store.prepare(&record).unwrap();
+        store.recover(&history);
+        assert!(!output.exists(), "内容指纹命中才是自己的产物");
+        let _ = history;
+    }
+
+    /// §4：读不懂的事务日志也算未完成事务 —— 启动恢复给出明确警告，
+    /// hasPending 为真，任何"未引用备份"的清理都必须把它当作未完成事务对待。
+    #[test]
+    fn an_unparsable_journal_counts_as_pending_and_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (history, store) = stores(dir.path());
+        fs::create_dir_all(&store.root).unwrap();
+        fs::write(store.root.join("broken.json"), "{ half a journal").unwrap();
+
+        assert!(store.has_pending(), "损坏日志必须挡住一切依赖 has_pending 的清理");
+        let report = store.recover(&history);
+        assert!(report.warnings.iter().any(|w| w.contains("无法解析")), "{}", report.warnings.join(" / "));
+        assert!(store.has_pending(), "警告之后现场仍在：hasPending 保持为真");
     }
 }

@@ -70,13 +70,15 @@ pub enum CompressionState {
 ///
 /// 用 Notify + 轮询超时兜底：notify_waiters 与 notified.await 之间存在丢唤醒的
 /// 窗口，超时让最坏情况只是延迟几百毫秒，而不是永久卡住。
+/// 压缩会话与维护操作（恢复/清理）共用同一个原子生命周期状态仲裁：
+/// 0=空闲 1=批次 2=维护。"检查时空闲、拿到手前批次开跑"的窗口从结构上不存在，
+/// 这是恢复与压缩之间真正的互斥（§2.7），不再是一次状态检查加祈祷。
 pub struct CompressionScheduler {
+    lifecycle: AtomicUsize,
     paused: AtomicBool,
     /// 批次级的「停止」。与文件级的 `cancel_queue` 是两件事：停止不需要逐条记账，
     /// 闸门本身对后来者永久关闭。
     stopping: AtomicBool,
-    /// 是否有批次在跑，只影响前端显示的 state 文案。
-    active_batch: AtomicBool,
     max_parallelism: AtomicUsize,
     /// §63 并发账和内存账必须在同一把锁里结：拆成两个原子量分别 CAS，
     /// 两张 700 MB 的图会同时看见"还有余量"然后一起挤进 2 GB 预算。
@@ -133,9 +135,9 @@ impl CompressionScheduler {
     /// 不能因为跑测试的机器内存大小不同而改变并发行为。
     pub fn with_memory_budget(max_parallelism: usize, memory_budget: usize) -> Self {
         Self {
+            lifecycle: AtomicUsize::new(LIFECYCLE_IDLE),
             paused: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
-            active_batch: AtomicBool::new(false),
             max_parallelism: AtomicUsize::new(max_parallelism.max(MIN_PARALLELISM)),
             usage: Mutex::new(GateUsage::default()),
             memory_budget: AtomicUsize::new(memory_budget.max(1)),
@@ -185,7 +187,7 @@ impl CompressionScheduler {
     /// 是否有批次在跑。清空历史这类破坏性操作的硬保护看这个，不看前端状态。
     /// 用户点了停止但批次还在收尾时它仍然为真 —— 备份还在被认领，历史就不许被清。
     pub fn is_batch_active(&self) -> bool {
-        self.active_batch.load(Ordering::Acquire)
+        self.lifecycle.load(Ordering::Acquire) == LIFECYCLE_BATCH
     }
 
     pub fn is_paused(&self) -> bool {
@@ -237,23 +239,34 @@ impl CompressionScheduler {
     /// 失败时**一个原子位都不改**：抢会话的那个入口没有权利把正在跑的会话暂停，
     /// 更没有权利替它解除暂停。
     pub fn try_begin_batch(&self) -> bool {
-        if self.active_batch.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() { return false; }
+        if self.lifecycle.compare_exchange(LIFECYCLE_IDLE, LIFECYCLE_BATCH, Ordering::AcqRel, Ordering::Acquire).is_err() { return false; }
         self.paused.store(false, Ordering::Release);
         self.stopping.store(false, Ordering::Release);
         true
     }
 
+    /// 维护租约：恢复原图 / 清理历史在动手**之前**必须持有。与会话启动在同一个
+    /// 原子状态上仲裁，恢复与压缩不可能各拿一半检查再各走各的。
+    pub fn begin_maintenance(self: &std::sync::Arc<Self>) -> Option<MaintenanceLease> {
+        self.lifecycle
+            .compare_exchange(LIFECYCLE_IDLE, LIFECYCLE_MAINTENANCE, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(MaintenanceLease { scheduler: self.clone() })
+    }
+
     pub fn end_batch(&self) {
         self.paused.store(false, Ordering::Release);
         self.stopping.store(false, Ordering::Release);
-        self.active_batch.store(false, Ordering::Release);
+        // 只有真正持有批次的收尾才许清状态：维护租约在场时这里不可能被调用
+        //（会话根本开不起来），防御性地 CAS 而不是无条件 store。
+        let _ = self.lifecycle.compare_exchange(LIFECYCLE_BATCH, LIFECYCLE_IDLE, Ordering::AcqRel, Ordering::Acquire);
         *self.usage.lock().unwrap() = GateUsage::default();
         self.notify.notify_waiters();
     }
 
     /// idle / running / paused / stopping —— 前端按钮与 summary 的唯一真相来源。
     pub fn state(&self) -> CompressionState {
-        if !self.active_batch.load(Ordering::Acquire) {
+        if self.lifecycle.load(Ordering::Acquire) != LIFECYCLE_BATCH {
             return CompressionState::Idle;
         }
         // 停止盖过暂停：暂停中点停止，状态就该是"正在停止"，而不是一直显示暂停。
@@ -764,8 +777,24 @@ fn relative_output_path(file_path: &Path, options: &CompressOptions) -> PathBuf 
 ///
 /// 同格式覆盖的目标**就是用户原图**，那种情况下"收回占位"等于删原图 —— 所以界线就是
 /// `out_path == file_path` 这一条：只有我们新建出来的空占位才归自己删。
-fn release_output_placeholder(out_path: &Path, file_path: &Path) {
-    if out_path != file_path {
+/// 收回前必须核对占位凭证 `(dev,ino)`：外部程序即使删掉占位又放进自己的文件，
+/// 这里的清理也不会碰它（§28 审查意见 A）。
+fn release_output_placeholder(
+    out_path: &Path,
+    file_path: &Path,
+    placeholder: Option<(u64, u64)>,
+) {
+    if out_path == file_path {
+        return;
+    }
+    let still_ours = match (placeholder, crate::output_transaction::file_identity(out_path)) {
+        (Some(expected), Some(actual)) => expected == actual,
+        // 没有凭证可比（非 unix / 文件已消失）：文件已消失就无需清理；
+        // 非 unix 退化为旧行为。
+        (None, None) => !out_path.exists(),
+        _ => false,
+    };
+    if still_ours {
         let _ = fs::remove_file(out_path);
     }
 }
@@ -1192,7 +1221,7 @@ fn commit_output(
 
     // §29 先定落盘模式，再由这一个决定派生出"要不要备份""名字怎么来""事务算哪一类"。
     // 拿到手的目标名已经是独占申请到的（同格式覆盖除外：它的目标本来就是用户那个文件）。
-    let (out_path, placement) = match options.output_mode.as_str() {
+    let (out_path, placeholder, placement) = match options.output_mode.as_str() {
         "replace" => {
             // §25 覆盖的依据必须在场：读不到源文件指纹、或编码前的快照没写成，
             // 就一个字节都不许碰用户文件。原因由 Publish 统一发布成对应结论。
@@ -1220,12 +1249,7 @@ fn commit_output(
             // 引擎在"没压小就保留原图"时交回的是源格式（engine::kept_original），
             // 所以这里判到的格式差异只可能是真转换，不是失败的回落。
             if same_output_format(file_path, &out_format) {
-                (
-                    file_path.to_path_buf(),
-                    OutputPlacement::ReplaceExisting {
-                        cross_format: false,
-                    },
-                )
+                (file_path.to_path_buf(), None, OutputPlacement::ReplaceExisting { cross_format: false })
             } else {
                 // 跨格式转换的产物是新文件，但名字照样要独占申请：photo.webp 可能是
                 // 邻居的成品，"转换"把它盖掉就不是转换而是毁掉别人的东西（§28）。
@@ -1237,12 +1261,8 @@ fn commit_output(
                     },
                 )
                 .map_err(OutputWriteError::Collision)?;
-                (
-                    claimed.into_path(),
-                    OutputPlacement::ReplaceExisting {
-                        cross_format: true,
-                    },
-                )
+                let identity = claimed.identity();
+                (claimed.into_path(), identity, OutputPlacement::ReplaceExisting { cross_format: true })
             }
         }
         "suffix" => {
@@ -1255,7 +1275,8 @@ fn commit_output(
                 },
             )
             .map_err(OutputWriteError::Collision)?;
-            (claimed.into_path(), OutputPlacement::CreateNew)
+            let identity = claimed.identity();
+            (claimed.into_path(), identity, OutputPlacement::CreateNew)
         }
         "folder" => {
             // 评估说"该落盘"，输出方式却给不出目标位置（folder 没选目录）。这不是跳过，
@@ -1289,7 +1310,8 @@ fn commit_output(
                 },
             )
             .map_err(OutputWriteError::Collision)?;
-            (claimed.into_path(), OutputPlacement::CreateNew)
+            let identity = claimed.identity();
+            (claimed.into_path(), identity, OutputPlacement::CreateNew)
         }
         // 未知的输出方式：同样是配置没兑现，不许冒充"压缩完成"。
         _ => {
@@ -1309,7 +1331,7 @@ fn commit_output(
     let staged = match StagedOutput::claim(&out_path, ".sizqo-write-") {
         Ok(staged) => staged,
         Err(detail) => {
-            release_output_placeholder(&out_path, file_path);
+            release_output_placeholder(&out_path, file_path, placeholder);
             return Err(OutputWriteError::OutputWriteFailed(detail));
         }
     };
@@ -1330,6 +1352,7 @@ fn commit_output(
         // 证明不了就不会拿备份去盖一个被外部改过的文件。
         original_sha256: replace.as_ref().and_then(|identity| identity.sha256.clone()),
         output_sha256: Some(crate::source_identity::sha256_bytes(compressed)),
+        placeholder_identity: placeholder,
         created_at: crate::history::now_millis(),
         cross_format,
         mode: placement.transaction_mode(),
@@ -1337,7 +1360,7 @@ fn commit_output(
     // ③记账先于动手：写不进日志就还不许碰用户文件，占好的名字也得收回去。
     if let Err(detail) = placement.journal(transactions, &txn) {
         staged.discard();
-        release_output_placeholder(&out_path, file_path);
+        release_output_placeholder(&out_path, file_path, placeholder);
         return Err(OutputWriteError::TransactionFailed(detail));
     }
 
@@ -1346,7 +1369,7 @@ fn commit_output(
     let withdraw = |error: OutputWriteError| -> OutputWriteError {
         transactions.finish(&history_id);
         staged.discard();
-        release_output_placeholder(&out_path, file_path);
+        release_output_placeholder(&out_path, file_path, placeholder);
         error
     };
 
@@ -1356,10 +1379,11 @@ fn commit_output(
     }
 
     // ⑤改名前的最后两道门（§26「最终 Commit 前必须确认当前 source == 本次压缩所基于的
-    //   source」+ §31 的 backup check）。快速门只 stat 不读内容：改名之后就是用户的
-    //   文件了，来不及反悔，所以这一道必须便宜到任何时候都跑得动。备份则按 §27 验字节。
+    //   source」+ §31 的 backup check）。这里用**完整 verify**：快速门只 stat 不读内容，
+    //   "同大小、同修改时间"的原地改动只有内容哈希看得出来 —— 宁可多读一遍源文件，
+    //   也不能把用户刚改过的内容盖掉（与视频线同一标准）。备份则按 §27 验字节。
     if let Some(identity) = replace.as_ref() {
-        if let SourceCheck::Changed(detail) = identity.fingerprint_intact(file_path) {
+        if let SourceCheck::Changed(detail) = identity.verify(file_path) {
             return Err(withdraw(OutputWriteError::SourceChanged(detail)));
         }
         let backup = backup_file
@@ -1370,9 +1394,10 @@ fn commit_output(
         }
     }
 
-    // ⑥原子改名。到这里用户的原图才真的被换掉。
-    if let Err(detail) = staged.publish(&out_path) {
-        return Err(withdraw(OutputWriteError::OutputWriteFailed(detail)));
+    // ⑥原子改名。到这里用户的原图才真的被换掉。提交带占位凭证：目标路径上
+    //   必须还是我们认领的那个 inode，外部放进去的内容绝不盖（§28 审查意见 A）。
+    if let Err(detail) = staged.publish_claimed(&out_path, placeholder) {
+        return Err(withdraw(OutputWriteError::Collision(detail)));
     }
     staged.settle();
 
@@ -2134,9 +2159,12 @@ pub fn list_history(state: State<'_, AppState>) -> Vec<HistoryEntry> {
 /// 所以判据必须在**后端**，不能指望前端把按钮禁用住。
 #[tauri::command]
 pub fn clear_history(state: State<'_, AppState>) -> Result<usize, String> {
-    if state.compression.is_batch_active() {
-        return Err("压缩进行中，无法清空历史记录".into());
-    }
+    // §2.7 维护租约：与会话启动在同一原子状态上仲裁，清历史的检查与执行之间
+    // 不再留给会话一个开跑的窗口。
+    let _lease = match state.compression.begin_maintenance() {
+        Some(lease) => lease,
+        None => return Err("压缩进行中，无法清空历史记录".into()),
+    };
     // 批次可能刚好结束、事务还挂着（比如 worker 被取消后迟到的写入）：
     // 这时清历史会连正在跑那批的备份一起删掉，比 batch active 更严格的判据。
     if state.transactions.has_pending() {
@@ -2481,18 +2509,41 @@ fn request_folder_access(app: &AppHandle, state: &AppState, target: &Path) -> bo
     parent_ok
 }
 
-/// §44 压缩会话与历史管理是两条生命周期：会话没结束（running / paused / stopping）
-/// 前，恢复会改写正在被读的源文件，队列进度也会从「5 / 10」倒成「4 / 9」。
-fn restore_blocked_by_session(compression: &CompressionScheduler) -> bool {
-    compression.state() != CompressionState::Idle
+/// 压缩会话与维护操作（恢复/清理）共用同一个原子生命周期状态仲裁：
+/// 0=空闲 1=批次 2=维护。"检查时空闲、拿到手前批次开跑"的窗口从结构上不存在，
+/// 这是恢复与压缩之间真正的互斥（§2.7），不再是一次状态检查加祈祷。
+const LIFECYCLE_IDLE: usize = 0;
+const LIFECYCLE_BATCH: usize = 1;
+const LIFECYCLE_MAINTENANCE: usize = 2;
+
+/// 维护租约：持有期间压缩会话无法开始（同一原子状态仲裁），Drop 即释放。
+pub struct MaintenanceLease {
+    scheduler: std::sync::Arc<CompressionScheduler>,
+}
+impl Drop for MaintenanceLease {
+    fn drop(&mut self) {
+        let _ = self.scheduler.lifecycle.compare_exchange(
+            LIFECYCLE_MAINTENANCE,
+            LIFECYCLE_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 /// 统一恢复服务：主队列、历史页、恢复全部三个入口都只能走这里。
 fn restore_entry(app: &AppHandle, state: &AppState, entry: &HistoryEntry, force: bool) -> RestoreOutcome {
-    // 闸门放在最前：连冲突弹窗都不该消耗用户的一次点击。
-    if restore_blocked_by_session(&state.compression) {
-        return RestoreOutcome::failure(Some(entry), RestoreError::SessionBusy);
-    }
+    // §2.7 维护租约放在最前：与会话启动在同一原子状态上仲裁，恢复与压缩
+    // 不可能各拿一半检查再各走各的。租约持有到本次恢复结束（RAII）。
+    let _lease = match state.compression.begin_maintenance() {
+        Some(lease) => lease,
+        None => return RestoreOutcome::failure(Some(entry), RestoreError::SessionBusy),
+    };
+    restore_entry_leased(app, state, entry, force)
+}
+
+/// 已持有维护租约的恢复主体。`restore_all` 批量入口整批持一把租约时走这里。
+fn restore_entry_leased(app: &AppHandle, state: &AppState, entry: &HistoryEntry, force: bool) -> RestoreOutcome {
     let mut reauth = || {
         request_folder_access(
             app,
@@ -2732,13 +2783,17 @@ pub async fn restore_all(
     results: Vec<MediaOperationItem>,
 ) -> Result<BulkOperationResult, String> {
     // restore_entry 也会逐条拦，但批量入口要在第一次落盘前就说清整批为什么没动。
-    if restore_blocked_by_session(&state.compression) {
-        return Ok(BulkOperationResult::blocked(
-            "restore",
-            &results,
-            RestoreError::SessionBusy.message().to_string(),
-        ));
-    }
+    // 整批持同一把维护租约：批内逐条走 restore_entry_leased，不再各自抢锁。
+    let _lease = match state.compression.begin_maintenance() {
+        Some(lease) => lease,
+        None => {
+            return Ok(BulkOperationResult::blocked(
+                "restore",
+                &results,
+                RestoreError::SessionBusy.message().to_string(),
+            ))
+        }
+    };
     let mut summary = BulkOperationResult::new("restore");
 
     for item in &results {
@@ -2760,7 +2815,7 @@ pub async fn restore_all(
             ));
             continue;
         };
-        let outcome = restore_entry(&app, state.inner(), &entry, false);
+        let outcome = restore_entry_leased(&app, state.inner(), &entry, false);
         if outcome.success {
             summary.success_count += 1;
             summary.restored_files.push(outcome.file_path.clone());
@@ -3045,20 +3100,23 @@ mod tests {
         }
     }
 
-    /// §44 只有空闲才允许恢复：暂停 / 停止仍然属于同一个会话。
+    /// §2.7 恢复走维护租约：会话在跑（运行/暂停/停止）拿不到租约；空闲时拿到，
+    /// 且租约在手期间会话也开不起来 —— 两个方向都在同一个原子状态上仲裁。
     #[test]
     fn restore_is_refused_exactly_while_the_compression_session_is_active() {
-        let scheduler = CompressionScheduler::new(2);
-        assert!(!restore_blocked_by_session(&scheduler), "空闲时必须允许恢复");
-        assert!(scheduler.try_begin_batch());
-        assert!(restore_blocked_by_session(&scheduler), "运行中必须拒绝恢复");
+        let scheduler = std::sync::Arc::new(CompressionScheduler::new(2));
+        let lease = scheduler.begin_maintenance();
+        assert!(lease.is_some(), "空闲时必须允许恢复");
+        assert!(!scheduler.try_begin_batch(), "维护租约在场，会话必须开不起来");
+        drop(lease);
+        assert!(scheduler.try_begin_batch(), "租约释放后会话照常开始");
         scheduler.pause();
-        assert!(restore_blocked_by_session(&scheduler), "暂停仍属于会话，恢复继续被拒");
+        assert!(scheduler.begin_maintenance().is_none(), "暂停仍属于会话，恢复继续被拒");
         scheduler.resume();
         scheduler.stop();
-        assert!(restore_blocked_by_session(&scheduler), "停止中仍属于会话，恢复继续被拒");
+        assert!(scheduler.begin_maintenance().is_none(), "停止中仍属于会话，恢复继续被拒");
         scheduler.end_batch();
-        assert!(!restore_blocked_by_session(&scheduler), "会话结束后恢复必须放行");
+        assert!(scheduler.begin_maintenance().is_some(), "会话结束后恢复必须放行");
     }
 
     /// 同一句拒绝原话在 Rust / 前端 / Swift 各有一份实现；任何一份被改写，

@@ -435,7 +435,15 @@ final class OutputTransactionStore: @unchecked Sendable {
     }
 
     func hasPending() -> Bool {
-        !list().isEmpty
+        // 先 list()：它会把半个日志改名成 .unparsed；随后再看它。
+        // 半个日志文件也算未完成事务：它背后的覆盖可能发生过，相关备份绝不能
+        // 因为"没有可解析的未完成事务"而被当成孤儿清掉。
+        let pending = !list().isEmpty
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: root),
+           names.contains(where: { $0.hasSuffix(".unparsed") }) {
+            return true
+        }
+        return pending
     }
 
     /// 启动时第一件事：把上次没走完的事务结清。**必须早于任何清理** ——
@@ -445,6 +453,13 @@ final class OutputTransactionStore: @unchecked Sendable {
     /// 按 §29 的模式各自收拾 —— 覆盖模式回滚成真正原图，新建模式删掉这次生成的文件。
     func recover(_ history: HistoryStore) -> RecoveryReport {
         var report = RecoveryReport()
+        let unparsed = (try? FileManager.default.contentsOfDirectory(atPath: root))?
+            .filter { $0.hasSuffix(".unparsed") }.count ?? 0
+        if unparsed > 0 {
+            report.warnings.append(
+                "\(unparsed) 个事务日志无法解析（已保留为 .unparsed）：无法证明其覆盖是否发生，" +
+                "相关原图备份不会被任何清理触碰，请在恢复原图后人工确认")
+        }
         for txn in list() {
             if history.containsCommitted(txn.historyId) {
                 finish(txn.id)
@@ -533,9 +548,12 @@ final class OutputTransactionStore: @unchecked Sendable {
     /// 都归这次事务；其它体积说明这位置已经被别人的内容占了，宁可留个来历不明的文件，
     /// 也不许拿它当自己的半成品删（删用户文件永远不是恢复的选项）。
     static func retireGeneratedOutput(_ txn: ReplaceTransaction) {
-        // `fileLength` 对不存在的文件给 -1：那种情况本来就没东西要删。
+        // §2.5 同款身份门：非空产物按内容指纹对账 —— 大小相同不等于内容还是我们写
+        // 出去的那份；没有指纹可对账的日志一律保留。空占位暂不自动清理（占位 inode
+        // 凭证接线之前，宁可多留一个空文件，也绝不凭"大小为零"删东西）。
         let size = fileLength(txn.outputPath)
-        if size == 0 || size == txn.expectedOutputSize {
+        if size > 0, size == txn.expectedOutputSize, let expected = txn.outputSha256,
+           case .success(let hash) = sha256OfFile(txn.outputPath), hash == expected {
             try? FileManager.default.removeItem(atPath: txn.outputPath)
         }
         removeTemp(txn)

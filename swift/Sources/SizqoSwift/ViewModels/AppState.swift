@@ -1280,7 +1280,9 @@ final class AppState: ObservableObject {
         //    就是用户的文件了，来不及反悔，所以这一道必须便宜到任何时候都跑得动。
         //    备份则按 §27 验字节 —— 覆盖之后它是原图唯一的副本。
         if let identity = replaceIdentity, let backup = backupFile {
-            if case .changed(let detail) = identity.fingerprintIntact(at: path) {
+            // §26：终检用完整 verify —— 快速门看不出"同大小、同修改时间"的原地改动，
+            // 宁可多读一遍源文件，也不能把用户刚改过的内容盖掉（与 Rust 线同一标准）。
+            if case .changed(let detail) = identity.verify(at: path) {
                 return withdraw(.sourceChanged(detail))
             }
             if let detail = history.backupIsFaithful(backup) {

@@ -1785,16 +1785,18 @@ do {
     let newSource = canonicalPath(dir + "/newsrc.png")
     makeFile(newSource, [4, 4, 4])
     let newOutput = dir + "/newsrc_compressed.png"
-    func newTxn(_ id: String, outputSize: Int64, temp: String? = nil) -> ReplaceTransaction {
+    func newTxn(_ id: String, outputSize: Int64, temp: String? = nil, outputSha256: String? = nil) -> ReplaceTransaction {
         ReplaceTransaction(
             id: id, historyId: id, sourcePath: newSource, outputPath: newOutput,
             backupPath: "", tempOutputPath: temp, originalSize: 4, expectedOutputSize: outputSize,
+            originalSha256: nil, outputSha256: outputSha256,
             createdAt: SizqoClock.nowMillis, crossFormat: false, mode: .createNew
         )
     }
     writeData(newOutput, [9, 9])
     check(newJournal.prepare(newTxn("t-new", outputSize: 2,
-                                    temp: dir + "/t-new.tmp")) == nil,
+                                    temp: dir + "/t-new.tmp",
+                                    outputSha256: sha256OfData(Data([9, 9])))) == nil,
           "新建模式也要记账：没有这条日志，磁盘上多出来的产物没人认领")
     writeData(dir + "/t-new.tmp", [0])
     check(newJournal.recover(newStore).rolledBack == 1, "历史不认账 → 新建模式收场")

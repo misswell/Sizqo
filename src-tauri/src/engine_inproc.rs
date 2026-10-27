@@ -48,7 +48,19 @@ fn acceptable(rule: OutputRule, size: usize, original_size: u64) -> bool {
 fn no_candidate(original: Vec<u8>, out_type: &str, algorithm: &str, rule: OutputRule) -> EngineResult {
     let size = original.len() as u64;
     match rule {
-        OutputRule::BenefitOnly => kept_original(original, algorithm, size, size),
+        OutputRule::BenefitOnly => {
+            // §8：与 CLI 线同款守卫 —— 解不开的字节是损坏，不是"没有优化空间"。
+            if image::load_from_memory(&original).is_err() {
+                return rejected(
+                    original,
+                    out_type,
+                    "none",
+                    crate::result_model::ReasonCode::DecodeFailed,
+                    "无法解码：文件可能已损坏或不完整",
+                );
+            }
+            kept_original(original, algorithm, size, size)
+        }
         OutputRule::Convert => conversion_failed(
             original,
             out_type,

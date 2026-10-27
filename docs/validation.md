@@ -1080,6 +1080,59 @@ bundled FFmpeg 实编实探）随 cargo 套件在发布前通过，覆盖元数�
 运行时、FFmpeg GPL 对应源码义务仍未做（与 v0.3.1–v0.3.4 相同）。本轮按用户
 「做完就发版」的指示发布，未把上述未验证项标成已通过。
 
+## 第二轮审查修复与验收推进（2026-10-27）
+
+针对 v0.3.5（`74debeb3`）的第二轮外部审查逐条核实后的处置。**更正**：上一节
+"真实视频 fixture 回归随 cargo 套件通过"表述有误——`metadata_policies_hold_on_
+real_encoded_fixtures` 是 `#[ignore]` 的显式测试，常规套件并不运行它；本轮已
+显式运行并通过（`cargo test --lib real -- --ignored`）。
+
+### 真实媒体矩阵（§9.3 首批落地）
+
+新增两组真实文件测试并全部通过：
+
+- 视频 `s11_real_media_matrix`（`#[ignore]`，bundled FFmpeg 实编实探）：
+  SDR 双音轨+字幕+章节的 copy 全保留并通过 §56 全量校验；VFR 夹具（r=6/1、
+  avg=45/7）计划带归一化帧率且产物时长在 §56 容差内；argb/qtrle 的 Alpha
+  输入在编码前被拒；10bit+HDR10 VUI 被拒；隔行被拒；魔数被覆盖的损坏文件被
+  probe 干净拒绝；物理不可达的目标体积在 plan 被拒。
+- 图片 `tests/real_media_matrix.rs`（常规套件）：带 Alpha 的 PNG 压缩后透明
+  区保留；损坏 JPEG/空文件干净失败；Unicode+空格路径正常压缩；64 字节的
+  物理不可达预算不会被报告为命中。
+- **矩阵抓到并修复的真实缺陷**：损坏 JPEG 的解码失败在 `compress_jpg` 被静默
+  跳过、最终归类为 KeptOriginal（"原图已是最优压缩"）。修复：新增
+  `corrupted_source` 守卫，png/jpg/gif/webp 四条回退路径在"没有任何编码器
+  产出"时先验证源文件可解码，解不开 → `DecodeFailed` 明确失败；heic/avif/jxl
+  的解码在外部 CLI 里无法就地区分，维持原语义（留档）。
+
+### 第二轮审查 8 条的处置
+
+| # | 审查意见 | 处置 |
+| --- | --- | --- |
+| 1 | 同大小内容被改的输出被 retire 误删 | **已修**：`retire_generated_output` 非空产物必须内容指纹命中才删，无指纹一律保留；空占位须 `(dev,ino)` 凭证命中（journal 记录 `placeholder_identity`）。Swift 同款指纹门 |
+| 2 | 占位文件所有权竞态（A）+ 认领先于记账（B） | **A 已修**：`publish_claimed` 提交前核对目标 inode 仍是认领的占位；`release_output_placeholder` / `ClaimedOutput::release` 同款凭证，外部放入的文件绝不碰。**B 部分缓解**：有 journal 的占位凭 inode 清理；崩在"认领与记账之间"的 0 字节孤儿保守保留（删除它同样需要凭证），下一次同名认领自动顺延 `_1` |
+| 3 | 恢复与压缩之间非原子竞争窗口 | **已修**：调度器生命周期改为单一原子状态（0=空闲/1=批次/2=维护）；`restore_entry`/`restore_all`/`clear_history` 在动手前获取维护租约（RAII），租约在场时会话开不起来，会话在场时租约拿不到——两个方向都原子 |
+| 4 | 损坏事务日志导致备份被清理 | **已修**（Rust+Swift）：`.unparsed` 计入 `has_pending`，一切依赖该判据的清理都不会把相关备份当孤儿；`recover` 给出明确警告 |
+| 5 | 视频输出指纹 `.ok()` 吞错 + 非覆盖无事务 | **已修**：指纹计算失败在记账与覆盖之前终止提交；视频非覆盖模式补齐 `CreateNew` 事务（prepare + 失败 retire），与图片线同构 |
+| 6 | 图片终检只查 stat 指纹 | **已修**（Rust+Swift）：改名前最后两道门改用完整 `verify`（内容哈希），与视频线同一标准 |
+| 7 | 队列仍有全量重排，缺基准 | **部分**：Set 与 encoding tick 降频已在 v0.3.5；排序脏标记与 1,000/5,000/10,000 实测基准**未完成**，见下方遗留 |
+| 8 | 老日志无条件回滚 | **维持原决策**：无身份信息的老日志按升级前契约回滚，否则旧崩溃现场的原图永远滞留在备份里；风险窗口（升级前崩溃+升级后人为改动同一文件）与残留概率已在第一轮记录。重新评估的结论：保留，但已在日志中明示 |
+
+新增 Rust 测试：`retire_never_deletes_a_same_size_file_whose_content_changed`、
+`an_unparsable_journal_counts_as_pending_and_warns`、
+`restore_is_refused_exactly_while_the_compression_session_is_active`（租约双向）。
+
+### 已知不对称与遗留（不冒充完成）
+
+- **Swift 占位 inode 凭证未接线**：Swift 的空占位清账暂保守保留（不删），
+  Rust 按 `(dev,ino)` 凭证清理；非空产物的指纹门两侧一致。
+- **Swift 调度器维护租约未加**：Swift 侧恢复闸门仍是 `isCompressing` 状态检查；
+  Rust 的 lifecycle 租约先行，Swift 接线列入下一轮。
+- **视频 CreateNew 事务的崩溃恢复测试**：事务与 retire 语义与图片共用同一实现
+  （output_transaction 测试覆盖），端到端视频崩溃注入未单独补。
+- **1,000/5,000/10,000 性能基准、排序脏标记、签名应用 GUI 点击验收、
+  App Store 沙盒运行**：仍未完成，继续标记为未通过。
+
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
 Before any tag/Release: full three-track build, signed Direct runtime check,

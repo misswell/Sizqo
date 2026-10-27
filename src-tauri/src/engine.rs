@@ -592,6 +592,25 @@ fn kept_original(original: Vec<u8>, algorithm: &str, orig_size: u64, comp_size: 
     no_improvement(original, source_type, algorithm, orig_size, comp_size)
 }
 
+/// 解码失败的明确结论：文件读得出来但任何解码器都解不开 = 数据损坏，
+/// 不是"没有优化空间"。§8：把损坏吞成"已是最优"会让它在界面上永远显示
+/// 为跳过而不是失败，用户也就永远不会知道这张图是坏的。
+///
+/// 只用于 image crate 能解的格式（png/jpg/gif/webp）；heic/avif/jxl 的解码
+/// 在外部 CLI 里，CLI 失败与"压不小"无法在这里区分，维持原语义。
+fn corrupted_source(original: &[u8], source_type: &str) -> Option<EngineResult> {
+    if image::load_from_memory(original).is_err() {
+        return Some(rejected(
+            original.to_vec(),
+            source_type,
+            "none",
+            ReasonCode::DecodeFailed,
+            "无法解码：文件可能已损坏或不完整",
+        ));
+    }
+    None
+}
+
 // ─── 动画保护（§23） ────────────────────────────────────────────
 
 /// 源文件是否是动画，以及是哪一种。`None` = 可以按单帧处理。
@@ -798,7 +817,10 @@ async fn compress_png(file: &Path, options: &CompressOptions, rule: OutputRule) 
     }
 
     match rule {
-        OutputRule::BenefitOnly => kept_original(original, "pngquant", original_size, original_size),
+        OutputRule::BenefitOnly => {
+            if let Some(failure) = corrupted_source(&original, "png") { return failure; }
+            kept_original(original, "pngquant", original_size, original_size)
+        },
         OutputRule::Convert => {
             conversion_failed(original, "png", "没能产出 PNG：所有编码器都没有交回有效字节")
         }
@@ -877,7 +899,10 @@ async fn compress_jpg(file: &Path, options: &CompressOptions, rule: OutputRule) 
     }
 
     match rule {
-        OutputRule::BenefitOnly => kept_original(original, "mozjpeg", original_size, original_size),
+        OutputRule::BenefitOnly => {
+            if let Some(failure) = corrupted_source(&original, "jpg") { return failure; }
+            kept_original(original, "mozjpeg", original_size, original_size)
+        },
         OutputRule::Convert => {
             conversion_failed(original, "jpg", "没能产出 JPEG：所有编码器都没有交回有效字节")
         }
@@ -931,7 +956,10 @@ async fn compress_gif(file: &Path, options: &CompressOptions, rule: OutputRule) 
     // 没有 gifsicle 时进程内重编码只会取第一帧；这里宁可保留原图，
     // 也不产出一个"看起来成功、其实动画没了"的 GIF（§23）。
     match rule {
-        OutputRule::BenefitOnly => kept_original(original, "gifsicle", original_size, original_size),
+        OutputRule::BenefitOnly => {
+            if let Some(failure) = corrupted_source(&original, "gif") { return failure; }
+            kept_original(original, "gifsicle", original_size, original_size)
+        },
         OutputRule::Convert => {
             conversion_failed(original, "gif", "没有可用的 GIF 编码器，无法在保留动画的前提下转换")
         }
@@ -973,7 +1001,10 @@ async fn compress_to_webp(file: &Path, options: &CompressOptions, rule: OutputRu
     }
 
     match rule {
-        OutputRule::BenefitOnly => kept_original(original, "cwebp", original_size, original_size),
+        OutputRule::BenefitOnly => {
+            if let Some(failure) = corrupted_source(&original, "webp") { return failure; }
+            kept_original(original, "cwebp", original_size, original_size)
+        },
         OutputRule::Convert => {
             conversion_failed(original, "webp", "没能产出 WebP：cwebp 没有交回有效字节")
         }

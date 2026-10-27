@@ -47,9 +47,10 @@ pub fn commit(source:&Path,partial:&Path,target:&Path,o:&VideoOptions,probe:&Vid
     if let Some(ref backup)=backup {fs::File::open(backup).and_then(|f|f.sync_all()).map_err(|e|e.to_string())?;sync_dir(backup.parent().ok_or("Backup parent missing")?)?;}
     let id=HistoryEntry::new_id(source);
     // §2.5：产物哈希在记账前算好 —— 恢复时要靠它证明"源位置上的字节是我们写出去的"。
-    let output_sha256=crate::source_identity::sha256_of(partial).ok();
-    let txn=backup.as_ref().map(|b|ReplaceTransaction{id:id.clone(),history_id:id.clone(),source_path:source.to_string_lossy().into(),output_path:target.to_string_lossy().into(),backup_path:b.to_string_lossy().into(),temp_output_path:Some(partial.to_string_lossy().into()),original_size:probe.size_bytes,expected_output_size:size,original_sha256:identity.sha256.clone(),output_sha256,created_at:now_millis(),cross_format:false,mode:TransactionMode::ReplaceExisting});
-    if let Some(t)=txn.as_ref(){transactions.prepare_durable(t)?;}
+    // 指纹算不出来就必须在覆盖之前终止：没有恢复依据的覆盖等于裸奔（§5 审查意见）。
+    let output_sha256=Some(crate::source_identity::sha256_of(partial).map_err(|e|e.to_string())?);
+    let txn=Some(ReplaceTransaction{id:id.clone(),history_id:id.clone(),source_path:source.to_string_lossy().into(),output_path:target.to_string_lossy().into(),backup_path:backup.as_ref().map(|p|p.to_string_lossy().into()).unwrap_or_default(),temp_output_path:Some(partial.to_string_lossy().into()),original_size:probe.size_bytes,expected_output_size:size,original_sha256:identity.sha256.clone(),output_sha256,placeholder_identity:None,created_at:now_millis(),cross_format:false,mode:if replace{TransactionMode::ReplaceExisting}else{TransactionMode::CreateNew}});
+    if replace{transactions.prepare_durable(txn.as_ref().unwrap())?;}else{transactions.prepare(txn.as_ref().unwrap())?;}
     let mut claimed=false;
     let install=(||{
         // 备份可能拷了很久：改名前再核一次（§25）。
