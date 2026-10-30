@@ -973,10 +973,13 @@ async function validateVideoBatch(paths, options) {
     var reason = videoCapabilities.reason || localizeUiText('视频编码当前不可用');
     return { valid: false, globalErrors: [reason], warnings: [], failures: paths.map(function(path) { return { path: path, message: reason }; }) };
   }
-  // §5.3 逐项校验：把每个不兼容的视频都收进 failures，而不是在第一个就短路 ——
+  // §5.3 §7.2 逐项校验：把每个不兼容的视频都收进 failures，而不是在第一个就短路 ——
   // 一个文件不兼容只标记它自己，其余有效视频照常开跑。
+  // 批量接口一次 IPC 校验整批：本地判据先筛掉不兼容的，剩下的交给后端逐文件作答；
+  // 不再对 100 个视频连发 100 次 validate_video_options。
   var failures = [];
   var warnings = [];
+  var batchItems = [];
   for (var i = 0; i < paths.length; i++) {
     var path = paths[i];
     var item = queueItems.get(path);
@@ -986,18 +989,23 @@ async function validateVideoBatch(paths, options) {
       failures.push({ path: path, message: (local.errors || []).join(' · ') || localizeUiText('该视频与当前设置不兼容') });
       continue;
     }
+    batchItems.push({ path: path, probe: item.videoProbe });
+  }
+  if (batchItems.length > 0) {
     try {
-      var verdict = await invoke('validate_video_options', { options: options, probe: item.videoProbe });
-      if (verdict === false || (verdict && verdict.valid === false)) {
-        failures.push({
-          path: path,
-          message: verdict && verdict.errors && verdict.errors.length ? verdict.errors.join(' · ') : localizeUiText('该视频与当前设置不兼容'),
-        });
-      } else if (verdict && Array.isArray(verdict.warnings)) {
-        warnings = warnings.concat(verdict.warnings);
-      }
+      var results = await invoke('validate_video_batch', { items: batchItems, options: options });
+      (results || []).forEach(function(result) {
+        if (!result.valid) {
+          failures.push({ path: result.path, message: result.reason || localizeUiText('该视频与当前设置不兼容') });
+        } else if (Array.isArray(result.warnings)) {
+          warnings = warnings.concat(result.warnings);
+        }
+      });
     } catch (error) {
-      failures.push({ path: path, message: error.message || localizeUiText('视频参数校验失败') });
+      // 批量接口本身失败：全部逐文件记失败，不许静默放行。
+      batchItems.forEach(function(entry) {
+        failures.push({ path: entry.path, message: error.message || localizeUiText('视频参数校验失败') });
+      });
     }
   }
   return { valid: failures.length === 0, globalErrors: [], warnings: warnings, failures: failures };
@@ -1304,6 +1312,10 @@ var fileRows = {};
 var queueSortDescending = false;
 var pendingImports = Promise.resolve();
 var queueRevision = 0;
+// §7.1 预检代次：清空队列/下一轮时立刻失效掉还在飞的预检逻辑。
+// queueRevision 只保护"会话开始之后"的事件，预检窗口（授权弹窗、批量校验这些
+// await 之间）需要自己的代次号 —— 清空时两个都要 ++。
+var preflightToken = 0;
 
 function getRunnablePendingPaths(requestedPaths) {
   var requested = getPendingQueuePaths(requestedPaths);
@@ -2139,7 +2151,7 @@ async function cancelCurrentVideo(taskId) {
   }
 }
 
-async function restoreVideoResult(result, force) {
+async function restoreVideoResult(result, force, acceptLegacy) {
   if (!result || !result.historyId) return;
   if (restoreBlockedBySession()) {
     showToast(restoreBlockedText());
@@ -2148,11 +2160,18 @@ async function restoreVideoResult(result, force) {
   if (result.outputMode !== 'replace' && !confirm(localizeUiText('删除这次压缩结果？\n将删除 ') + (result.outputPath || '')
     + localizeUiText('，并移除这条历史记录。原图未被覆盖，不受影响。'))) return;
   var outcome;
-  try { outcome = await invoke('restore_history_entry', { historyId: result.historyId, force: !!force }); }
+  try { outcome = await invoke('restore_history_entry', {
+    historyId: result.historyId, force: !!force, acceptLegacy: !!acceptLegacy,
+  }); }
   catch (error) { showToast(localizeUiText('恢复失败: ') + (error.message || error)); return; }
   if (outcome.conflict) {
     if (!confirm(RESTORE_CONFLICT_TEXT)) return;
-    await restoreVideoResult(result, true);
+    await restoreVideoResult(result, true, acceptLegacy);
+    return;
+  }
+  if (outcome.legacyBackup) {
+    if (!confirm(RESTORE_LEGACY_BACKUP_TEXT)) return;
+    await restoreVideoResult(result, force, true);
     return;
   }
   if (!outcome.success) { showToast(localizeBackendText(outcome.error) || localizeUiText('恢复失败')); return; }
@@ -2614,6 +2633,8 @@ function clearAllFiles() {
   // 真正把它收回来的仍然是发起它的那次调用（它会在 finally 里收尾）。
   var wasCompressing = isCompressing;
   queueRevision++;
+  // §7.1 作废还在飞的预检：授权弹窗/批量校验回来后代次对不上，直接收场。
+  preflightToken++;
   if (wasCompressing && executionSession) {
     // 一次调用取消整批：逐个 invoke 会让每个请求都顺手动一次暂停闸门，
     // 队列会在清空过程中被重新放行。
@@ -2645,6 +2666,7 @@ function resetQueue() {
 function startNextRound() {
   if (isCompressing) return;
   queueRevision++;
+  preflightToken++;
   resetQueue();
   updateQueueSummary();
   renderDetailPane();
@@ -2730,6 +2752,7 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
   // 那几步里不该亮出"暂停/停止"按钮和「压缩中…」。
   setCompressionState(COMPRESSION_RUNNING, true);
   var runRevision = queueRevision;
+  var myPreflight = preflightToken;
 
   var hasOutputAccess = true;
   if (imagePaths.length > 0 && systemModeActive()) {
@@ -2745,7 +2768,7 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
     updateQueueSummary();
     return;
   }
-  if (runRevision !== queueRevision) {
+  if (runRevision !== queueRevision || myPreflight !== preflightToken) {
     setCompressionState(COMPRESSION_IDLE, true);
     updateQueueSummary();
     return;
@@ -2775,6 +2798,13 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
   var videoOptions = videoPaths.length > 0 ? videoOptionsFromControls() : null;
   if (videoPaths.length > 0) {
     var videoVerdict = await validateVideoBatch(videoPaths, videoOptions);
+    // §7.1 批量校验的 await 之间队列可能已被清空：代次对不上就立刻收场，
+    // 绝不许拿着过期路径继续走到 beginExecutionSession。
+    if (runRevision !== queueRevision || myPreflight !== preflightToken) {
+      setCompressionState(COMPRESSION_IDLE, true);
+      updateQueueSummary();
+      return;
+    }
     var globalErrors = videoVerdict.globalErrors || [];
     if (globalErrors.length) {
       // 能力级失效（视频编码整体不可用）：整批都进不了，按会话级失败收场。
@@ -2820,6 +2850,19 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
     image: imageRequestFromIntent(),
     video: videoPaths.length > 0 ? videoRequestFromIntent() : null,
   };
+  // §7.1 会话开始前的最后一道：这一轮要带的每个文件必须**此刻仍在队列里、
+  // 仍是 pending**。预检窗口里被清掉/被移除/已被别轮收编的都不许带上。
+  batchPaths = batchPaths.filter(function(filePath) {
+    var item = queueItems.get(filePath);
+    return !!item && item.state === 'pending';
+  });
+  if (batchPaths.length === 0) {
+    setCompressionState(COMPRESSION_IDLE, true);
+    updateQueueSummary();
+    return;
+  }
+  imagePaths = imagePaths.filter(function(path) { return batchPaths.indexOf(path) >= 0; });
+  videoPaths = videoPaths.filter(function(path) { return batchPaths.indexOf(path) >= 0; });
   var session = beginExecutionSession(batchPaths);
   // 会话真的开起来了：compressOneFile 靠这个返回值决定要不要把抹掉的状态放回去。
   var started = true;
@@ -3693,6 +3736,8 @@ async function openInFinder(filePath) {
 
 // 压缩后又用别的 App 改过图：恢复会覆盖那个新版本，必须先问。
 var RESTORE_CONFLICT_TEXT = localizeUiText('这个文件在压缩后又被修改过。\n恢复原图会覆盖当前版本。');
+// §2.3 旧版本备份没有内容指纹：确认的是"完整性未知"，不是"已知损坏"。
+var RESTORE_LEGACY_BACKUP_TEXT = localizeUiText('这份备份来自旧版本，缺少内容指纹。\nSizqo 无法验证它的完整性，仍要尝试恢复吗？');
 
 /// 恢复成功后的统一收尾：主队列、历史页、对比窗口都只走这里。
 /// skipRefresh 供批量恢复使用，避免每个文件重绘一次结果列表。
@@ -3704,21 +3749,28 @@ function afterRestore(filePath, skipRefresh) {
   refreshHistoryIfOpen();
 }
 
-async function restoreOriginal(filePath, force) {
+async function restoreOriginal(filePath, force, acceptLegacy) {
   if (restoreBlockedBySession()) {
     showToast(restoreBlockedText());
     return;
   }
   var outcome;
   try {
-    outcome = await invoke('restore_original', { filePath: filePath, force: !!force });
+    outcome = await invoke('restore_original', {
+      filePath: filePath, force: !!force, acceptLegacy: !!acceptLegacy,
+    });
   } catch (error) {
     showToast(localizeUiText('恢复失败: ') + (error.message || error));
     return;
   }
   if (outcome.conflict) {
     if (!confirm(RESTORE_CONFLICT_TEXT)) return;
-    await restoreOriginal(filePath, true);
+    await restoreOriginal(filePath, true, acceptLegacy);
+    return;
+  }
+  if (outcome.legacyBackup) {
+    if (!confirm(RESTORE_LEGACY_BACKUP_TEXT)) return;
+    await restoreOriginal(filePath, force, true);
     return;
   }
   if (!outcome.success) {
@@ -4587,21 +4639,28 @@ function refreshHistoryIfOpen() {
   if (currentView === 'history') refreshHistory();
 }
 
-async function restoreFromHistory(entry, force) {
+async function restoreFromHistory(entry, force, acceptLegacy) {
   if (restoreBlockedBySession()) {
     showToast(restoreBlockedText());
     return;
   }
   var outcome;
   try {
-    outcome = await invoke('restore_history_entry', { historyId: entry.id, force: !!force });
+    outcome = await invoke('restore_history_entry', {
+      historyId: entry.id, force: !!force, acceptLegacy: !!acceptLegacy,
+    });
   } catch (error) {
     showToast(localizeUiText('恢复失败: ') + (error.message || error));
     return;
   }
   if (outcome.conflict) {
     if (!confirm(RESTORE_CONFLICT_TEXT)) return;
-    await restoreFromHistory(entry, true);
+    await restoreFromHistory(entry, true, acceptLegacy);
+    return;
+  }
+  if (outcome.legacyBackup) {
+    if (!confirm(RESTORE_LEGACY_BACKUP_TEXT)) return;
+    await restoreFromHistory(entry, force, true);
     return;
   }
   if (!outcome.success) {

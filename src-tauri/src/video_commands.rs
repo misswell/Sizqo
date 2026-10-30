@@ -24,6 +24,10 @@ fn collect(root:&Path,path:&Path,seen:&mut HashSet<PathBuf>,out:&mut Vec<(PathBu
     // 会让"明明是子路径"的两个字符串对不上，相对路径就退化成文件名。
     let Ok(root)=root.canonicalize()else{return};
     let Ok(real)=path.canonicalize()else{return};if !seen.insert(real.clone()){return;}
+    // §8.1 默认不跟随指向根目录之外的符号链接：软链指去别的盘/别的目录时，
+    // 导入的就成了链接目标而不是用户点开的那份树。目录循环本身由 seen 集合
+    // （规范路径去重）兜住，这里再补一道"不许越界"。
+    if real.starts_with(&root)==false {return;}
     if real.is_dir(){if let Ok(children)=std::fs::read_dir(&real){let mut children:Vec<_>=children.flatten().map(|e|e.path()).collect();children.sort();for p in children{collect(&root,&p,seen,out);}}}else if real.is_file(){
         let rel=real.strip_prefix(&root).map(Path::to_path_buf).unwrap_or_else(|_|PathBuf::from(real.file_name().unwrap_or_default()));
         out.push((real,root,rel));
@@ -83,8 +87,28 @@ pub async fn probe_media(paths:Vec<String>,state:State<'_,AppState>)->Result<Vec
         let workers=std::thread::available_parallelism().map(|n|n.get()).unwrap_or(2).min(4).max(1);
         if candidates.len()>1&&workers>1{
             let chunk_size=candidates.len().div_ceil(workers);
+            // §8.1 线程 panic 不许静默吞掉整块结果：worker 炸了就把那一块的
+            // 每个文件标成失败原因"import worker panicked"，其余块照常回收。
             let filled:Vec<Vec<(usize,Option<ImportedMedia>)>>=std::thread::scope(|scope|{
-                let handles:Vec<_>=candidates.chunks(chunk_size).map(|chunk|{let chunk:Vec<Candidate>=chunk.to_vec();scope.spawn(move||chunk.into_iter().map(|c|probe_video(c.index,&c.path,c.name,c.source_root,c.relative,c.size)).collect::<Vec<_>>())}).collect();
+                let handles:Vec<_>=candidates.chunks(chunk_size).map(|chunk|{let chunk:Vec<Candidate>=chunk.to_vec();scope.spawn(move||{
+                    // §8.1 panic 隔离：探测闭包只**借用**块数据，panic 之后块还在
+                    // 外层手里 —— 把这一块的每个文件按"探测失败"入队（带原因），
+                    // 其余块照常回收。整块静默消失是被禁止的。
+                    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{
+                        chunk.iter().map(|c|probe_video(c.index,&c.path,c.name.clone(),c.source_root.clone(),c.relative.clone(),c.size)).collect::<Vec<(usize,Option<ImportedMedia>)>>()
+                    }));
+                    match result{
+                        Ok(entries)=>entries,
+                        Err(_)=>{
+                            log::error!("导入探测 worker panic，本块 {} 个文件按探测失败处理",chunk.len());
+                            chunk.iter().map(|c|(c.index,Some(ImportedMedia{
+                                path:c.path.to_string_lossy().into(),name:c.name.clone(),size:c.size,
+                                media_kind:"video".into(),video_probe:None,
+                                warning:Some("import worker panicked".into()),
+                                source_root:c.source_root.clone(),relative_path:c.relative.clone()}))).collect()
+                        }
+                    }
+                })}).collect();
                 handles.into_iter().filter_map(|handle|handle.join().ok()).collect()
             });
             for batch in filled{for (index,entry) in batch{slots[index]=entry;}}
@@ -109,6 +133,56 @@ pub async fn get_video_presets(app:AppHandle)->Result<Vec<video::presets::VideoP
 }
 #[tauri::command]
 pub async fn validate_video_options(options:VideoOptions,probe:VideoProbe,state:State<'_,AppState>)->Result<video::plan::EncodePlan,String>{let c=get_video_capabilities().await?;video::plan::build(&options,&probe,&c,state.compression.max_parallelism())}
+
+/// §7.2 单个视频的预检结果。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoPreflightResult {
+    pub path: String,
+    pub valid: bool,
+    pub reason: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+/// §7.2 批量预检的入参：路径 + 导入时缓存的探测结果。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct VideoPreflightItem {
+    pub path: String,
+    pub probe: VideoProbe,
+}
+
+/// §7.2 批量预检：**一次 IPC** 校验整批视频，前端不再对 100 个视频连发 100 次
+/// `validate_video_options`。探测在导入时已完成并随队列项缓存，这里只跑纯 CPU
+/// 的计划构建；单个失败不阻塞其他文件，逐文件独立作答。
+#[tauri::command]
+pub async fn validate_video_batch(
+    items: Vec<VideoPreflightItem>,
+    options: VideoOptions,
+    state: State<'_, AppState>,
+) -> Result<Vec<VideoPreflightResult>, String> {
+    let caps = get_video_capabilities().await?;
+    let budget = state.compression.max_parallelism();
+    // plan::build 是纯 CPU（微秒级、无 IO），顺序跑完即可；真正的开销本来就在
+    // 每文件一次的 IPC 往返上，批量接口把它从 N 次压成 1 次。
+    let results = items
+        .into_iter()
+        .map(|item| match video::plan::build(&options, &item.probe, &caps, budget) {
+            Ok(plan) => VideoPreflightResult {
+                path: item.path,
+                valid: true,
+                reason: None,
+                warnings: plan.warnings,
+            },
+            Err(reason) => VideoPreflightResult {
+                path: item.path,
+                valid: false,
+                reason: Some(reason),
+                warnings: vec![],
+            },
+        })
+        .collect();
+    Ok(results)
+}
 #[tauri::command]
 pub fn save_video_preset(name:String,options:VideoOptions,app:AppHandle)->Result<(),String>{
     // Names never become filesystem paths; all presets share one atomic store.

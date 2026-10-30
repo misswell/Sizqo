@@ -256,6 +256,7 @@
     '原图未被覆盖，无需恢复': 'The original was never overwritten, so there is nothing to restore',
     '原图备份已清理，无法恢复': 'The original backup was already cleaned up, so this cannot be restored',
     '这个文件在压缩后又被修改过': 'This file was modified again after compression',
+    '该备份来自旧版本，缺少内容指纹': 'This backup came from an older version and has no content fingerprint',
     '没有该文件夹的访问权限，请重新授权': 'Sizqo no longer has access to that folder, please grant it again',
     ' · 已恢复 ': ' · restored ',
     // §44 会话期间恢复被禁用时，行 / 详情 / 批量按钮共用这一句原因。

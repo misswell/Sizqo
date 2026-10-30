@@ -24,6 +24,8 @@ pub struct VideoProbe {
     pub color_metadata: Value, pub chapters: Vec<Value>, pub warnings: Vec<String>,
     pub width: u32, pub height: u32, pub frame_rate: Option<f64>, pub bit_rate: Option<u64>,
     pub variable_frame_rate: bool,
+    /// §6 program 级 metadata 的载体。校验隐私清理时必须遍历到这里。
+    #[serde(default)] pub programs: Vec<Value>,
 }
 fn text(v:&Value,k:&str)->String {v[k].as_str().unwrap_or("").into()}
 fn uint(v:&Value,k:&str)->u64 { v[k].as_u64().or_else(||v[k].as_str()?.parse().ok()).unwrap_or(0) }
@@ -57,18 +59,26 @@ impl VideoProbe {
             .or_else(||video.raw["duration"].as_str()?.parse::<f64>().ok());
         let duration_us=duration.filter(|s|s.is_finite()&&*s>0.0&&*s<(u64::MAX as f64/1e6)).map(|s|(s*1e6) as u64);
         let side=video.side_data.to_string().to_lowercase();
+        // §5.2 HDR 由传递函数与动态元数据判定：PQ / HLG / Dolby Vision / HDR10+。
+        // BT.2020 原色只表示色彩原色 —— 把它当 HDR 是误判，把它当 BT.709 静默转换
+        // 是错误；它由能力分类器按"色彩空间未验证"单独拒绝。
         let hdr_kind=if side.contains("dovi")||side.contains("dolby") {"dolbyVision"}
             else if side.contains("hdr10+")||side.contains("smpte2094") {"hdr10Plus"}
-            else if video.color_transfer=="smpte2084"||video.color_transfer=="arib-std-b67"||video.color_primaries=="bt2020"||side.contains("mastering display") {"hdr"} else {"sdr"};
+            else if video.color_transfer=="smpte2084" {"hdr10"}
+            else if video.color_transfer=="arib-std-b67" {"hlg"}
+            else if side.contains("mastering display") {"hdr"}
+            else {"sdr"};
         let rotation=video.side_data.as_array().and_then(|a|a.iter().find_map(|d|d["rotation"].as_i64()))
             .or_else(||video.tags["rotate"].as_str()?.parse().ok()).unwrap_or(0) as i32;
         let mut warnings=vec![];
         let variable_frame_rate=matches!((rational(&text(&video.raw,"r_frame_rate")),video.frame_rate),(Some(r),Some(a)) if r!=a);
-        if variable_frame_rate { warnings.push("Variable frame rate detected; duration is preserved by using the source average frame rate unless a frame rate is selected".into()); }
+        if variable_frame_rate { warnings.push("Variable frame rate detected; original timestamps are preserved (passthrough) unless a frame rate is selected".into()); }
         let color_metadata=serde_json::json!({"transfer":video.color_transfer,"primaries":video.color_primaries,"space":video.color_space,"pixelFormat":video.pixel_format});
         let (width,height,frame_rate)=(video.width,video.height,video.frame_rate);
         Ok(Self {duration_us,streams,format:text(&root["format"],"format_name"),format_tags:root["format"]["tags"].clone(),size_bytes:size,rotation,hdr_kind:hdr_kind.into(),color_metadata,
-            chapters:root["chapters"].as_array().cloned().unwrap_or_default(),warnings,width,height,frame_rate,
+            chapters:root["chapters"].as_array().cloned().unwrap_or_default(),
+            programs:root["programs"].as_array().cloned().unwrap_or_default(),
+            warnings,width,height,frame_rate,
             bit_rate:Some(uint(&root["format"],"bit_rate")).filter(|n|*n>0),variable_frame_rate})
     }
 }
@@ -83,7 +93,8 @@ pub fn probe_with_timeout(path:&Path,timeout:std::time::Duration)->Result<VideoP
     let size=std::fs::metadata(&path).map_err(|e|e.to_string())?.len();
     if size==0 {return Err("Empty file".into());}
     let mut cmd=super::process::command("ffprobe")?;
-    cmd.args(["-v","error","-protocol_whitelist","file,pipe","-show_format","-show_streams","-show_chapters","-of","json"]).arg(path);
+    // §6 program 也要采：隐私校验必须遍历得到 program 级 metadata。
+    cmd.args(["-v","error","-protocol_whitelist","file,pipe","-show_format","-show_streams","-show_chapters","-show_programs","-of","json"]).arg(path);
     let out=super::process::capture(cmd,timeout,8*1024*1024)?;
     VideoProbe::parse(serde_json::from_slice(&out).map_err(|e|e.to_string())?,size)
 }
@@ -92,12 +103,28 @@ pub fn probe(_path:&Path)->Result<VideoProbe,String> {Err(super::capabilities::N
 #[cfg(feature="inproc-backends")]
 pub fn probe_with_timeout(_path:&Path,_timeout:std::time::Duration)->Result<VideoProbe,String> {Err(super::capabilities::NATIVE_UNAVAILABLE.into())}
 #[cfg(test)] mod tests { use super::*;
-    #[test] fn hdr_rotation_tracks_are_not_lost() { let p=VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":1080,"height":1920,"pix_fmt":"yuv420p10le","color_transfer":"smpte2084","side_data_list":[{"rotation":90}]},{"index":1,"codec_type":"audio","codec_name":"aac","channels":6}],"format":{"duration":"4.5","format_name":"mov"}}),123).unwrap();assert_eq!(p.duration_us,Some(4500000));assert_eq!(p.hdr_kind,"hdr");assert_eq!(p.rotation,90);assert_eq!(p.audio().count(),1); }
+    #[test] fn hdr_rotation_tracks_are_not_lost() { let p=VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":1080,"height":1920,"pix_fmt":"yuv420p10le","color_transfer":"smpte2084","side_data_list":[{"rotation":90}]},{"index":1,"codec_type":"audio","codec_name":"aac","channels":6}],"format":{"duration":"4.5","format_name":"mov"}}),123).unwrap();assert_eq!(p.duration_us,Some(4500000));assert_eq!(p.hdr_kind,"hdr10");assert_eq!(p.rotation,90);assert_eq!(p.audio().count(),1); }
     #[test] fn invalid_video_is_rejected() {assert!(VideoProbe::parse(serde_json::json!({"streams":[]}),0).is_err());assert_eq!(rational("0/0"),None);}
     #[test] fn variable_frame_rate_is_detected() {
         let p=VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":720,"height":1280,"pix_fmt":"yuv420p","avg_frame_rate":"130500/9191","r_frame_rate":"89/6"}],"format":{"duration":"30.636667","format_name":"mov"}}),1).unwrap();
         assert!(p.variable_frame_rate);assert_eq!(p.frame_rate,rational("130500/9191"));
         let cfr=VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":720,"height":1280,"pix_fmt":"yuv420p","avg_frame_rate":"30/1","r_frame_rate":"30/1"}],"format":{"duration":"10","format_name":"mp4"}}),1).unwrap();
         assert!(!cfr.variable_frame_rate);
+    }
+
+    /// §5.2 BT.2020 原色只表示色彩原色，不再单独认定 HDR —— 归类交给能力分类器。
+    #[test] fn bt2020_primaries_alone_are_not_hdr() {
+        let p=VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":720,"height":1280,"pix_fmt":"yuv420p","avg_frame_rate":"30/1","color_primaries":"bt2020","color_transfer":"bt709"}],"format":{"duration":"10","format_name":"mp4"}}),1).unwrap();
+        assert_eq!(p.hdr_kind,"sdr","BT.2020 SDR 不许被当成 HDR");
+    }
+
+    /// §6 program 采集：-show_programs 的结果必须落进 probe。
+    #[test] fn programs_are_captured() {
+        let p=VideoProbe::parse(serde_json::json!({
+            "streams":[{"index":0,"codec_type":"video","width":720,"height":1280,"pix_fmt":"yuv420p","avg_frame_rate":"30/1"}],
+            "format":{"duration":"10","format_name":"mp4"},
+            "programs":[{"program_id":1,"program_num":1,"tags":{"service_name":"News"}}]}),1).unwrap();
+        assert_eq!(p.programs.len(),1);
+        assert_eq!(p.programs[0]["tags"]["service_name"],"News");
     }
 }

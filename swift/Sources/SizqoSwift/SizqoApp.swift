@@ -68,7 +68,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let report = store.applyRetentionOnExit(
             retentionDays: SettingsStore().load().originalRetentionDays,
             runStartedAt: store.runStartedAt,
-            previousRunEndedCleanly: store.previousRunEndedCleanly
+            previousRunEndedCleanly: store.previousRunEndedCleanly,
+            // §2.3 未完成事务引用的备份也在保护集里：除了批次/待定事务两道闸门，
+            // 清理的引用核对本身也要把"事务还认领着的备份"算作存活引用。
+            protectedBackupKeys: AppState.current?.transactions.pendingBackupKeys() ?? []
         )
         if report.removedEntries > 0 || report.removedBackups > 0 {
             NSLog("Sizqo 退出清理: 历史记录 -%d 条，原图备份 -%d 份，保留 %d 份",

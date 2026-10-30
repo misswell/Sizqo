@@ -1352,10 +1352,16 @@ fn commit_output(
         // 证明不了就不会拿备份去盖一个被外部改过的文件。
         original_sha256: replace.as_ref().and_then(|identity| identity.sha256.clone()),
         output_sha256: Some(crate::source_identity::sha256_bytes(compressed)),
+        // §3.1 备份凭证：来历记录里有就抄，老备份没有记录就现场算一份。
+        // 覆盖事务缺这份凭证会在 validate_for_prepare 处被拒绝落账。
+        backup_sha256: backup_file
+            .as_ref()
+            .and_then(|backup| history.recorded_backup_sha256(backup)),
         placeholder_identity: placeholder,
         created_at: crate::history::now_millis(),
         cross_format,
         mode: placement.transaction_mode(),
+        schema_version: output_transaction::SCHEMA_VERSION,
     };
     // ③记账先于动手：写不进日志就还不许碰用户文件，占好的名字也得收回去。
     if let Err(detail) = placement.journal(transactions, &txn) {
@@ -1394,10 +1400,42 @@ fn commit_output(
         }
     }
 
-    // ⑥原子改名。到这里用户的原图才真的被换掉。提交带占位凭证：目标路径上
-    //   必须还是我们认领的那个 inode，外部放进去的内容绝不盖（§28 审查意见 A）。
-    if let Err(detail) = staged.publish_claimed(&out_path, placeholder) {
-        return Err(withdraw(OutputWriteError::Collision(detail)));
+    // ⑥原子发布。到这里用户的原图才真的被换掉。
+    match (cross_format, replace.as_ref()) {
+        // §3.3 同格式覆盖走原子交换：先交换、再验证**被换出来的**字节，
+        // 验证结束到提交之间不再有可以塞进竞争的窗口。
+        (false, Some(identity)) => {
+            if let Err(error) = output_transaction::publish_replace_if_identity_matches(
+                &staged.temp,
+                &out_path,
+                identity,
+            ) {
+                if error.swapped {
+                    // 覆盖已经发生（换回还失败了）：用户的原内容已在冲突名下保留。
+                    // 用备份把原图写回去，绝不能用 withdraw 假装什么都没发生 ——
+                    // 那会留下"报了失败却真实存在"的覆盖。
+                    if let Err(rollback) = output_transaction::rollback(&txn) {
+                        return Err(OutputWriteError::RollbackFailed(format!(
+                            "{}；{rollback}",
+                            error.detail
+                        )));
+                    }
+                    transactions.finish(&history_id);
+                    return Err(OutputWriteError::Collision(error.detail));
+                }
+                // 交换没发生或已换回原状：目标原样，收走自己的临时文件。
+                return Err(withdraw(OutputWriteError::Collision(error.detail)));
+            }
+        }
+        // 跨格式 replace 的产物是独占申请来的新名字、新建模式（suffix/folder）同理会
+        // 占一个新 inode：占位凭证门照旧 —— 目标路径上必须还是我们认领的那个 inode，
+        // 外部放进去的内容绝不盖（§28 审查意见 A）。这两类目标都不是"被覆盖的原图"，
+        // 原子交换验证反而会把占位/新名当成"被换出的原图"误判。
+        _ => {
+            if let Err(detail) = staged.publish_claimed(&out_path, placeholder) {
+                return Err(withdraw(OutputWriteError::Collision(detail)));
+            }
+        }
     }
     staged.settle();
 
@@ -2068,6 +2106,9 @@ pub fn apply_retention_on_exit(app: &AppHandle) {
         state.settings_store.load().original_retention_days,
         state.run_started_at,
         state.previous_run_ended_cleanly,
+        // §2.3 未完成事务引用的备份也在保护集里：除了批次/待定事务两道闸门，
+        // 清理的引用核对本身也要把"事务还认领着的备份"算作存活引用。
+        &state.transactions.pending_backup_keys(),
     );
     if report.removed_entries > 0 || report.removed_backups > 0 {
         log::info!(
@@ -2436,6 +2477,9 @@ pub struct RestoreOutcome {
     success: bool,
     /// true = 压缩之后目标文件又被改过，需要用户确认后用 force = true 再来一次。
     conflict: bool,
+    /// §2.3 true = 这份备份来自旧版本、没有内容指纹；需要用户确认后用
+    /// acceptLegacy = true 再来一次。确认的是"完整性未知"，不是"已知损坏"。
+    legacy_backup: bool,
     file_path: String,
     error: Option<String>,
     /// 一起被标记为「已恢复」的历史记录：同一张图重压多次会共享那份真正原图。
@@ -2459,6 +2503,7 @@ fn restore_error_code(error: &RestoreError) -> ReasonCode {
         RestoreError::NotRestorable => ReasonCode::Unknown,
         RestoreError::BackupGone => ReasonCode::BackupFailed,
         RestoreError::Conflict => ReasonCode::SourceChanged,
+        RestoreError::LegacyBackup => ReasonCode::BackupFailed,
         RestoreError::SessionBusy => ReasonCode::SessionBusy,
         RestoreError::Io(_) => ReasonCode::Unknown,
         RestoreError::AccessDenied => ReasonCode::PermissionDenied,
@@ -2474,6 +2519,7 @@ impl RestoreOutcome {
         Self {
             success: false,
             conflict: matches!(error, RestoreError::Conflict),
+            legacy_backup: matches!(error, RestoreError::LegacyBackup),
             file_path: entry.map(|e| e.source_path.clone()).unwrap_or_default(),
             error: Some(detail),
             history_ids: Vec::new(),
@@ -2532,18 +2578,30 @@ impl Drop for MaintenanceLease {
 }
 
 /// 统一恢复服务：主队列、历史页、恢复全部三个入口都只能走这里。
-fn restore_entry(app: &AppHandle, state: &AppState, entry: &HistoryEntry, force: bool) -> RestoreOutcome {
+fn restore_entry(
+    app: &AppHandle,
+    state: &AppState,
+    entry: &HistoryEntry,
+    force: bool,
+    accept_legacy: bool,
+) -> RestoreOutcome {
     // §2.7 维护租约放在最前：与会话启动在同一原子状态上仲裁，恢复与压缩
     // 不可能各拿一半检查再各走各的。租约持有到本次恢复结束（RAII）。
     let _lease = match state.compression.begin_maintenance() {
         Some(lease) => lease,
         None => return RestoreOutcome::failure(Some(entry), RestoreError::SessionBusy),
     };
-    restore_entry_leased(app, state, entry, force)
+    restore_entry_leased(app, state, entry, force, accept_legacy)
 }
 
 /// 已持有维护租约的恢复主体。`restore_all` 批量入口整批持一把租约时走这里。
-fn restore_entry_leased(app: &AppHandle, state: &AppState, entry: &HistoryEntry, force: bool) -> RestoreOutcome {
+fn restore_entry_leased(
+    app: &AppHandle,
+    state: &AppState,
+    entry: &HistoryEntry,
+    force: bool,
+    accept_legacy: bool,
+) -> RestoreOutcome {
     let mut reauth = || {
         request_folder_access(
             app,
@@ -2553,11 +2611,12 @@ fn restore_entry_leased(app: &AppHandle, state: &AppState, entry: &HistoryEntry,
     };
     match state
         .history_store
-        .restore(entry, force, state.access.as_ref(), &mut reauth)
+        .restore(entry, force, accept_legacy, state.access.as_ref(), &mut reauth)
     {
         Ok(report) => RestoreOutcome {
             success: true,
             conflict: false,
+            legacy_backup: false,
             file_path: entry.source_path.clone(),
             error: None,
             history_ids: report.history_ids,
@@ -2586,11 +2645,18 @@ pub async fn restore_original(
     state: State<'_, AppState>,
     file_path: String,
     force: Option<bool>,
+    accept_legacy: Option<bool>,
 ) -> Result<RestoreOutcome, String> {
     // Result 只是 Tauri 对「async 命令带引用参数」的硬性要求；恢复路径的所有失败
     // 都已经装在 RestoreOutcome.failure 里回给前端了，这里永远 Ok。
     let outcome = match entry_for_source(state.inner(), &file_path) {
-        Some(entry) => restore_entry(&app, state.inner(), &entry, force.unwrap_or(false)),
+        Some(entry) => restore_entry(
+            &app,
+            state.inner(),
+            &entry,
+            force.unwrap_or(false),
+            accept_legacy.unwrap_or(false),
+        ),
         None => RestoreOutcome::failure(None, RestoreError::NotFound),
     };
     Ok(outcome)
@@ -2602,9 +2668,16 @@ pub async fn restore_history_entry(
     state: State<'_, AppState>,
     history_id: String,
     force: Option<bool>,
+    accept_legacy: Option<bool>,
 ) -> Result<RestoreOutcome, String> {
     let outcome = match state.history_store.find(&history_id) {
-        Some(entry) => restore_entry(&app, state.inner(), &entry, force.unwrap_or(false)),
+        Some(entry) => restore_entry(
+            &app,
+            state.inner(),
+            &entry,
+            force.unwrap_or(false),
+            accept_legacy.unwrap_or(false),
+        ),
         None => RestoreOutcome::failure(None, RestoreError::NotFound),
     };
     Ok(outcome)
@@ -2815,7 +2888,9 @@ pub async fn restore_all(
             ));
             continue;
         };
-        let outcome = restore_entry_leased(&app, state.inner(), &entry, false);
+        // 批量恢复不接受 legacy 确认：老备份逐条在单文件恢复里确认（§2.3），
+        // 整批"全部接受"会让用户在没看清的情况下回写无法验证的内容。
+        let outcome = restore_entry_leased(&app, state.inner(), &entry, false, false);
         if outcome.success {
             summary.success_count += 1;
             summary.restored_files.push(outcome.file_path.clone());

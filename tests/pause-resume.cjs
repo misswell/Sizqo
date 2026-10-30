@@ -248,7 +248,7 @@ const countOf = needle => source.split(needle).length - 1;
     console, Set, Map, Promise, JSON,
     files: paths.slice(), inputPaths: [], fileRows: {},
     queueItems: new Map(paths.map(p => [p, { path: p, state: 'pending', result: null, originalSize: null }])),
-    queueRevision: 0, pendingAutoCompress: true,
+    queueRevision: 0, preflightToken: 0, pendingAutoCompress: true,
     executionSession: { id: 'session-1', queueRevision: 0, targetPaths: paths.slice(), phase: 'running' },
     confirm: () => true,
     document: { getElementById: () => null },

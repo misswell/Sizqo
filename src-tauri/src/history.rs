@@ -249,7 +249,7 @@ impl HistoryEntry {
 #[serde(rename_all = "camelCase")]
 struct BackupMeta {
     /// 1 = 只有 sourcePath/createdAt（老版本）；2 = 带大小、mtime、扩展名；
-    /// 3 = §27 的快照指纹。
+    /// 3 = §27 的快照指纹；4 = 再带源文件的 `(dev,ino)`。
     #[serde(default = "meta_version_v1")]
     version: u32,
     source_path: String,
@@ -264,16 +264,50 @@ struct BackupMeta {
     /// 快照当时源文件的指纹 + 快照文件自己的指纹。
     ///
     /// 两者必须相等，不等就是复制过程把字节改坏了，这份东西不配叫备份。
-    /// 老记录（version < 3）里是 None：恢复时**跳过**校验，绝不因为"证明不了"
-    /// 就拒绝把用户的原图写回去。
+    /// 老记录（version < 3）里是 None：按 `LegacyUnverified` 处理 —— 不自动复用、
+    /// 恢复前必须用户确认，但绝不因为"证明不了"就删掉升级用户的旧备份。
     #[serde(default)]
     source_sha256: Option<String>,
     #[serde(default)]
     backup_sha256: Option<String>,
+    /// §2.2 v4：快照当时源文件的文件系统身份。恢复与复用多一道"还是那个 inode"的门。
+    #[serde(default)]
+    source_device: Option<u64>,
+    #[serde(default)]
+    source_inode: Option<u64>,
 }
 
 fn meta_version_v1() -> u32 {
     1
+}
+
+/// 一份既有备份此刻的可信程度（五态，§2.3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackupVerification {
+    /// 记录里的两份指纹互相咬合，副本字节也和记录一致。
+    Verified,
+    /// 老版本留下的备份：没有内容指纹，证明不了它是否完整。
+    /// 不自动复用、恢复前必须由用户明确确认；旧备份绝不因此被删除。
+    LegacyUnverified,
+    /// 有指纹但对不上：副本内容已经不是记录的那份字节（或记录自相矛盾）。
+    ContentMismatch,
+    /// 备份文件不在磁盘上。
+    Missing,
+    /// 副本读不出来（权限、IO 故障）。
+    Unreadable,
+}
+
+/// 一次既有备份的复用判定结果。
+enum ReuseDecision {
+    /// 内容指纹互相咬合（或 v3 记录 + 连压链）：按可信备份复用。
+    Reuse,
+    /// 老备份凭历史证据补写了可信来历记录后复用。
+    Upgrade { source_sha256: String },
+    /// 老备份证明不了内容，但当前字节是我们自己的产物：复用是
+    /// 「恢复原图回到最初原图」的唯一途径；恢复时要求用户明确确认。
+    ReuseLegacy,
+    /// 不可复用。旧备份原样保留，另起新快照。
+    Refuse(String),
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -300,6 +334,8 @@ pub enum RestoreError {
     Conflict,
     /// §44 压缩会话还在跑：此时恢复会改写正在被读的源文件，还会让进度倒退
     SessionBusy,
+    /// §2.3 这份备份来自旧版本，没有内容指纹：用户明确确认后才能恢复
+    LegacyBackup,
     Io(String),
     /// 沙盒下拿不到（也续不上）目标位置的访问授权
     AccessDenied,
@@ -318,6 +354,7 @@ impl RestoreError {
             RestoreError::BackupGone => "原图备份已清理，无法恢复",
             RestoreError::Conflict => "这个文件在压缩后又被修改过",
             RestoreError::SessionBusy => RESTORE_BLOCKED_MESSAGE,
+            RestoreError::LegacyBackup => "该备份来自旧版本，缺少内容指纹",
             RestoreError::Io(_) => "恢复失败",
             RestoreError::AccessDenied => "没有该文件夹的访问权限，请重新授权",
         }
@@ -688,7 +725,10 @@ impl HistoryStore {
     /// 关键不变量：**已有有效备份时绝不覆盖**。同一张图连压三次，备份里永远是
     /// 第一次压缩前的真正原图，否则「恢复原图」只会回到上一版压缩结果。
     pub fn ensure_backup(&self, source: &Path) -> Result<PathBuf, String> {
-        self.ensure_backup_verified(source, None)
+        // §2.1：覆盖流程的调用方必须有内容指纹；这里代算一份（测试与内部工具用）。
+        let current = crate::source_identity::sha256_of(source)
+            .map_err(|error| format!("无法读取原图指纹: {error}"))?;
+        self.ensure_backup_verified(source, Some(&current))
     }
 
     /// 与 [Self::ensure_backup] 同一入口，但复用旧备份前先核对「这次要盖掉的原图」
@@ -718,15 +758,25 @@ impl HistoryStore {
             };
             let dir = self.backup_dir(&key);
             match self.read_meta(&key) {
-                // 命中同一源路径：备份的字节仍是这一次要盖掉的那份才复用。
+                // 命中同一源路径：按五态判定这份旧备份还能不能代表这次要盖掉的原图。
                 Some(meta) if meta.source_path == canonical.to_string_lossy() => {
                     if let Some(existing) = self.existing_backup_file(&key) {
-                        if backup_matches_current(source, &meta, current_sha256)
-                            || self.replaced_bytes_are_own_product(&canonical, current_sha256)
-                        {
-                            return Ok(existing);
+                        match self.backup_reuse_decision(Some(&meta), &existing, &canonical, current_sha256) {
+                            ReuseDecision::Reuse => return Ok(existing),
+                            ReuseDecision::Upgrade { source_sha256 } => {
+                                if self.upgrade_legacy_meta(&key, &canonical, &extension, &source_sha256) {
+                                    return Ok(existing);
+                                }
+                                // 升级记录写失败：按 legacy 复用，恢复时要求用户确认。
+                                return Ok(existing);
+                            }
+                            ReuseDecision::ReuseLegacy => return Ok(existing),
+                            ReuseDecision::Refuse(reason) => {
+                                // 旧备份原样保留（绝不删除），换下一个槽位。
+                                log::warn!("跳过旧备份槽位 {key}: {reason}");
+                                continue;
+                            }
                         }
-                        continue;
                     }
                     // 备份文件被外部删掉了，重新写一份真正原图。
                 }
@@ -738,11 +788,24 @@ impl HistoryStore {
                     }
                     // 升级前用老 key 备份过的图：认那一份，不另起炉灶，
                     // 否则第二次压缩会把压缩结果当成原图存进新目录。
+                    // 老备份同样过五态判定：证明不了内容就不自动当可信备份。
                     if index == 0 {
                         if let Some(legacy) = self
                             .existing_backup_file(&Self::legacy_backup_key(source))
                         {
-                            return Ok(legacy);
+                            match self.backup_reuse_decision(None, &legacy, &canonical, current_sha256) {
+                                ReuseDecision::Reuse => return Ok(legacy),
+                                ReuseDecision::Upgrade { source_sha256 } => {
+                                    let legacy_key = backup_key_of(legacy.to_str())
+                                        .unwrap_or_else(|| Self::legacy_backup_key(source));
+                                    if self.upgrade_legacy_meta(&legacy_key, &canonical, &extension, &source_sha256) {
+                                        return Ok(legacy);
+                                    }
+                                    return Ok(legacy);
+                                }
+                                ReuseDecision::ReuseLegacy => return Ok(legacy),
+                                ReuseDecision::Refuse(_) => {}
+                            }
                         }
                     }
                 }
@@ -752,78 +815,217 @@ impl HistoryStore {
                 return Err("无法创建原图备份目录".into());
             }
             let backup_path = dir.join(format!("original.{extension}"));
-            // §27 快照的两份指纹：源文件的先取，副本的后取，中间夹着一次复制。
-            // 对不上就是复制过程把字节改坏了 —— 那份东西不能当原图用，也不许留下冒充备份。
-            let source_sha256 = crate::source_identity::sha256_of(&canonical)
-                .map_err(|error| format!("无法读取原图指纹: {error}"))?;
-            // 先写临时名再 rename：崩溃不许留下半个 original.xxx 冒充有效备份。
-            // 临时名随机（§30）：两张图同时首次备份时，固定名会互相把对方的半成品盖掉。
-            if let Err(error) =
-                crate::output_transaction::StagedOutput::copy_from(&canonical, &backup_path)
-            {
-                let _ = fs::remove_dir_all(&dir);
-                return Err(format!("无法保存原图备份: {error}"));
-            }
-            let backup_sha256 = match crate::source_identity::sha256_of(&backup_path) {
-                Ok(sha256) => sha256,
-                Err(error) => {
-                    let _ = fs::remove_dir_all(&dir);
-                    return Err(format!("无法读取原图备份的指纹: {error}"));
-                }
-            };
-            if backup_sha256 != source_sha256 {
-                let _ = fs::remove_dir_all(&dir);
-                return Err("原图备份的字节和源文件对不上，已跳过覆盖".into());
-            }
-            let meta = BackupMeta {
-                version: 3,
-                source_path: canonical.to_string_lossy().into_owned(),
-                created_at: now_millis(),
-                original_size: file_size(&backup_path),
-                original_modified_at: file_mtime_millis(source),
-                original_extension: extension.clone(),
-                source_sha256: Some(source_sha256),
-                backup_sha256: Some(backup_sha256),
-            };
-            let json = serde_json::to_string(&meta)
-                .map_err(|error| format!("原图备份的来历记录写不成功: {error}"))?;
-            if let Err(error) = write_atomic(&dir.join(META_FILE), json.as_bytes()) {
-                let _ = fs::remove_dir_all(&dir);
-                return Err(format!("原图备份的来历记录写不成功: {error}"));
-            }
-            // 备份文件 + 来历记录**都在**才算备份成功，缺一处这次覆盖就不可恢复。
-            if self.existing_backup_file(&key).is_none() || self.read_meta(&key).is_none() {
-                let _ = fs::remove_dir_all(&dir);
-                return Err("原图备份不完整，已跳过覆盖".into());
-            }
-            return Ok(backup_path);
+            return self.write_verified_snapshot(&key, &canonical, &backup_path, &extension);
         }
         Err("原图备份槽位已满，无法为这张图准备备份".into())
     }
 
-    /// 覆盖之后、记历史之前最后一次确认：这份备份里的字节真是这次被盖掉的原图吗（§27）。
+    /// 在一个空槽位上写出"验证过的快照"：采集源身份 → 复制 → 验副本 → 复制后复核源
+    /// → 落 v4 来历记录。任何一步失败都不留下冒充备份的目录，也不允许覆盖发生。
+    fn write_verified_snapshot(
+        &self,
+        key: &str,
+        canonical: &Path,
+        backup_path: &Path,
+        extension: &str,
+    ) -> Result<PathBuf, String> {
+        let dir = backup_path.parent().ok_or("备份目录路径不完整")?.to_path_buf();
+        // §27 §2.2 源身份从**打开着的文件描述符**上采集（哈希前后各一次 fstat），
+        // 拿到的这一份就是快照要留住的字节。
+        let pre = crate::source_identity::SourceIdentity::read_with_hash(canonical)
+            .map_err(|error| format!("无法读取原图指纹: {error}"))?;
+        let source_sha256 = pre.sha256.clone().expect("read_with_hash 必有内容指纹");
+        // 先写临时名再 rename：崩溃不许留下半个 original.xxx 冒充有效备份。
+        // 临时名随机（§30）：两张图同时首次备份时，固定名会互相把对方的半成品盖掉。
+        if let Err(error) =
+            crate::output_transaction::StagedOutput::copy_from(canonical, backup_path)
+        {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(format!("无法保存原图备份: {error}"));
+        }
+        let backup_sha256 = match crate::source_identity::sha256_of(backup_path) {
+            Ok(sha256) => sha256,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&dir);
+                return Err(format!("无法读取原图备份的指纹: {error}"));
+            }
+        };
+        if backup_sha256 != source_sha256 {
+            let _ = fs::remove_dir_all(&dir);
+            return Err("原图备份的字节和源文件对不上，已跳过覆盖".into());
+        }
+        // §9.1 测试注入：复制之后、复核之前，源文件被并发改写。
+        #[cfg(test)]
+        if TEST_FAULT_EDIT_SOURCE_AFTER_COPY.load(std::sync::atomic::Ordering::SeqCst) {
+            fs::write(canonical, b"user-edited-during-backup").unwrap();
+        }
+        // §2.2 复制完成后把原图整个复核一遍：复制横着一场修改的话，快照和
+        // "用户此刻的原图"就不是同一份字节，这次覆盖没有可信的依据。
+        let post = crate::source_identity::SourceIdentity::read_with_hash(canonical).map_err(
+            |error| {
+                let _ = fs::remove_dir_all(&dir);
+                format!("无法复核原图指纹: {error}")
+            },
+        )?;
+        if !pre.same_fingerprint(&post) || post.sha256.as_deref() != Some(source_sha256.as_str()) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err("原图在备份过程中被修改，已跳过覆盖".into());
+        }
+        let meta = BackupMeta {
+            version: 4,
+            source_path: canonical.to_string_lossy().into_owned(),
+            created_at: now_millis(),
+            original_size: file_size(backup_path),
+            original_modified_at: file_mtime_millis(canonical),
+            original_extension: extension.to_owned(),
+            source_sha256: Some(source_sha256),
+            backup_sha256: Some(backup_sha256),
+            source_device: pre.identity.map(|(dev, _)| dev),
+            source_inode: pre.identity.map(|(_, ino)| ino),
+        };
+        let json = serde_json::to_string(&meta)
+            .map_err(|error| format!("原图备份的来历记录写不成功: {error}"))?;
+        if let Err(error) = write_atomic(&dir.join(META_FILE), json.as_bytes()) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(format!("原图备份的来历记录写不成功: {error}"));
+        }
+        // 备份文件 + 来历记录**都在**才算备份成功，缺一处这次覆盖就不可恢复。
+        if self.existing_backup_file(key).is_none() || self.read_meta(key).is_none() {
+            let _ = fs::remove_dir_all(&dir);
+            return Err("原图备份不完整，已跳过覆盖".into());
+        }
+        Ok(backup_path.to_path_buf())
+    }
+
+    /// 复用一份既有备份前的五态判定（§2.3）。
     ///
-    /// 恢复入口的全部意义是"点下去拿得回原图"。版本 3 的来历记录存了源文件与副本两份
-    /// 指纹，这里重算一次副本指纹：既能查出副本被谁换过，也能查出当年复制时就对不上。
+    /// 返回 `Refuse` 时旧备份**原样保留**（绝不删除），调用方往后挪一个槽位
+    /// 给当前字节另写快照。
+    fn backup_reuse_decision(
+        &self,
+        meta: Option<&BackupMeta>,
+        backup: &Path,
+        canonical: &Path,
+        current_sha256: Option<&str>,
+    ) -> ReuseDecision {
+        // 覆盖模式的调用方必须带着当前内容指纹进来；算不出指纹就不许覆盖（§2.1）。
+        let Some(current) = current_sha256 else {
+            return ReuseDecision::Refuse("无法计算当前文件的内容指纹".into());
+        };
+        let actual = match crate::source_identity::sha256_of(backup) {
+            Ok(hash) => hash,
+            Err(error) => return ReuseDecision::Refuse(format!("备份读不出来: {error}")),
+        };
+        if let Some(meta) = meta {
+            if let Some(recorded) = meta.backup_sha256.as_deref() {
+                if recorded != actual {
+                    return ReuseDecision::Refuse("备份内容与来历记录不符".into());
+                }
+            }
+            if let Some(recorded) = meta.source_sha256.as_deref() {
+                if recorded != actual {
+                    return ReuseDecision::Refuse("备份的来历记录自相矛盾".into());
+                }
+                if recorded == current {
+                    // 快照就是这次要盖掉的那份字节：最直接的复用。
+                    return ReuseDecision::Reuse;
+                }
+            }
+        }
+        // 字节不等于"这次要盖掉的原图"：只有当前字节是 Sizqo 自己上一轮的产物
+        // （A→B→C 连压链）才允许复用最早的备份；用户改过的字节必须有新快照。
+        if !self.replaced_bytes_are_own_product(canonical, Some(current)) {
+            return ReuseDecision::Refuse("两轮之间文件被修改过，旧备份不再代表这次要盖掉的原图".into());
+        }
+        match meta {
+            Some(meta) if meta.source_sha256.is_some() => ReuseDecision::Reuse,
+            _ => {
+                // 老备份：历史里还留着"某一轮开始时的原图指纹"就能升级成可信记录；
+                // 什么证据都没有就按 legacy 复用，恢复时要求用户明确确认。
+                if self.history_records_this_original(canonical, &actual) {
+                    ReuseDecision::Upgrade { source_sha256: actual }
+                } else {
+                    ReuseDecision::ReuseLegacy
+                }
+            }
+        }
+    }
+
+    /// 历史里有没有一条记录声明过"这个哈希是我某轮开始时的原图"。
+    /// 老备份凭这条证据可以升级成带指纹的可信备份。
+    fn history_records_this_original(&self, canonical: &Path, sha256: &str) -> bool {
+        let canonical = canonical.to_string_lossy();
+        self.snapshot().iter().any(|entry| {
+            entry.source_path == canonical && entry.source_sha256.as_deref() == Some(sha256)
+        })
+    }
+
+    /// 给一份证明过内容的老备份补写 v4 来历记录。写失败只降级成 legacy 复用，
+    /// 不阻塞压缩，也不删旧备份。
+    fn upgrade_legacy_meta(
+        &self,
+        key: &str,
+        canonical: &Path,
+        extension: &str,
+        source_sha256: &str,
+    ) -> bool {
+        let Some(existing) = self.existing_backup_file(key) else {
+            return false;
+        };
+        let meta = BackupMeta {
+            version: 4,
+            source_path: canonical.to_string_lossy().into_owned(),
+            created_at: now_millis(),
+            original_size: file_size(&existing),
+            original_modified_at: None,
+            original_extension: extension.to_owned(),
+            source_sha256: Some(source_sha256.to_owned()),
+            backup_sha256: Some(source_sha256.to_owned()),
+            source_device: None,
+            source_inode: None,
+        };
+        match serde_json::to_string(&meta) {
+            Ok(json) => write_atomic(&self.backup_dir(key).join(META_FILE), json.as_bytes()).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// 覆盖之后、记历史之前最后一次确认：这份备份还能当原图用吗（§27）。
     ///
     /// `Err` = 这份东西不能当原图用。它**不删备份**：留着才能让用户自己看清是谁动过，
     /// 而且事务日志必须留在磁盘上（AGENTS 规则 9：失败的回滚保留日志与备份）。
-    /// 老记录（版本 ≤ 2）没有指纹，按"无法证明"处理 —— 沿用旧行为，不把升级用户的
-    /// 既有备份一律判成死刑。
+    ///
+    /// 提交时刻的备份都是刚由 `ensure_backup_verified` 写出或刚判定过的：
+    /// `LegacyUnverified` 在这里放行（那是升级用户 conscious 复用的老备份，
+    /// 恢复侧会另外要求确认），`Missing`/`Unreadable`/`ContentMismatch` 一律拦下。
     pub fn backup_is_faithful(&self, backup: &Path) -> Result<(), String> {
+        match self.backup_verification(backup) {
+            Ok(BackupVerification::Verified) | Ok(BackupVerification::LegacyUnverified) => Ok(()),
+            Ok(BackupVerification::Missing) => Err("原图备份已经不在磁盘上了".into()),
+            Ok(BackupVerification::ContentMismatch) => Err("备份内容与来历记录不符".into()),
+            Ok(BackupVerification::Unreadable) => Err("原图备份读不出来".into()),
+            Err(detail) => Err(detail),
+        }
+    }
+
+    /// 一份备份的五态验证（§2.3）。恢复入口按这个结果决定
+    /// 直接恢复 / 要求用户确认 / 拒绝，绝不把「无法证明」当成「没有问题」。
+    pub fn backup_verification(&self, backup: &Path) -> Result<BackupVerification, String> {
         if !backup.exists() {
-            return Err("原图备份已经不在磁盘上了".into());
+            return Ok(BackupVerification::Missing);
         }
         let Some(key) = backup_key_of(backup.to_str()) else {
-            return Ok(());
+            // 备份目录结构认不出来：证明不了任何事，按 legacy 处理。
+            return Ok(BackupVerification::LegacyUnverified);
         };
         let Some(meta) = self.read_meta(&key) else {
-            return Ok(());
+            return Ok(BackupVerification::LegacyUnverified);
         };
         let (Some(source_sha256), Some(recorded_sha256)) =
             (meta.source_sha256.as_deref(), meta.backup_sha256.as_deref())
         else {
-            return Ok(());
+            // 老记录（版本 ≤ 2）没有指纹：明确标记为未验证，不再静默当可信。
+            return Ok(BackupVerification::LegacyUnverified);
         };
         if source_sha256 != recorded_sha256 {
             return Err(format!(
@@ -831,12 +1033,24 @@ impl HistoryStore {
             ));
         }
         match crate::source_identity::sha256_of(backup) {
-            Ok(actual) if actual == recorded_sha256 => Ok(()),
+            Ok(actual) if actual == recorded_sha256 => Ok(BackupVerification::Verified),
             Ok(actual) => Err(format!(
                 "备份文件已经不是当初那份字节（{recorded_sha256} → {actual}）"
             )),
-            Err(error) => Err(format!("读不出备份的指纹: {error}")),
+            Err(_) => Ok(BackupVerification::Unreadable),
         }
+    }
+
+    /// 事务凭证/提交前需要备份的内容指纹时用它：优先读来历记录，
+    /// 老备份没有记录就现场算一份（覆盖模式多读一遍大文件是值得的）。
+    pub fn recorded_backup_sha256(&self, backup: &Path) -> Option<String> {
+        let key = backup_key_of(backup.to_str())?;
+        if let Some(meta) = self.read_meta(&key) {
+            if let Some(recorded) = meta.backup_sha256 {
+                return Some(recorded);
+            }
+        }
+        crate::source_identity::sha256_of(backup).ok()
     }
 
     /// `history.json` 损坏后按备份目录重建恢复入口。
@@ -931,6 +1145,7 @@ impl HistoryStore {
         retention_days: u32,
         run_started_at: i64,
         previous_run_ended_cleanly: bool,
+        protected_backup_keys: &[String],
     ) -> CleanupReport {
         let mut report = CleanupReport::default();
         let _commit = self.commit_lock.lock().unwrap();
@@ -972,7 +1187,7 @@ impl HistoryStore {
             }
         }
 
-        self.sweep_unreferenced_backups(&kept, &mut report);
+        self.sweep_unreferenced_backups(&kept, protected_backup_keys, &mut report);
         report
     }
 
@@ -995,17 +1210,25 @@ impl HistoryStore {
         let _ = fs::write(self.root.join(CLEAN_EXIT_FILE), now_millis().to_string());
     }
 
-    /// 删掉没有任何存活条目引用的备份目录。
-    fn sweep_unreferenced_backups(&self, kept: &[HistoryEntry], report: &mut CleanupReport) {
+    /// 删掉没有任何存活引用的备份目录。引用集 = 历史条目（含退出后仍存活的）
+    /// + 调用方额外提供的保护键（未完成事务引用的备份：§2.3 清理必须同时
+    /// 检查历史引用与未完成事务引用，两者都清空才允许删）。
+    fn sweep_unreferenced_backups(
+        &self,
+        kept: &[HistoryEntry],
+        protected_keys: &[String],
+        report: &mut CleanupReport,
+    ) {
         if self.cleanup_is_locked() {
             report.warnings.push("历史记录不可信，跳过备份清理".into());
             return;
         }
-        let referenced: HashSet<String> = kept
+        let mut referenced: HashSet<String> = kept
             .iter()
             .filter(|entry| !entry.status.is_settled())
             .filter_map(|entry| backup_key_of(entry.backup_path.as_deref()))
             .collect();
+        referenced.extend(protected_keys.iter().cloned());
 
         let Ok(entries) = fs::read_dir(self.backups_dir()) else {
             return;
@@ -1164,6 +1387,7 @@ impl HistoryStore {
         &self,
         entry: &HistoryEntry,
         force: bool,
+        accept_legacy: bool,
         access: &dyn FileAccess,
         reauth: &mut dyn FnMut() -> bool,
     ) -> Result<RestoreReport, RestoreError> {
@@ -1207,8 +1431,22 @@ impl HistoryStore {
                 .map(PathBuf::from)
                 .filter(|path| path.exists())
                 .ok_or(RestoreError::BackupGone)?;
-            if let Err(detail) = self.backup_is_faithful(&backup) {
-                return Err(RestoreError::Io(detail));
+            // §2.3 备份在写回之前按五态验证。`force` 只代表用户确认覆盖被修改过的
+            // 压缩产物，绝不绕过备份真实性验证；legacy 备份要的是另一句明确的确认。
+            match self.backup_verification(&backup) {
+                Ok(BackupVerification::Verified) => {}
+                Ok(BackupVerification::LegacyUnverified) if accept_legacy => {}
+                Ok(BackupVerification::LegacyUnverified) => return Err(RestoreError::LegacyBackup),
+                Ok(state) => {
+                    return Err(RestoreError::Io(match state {
+                        BackupVerification::Missing => "原图备份已经不在磁盘上了".into(),
+                        BackupVerification::ContentMismatch => {
+                            "备份内容与来历记录不符，已停止恢复".into()
+                        }
+                        _ => "原图备份读不出来，已停止恢复".into(),
+                    }))
+                }
+                Err(detail) => return Err(RestoreError::Io(detail)),
             }
             let ids = self.siblings_sharing_backup(entry);
             let backup_dir = entry
@@ -1289,8 +1527,14 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     a == b || canonical_path(a) == canonical_path(b)
 }
 
+/// §9.1 仅测试使用的故障注入点：快照复制完成后、复核源文件前，把源文件改掉，
+/// 模拟"备份过程横着一场并发编辑"。正式产品里这个开关不存在。
+#[cfg(test)]
+pub(crate) static TEST_FAULT_EDIT_SOURCE_AFTER_COPY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// 备份 key = 备份目录名；目录名 = backups/<key>/original.<ext>。
-fn backup_key_of(backup_path: Option<&str>) -> Option<String> {
+pub(crate) fn backup_key_of(backup_path: Option<&str>) -> Option<String> {
     let dir = Path::new(backup_path?).parent()?;
     dir.file_name()?.to_str().map(str::to_owned)
 }
@@ -1302,28 +1546,6 @@ fn backup_file_is_live(entry: &HistoryEntry) -> bool {
         .as_ref()
         .map(|path| Path::new(path).exists())
         .unwrap_or(false)
-}
-
-/// 复用一份旧备份前回答：它记录的字节，还是不是这次要盖掉的那份原图？
-///
-/// - 有内容指纹（图片线在编码前就算好了）就以指纹为准，最严格；
-/// - 没有指纹（视频等大文件，算整份哈希太贵）退到「大小 + mtime」：备份时
-///   记录的就是源文件的这两项，真实改动至少会动其中一项；
-/// - 老备份（版本 ≤ 2）连指纹都没存：证明不了它过期就沿用旧行为复用，
-///   不把升级用户的既有备份一律判死刑。
-fn backup_matches_current(
-    source: &Path,
-    meta: &BackupMeta,
-    current_sha256: Option<&str>,
-) -> bool {
-    if let Some(current) = current_sha256 {
-        return match meta.source_sha256.as_deref() {
-            Some(recorded) => recorded == current,
-            None => true,
-        };
-    }
-    file_size(source) == meta.original_size
-        && file_mtime_millis(source) == meta.original_modified_at
 }
 
 impl HistoryStore {
@@ -1564,7 +1786,7 @@ mod tests {
             .add(entry_for(&fresh, &fresh_backup, now - 2 * DAY_MILLIS))
             .unwrap();
 
-        let report = store.apply_retention_on_exit(3, now, true);
+        let report = store.apply_retention_on_exit(3, now, true, &[]);
         assert_eq!(report.removed_entries, 1);
         assert!(!dir_of_backup(&old_backup).exists());
         assert!(dir_of_backup(&fresh_backup).exists());
@@ -1593,11 +1815,11 @@ mod tests {
             .add(entry_for(&source, &second, now - 2 * DAY_MILLIS))
             .unwrap();
 
-        store.apply_retention_on_exit(3, now, true);
+        store.apply_retention_on_exit(3, now, true, &[]);
         assert!(dir_of_backup(&backup).exists());
         assert_eq!(store.list().len(), 1);
 
-        store.apply_retention_on_exit(1, now, true);
+        store.apply_retention_on_exit(1, now, true, &[]);
         assert!(!dir_of_backup(&backup).exists());
         assert!(store.list().is_empty());
         assert!(source.exists());
@@ -1615,7 +1837,7 @@ mod tests {
             .add(entry_for(&source, &backup, run_started_at + 1_000))
             .unwrap();
 
-        let report = store.apply_retention_on_exit(0, run_started_at, true);
+        let report = store.apply_retention_on_exit(0, run_started_at, true, &[]);
         assert_eq!(report.removed_entries, 1);
         assert_eq!(report.removed_backups, 1);
         assert!(store.list().is_empty(), "「不保留」= 关掉应用后记录也没了");
@@ -1625,7 +1847,7 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), b"compressed");
 
         // 再退一次不许炸：已经没有东西可清了。
-        let again = store.apply_retention_on_exit(0, run_started_at, true);
+        let again = store.apply_retention_on_exit(0, run_started_at, true, &[]);
         assert_eq!(again.removed_entries, 0);
         assert_eq!(again.removed_backups, 0);
     }
@@ -1647,7 +1869,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].backup_exists);
         let error = store
-            .restore(&rows[0], true, open_access().as_ref(), &mut || false)
+            .restore(&rows[0], true, false, open_access().as_ref(), &mut || false)
             .unwrap_err();
         assert!(matches!(error, RestoreError::BackupGone));
         assert_eq!(error.message(), "原图备份已清理，无法恢复");
@@ -1667,7 +1889,7 @@ mod tests {
             .unwrap();
 
         // 本次退出：上一次没结清账 → 留着，用户在这一次会话里看得见、也恢复得了。
-        let report = store.apply_retention_on_exit(0, run_started_at, false);
+        let report = store.apply_retention_on_exit(0, run_started_at, false, &[]);
         assert_eq!(report.removed_entries, 0);
         assert_eq!(report.removed_backups, 0);
         assert!(dir_of_backup(&backup).exists());
@@ -1675,7 +1897,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].backup_exists);
         store
-            .restore(&rows[0], true, open_access().as_ref(), &mut || false)
+            .restore(&rows[0], true, false, open_access().as_ref(), &mut || false)
             .unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"true-original");
     }
@@ -1692,7 +1914,7 @@ mod tests {
             .add(entry_for(&source, &backup, now_millis() - 60_000))
             .unwrap();
 
-        let report = store.apply_retention_on_exit(0, now_millis(), true);
+        let report = store.apply_retention_on_exit(0, now_millis(), true, &[]);
         assert_eq!(report.removed_entries, 1);
         assert_eq!(report.removed_backups, 1);
         assert!(store.list().is_empty());
@@ -1726,7 +1948,7 @@ mod tests {
         let second = entry_for(&source, &backup, now);
         store.add(second.clone()).unwrap();
 
-        let restored = store.restore(&second, false, open_access().as_ref(), &mut || false).unwrap();
+        let restored = store.restore(&second, false, false, open_access().as_ref(), &mut || false).unwrap();
         assert_eq!(restored.history_ids.len(), 2);
         assert!(!restored.already_restored);
         assert_eq!(restored.warning, None);
@@ -1755,7 +1977,7 @@ mod tests {
         fs::write(&source, b"converted").unwrap();
         store.add(entry.clone()).unwrap();
 
-        store.restore(&entry, false, open_access().as_ref(), &mut || false).unwrap();
+        store.restore(&entry, false, false, open_access().as_ref(), &mut || false).unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"true-original");
         assert!(!output.exists());
     }
@@ -1773,11 +1995,11 @@ mod tests {
         fs::write(&source, b"photoshop-saved-this").unwrap();
         assert!(HistoryStore::has_conflict(&entry));
         assert!(matches!(
-            store.restore(&entry, false, open_access().as_ref(), &mut || false),
+            store.restore(&entry, false, false, open_access().as_ref(), &mut || false),
             Err(RestoreError::Conflict)
         ));
         // 备份没被动过，强制恢复仍可成功
-        assert!(store.restore(&entry, true, open_access().as_ref(), &mut || false).is_ok());
+        assert!(store.restore(&entry, true, false, open_access().as_ref(), &mut || false).is_ok());
         assert_eq!(fs::read(&source).unwrap(), b"true-original");
     }
 
@@ -1800,7 +2022,7 @@ mod tests {
         store.add(entry.clone()).unwrap();
 
         // 后缀模式没有备份，恢复语义只能是"删掉生成文件"。
-        store.restore(&entry, false, open_access().as_ref(), &mut || false).unwrap();
+        store.restore(&entry, false, false, open_access().as_ref(), &mut || false).unwrap();
         assert!(!generated.exists());
         assert!(store.list().is_empty());
         assert_eq!(fs::read(&source).unwrap(), b"untouched-original");
@@ -1841,7 +2063,7 @@ mod tests {
 
         // 退出清理第一刀就砍在损坏的历史上：它绝不能被当成"空历史"，否则所有备份
         // 看起来无人引用，一次不报错的退出就把原图全删了。
-        let report = store.apply_retention_on_exit(3, now_millis(), true);
+        let report = store.apply_retention_on_exit(3, now_millis(), true, &[]);
         assert_eq!(report.removed_entries, 0);
         assert_eq!(report.removed_backups, 0);
         assert!(!report.warnings.is_empty(), "跳过清理必须说给用户听");
@@ -1875,7 +2097,7 @@ mod tests {
         assert!(!HistoryStore::has_conflict(&rows[0]));
 
         store
-            .restore(&rows[0], false, open_access().as_ref(), &mut || false)
+            .restore(&rows[0], false, false, open_access().as_ref(), &mut || false)
             .unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"true-original");
         assert!(!dir_of_backup(&backup).exists());
@@ -1890,7 +2112,7 @@ mod tests {
         let backup = store.ensure_backup(&source).unwrap();
         assert!(!store.cleanup_is_locked());
         // 全新安装（没有任何历史）时，无人引用的孤儿备份照常被回收。
-        let report = store.apply_retention_on_exit(3, now_millis(), true);
+        let report = store.apply_retention_on_exit(3, now_millis(), true, &[]);
         assert_eq!(report.removed_backups, 1);
         assert!(!dir_of_backup(&backup).exists());
     }
@@ -1923,9 +2145,146 @@ mod tests {
         fs::write(&legacy_backup, b"true-original").unwrap();
 
         // 第二次压缩必须复用那份老备份，而不是把压缩结果当成原图存进新目录。
+        // 真实升级现场的历史里有上一轮的记录（0.3.5 起带 source/output 指纹），
+        // 老备份凭它升级成可信备份；什么证据都没有的老备份不再被静默采信（§2.3）。
         fs::write(&source, b"compressed").unwrap();
+        store
+            .add(entry_for(&source, &legacy_backup, now_millis()))
+            .unwrap();
         assert_eq!(store.ensure_backup(&source).unwrap(), legacy_backup);
         assert_eq!(fs::read(&legacy_backup).unwrap(), b"true-original");
+    }
+
+    /// §2.3 没有任何证据的老备份：既不自动复用（当前字节不是我们的产物），
+    /// 也绝不被当成垃圾清掉 —— 它留给旧历史条目和用户确认。
+    #[test]
+    fn a_legacy_backup_without_any_evidence_is_not_silently_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let source = sample_source(dir.path(), "a.png", b"bytes1");
+        let first = store.ensure_backup(&source).unwrap();
+        // 把来历记录降级成 v1（没有指纹）：模拟更老版本的备份。
+        let key = backup_key_of(first.to_str()).unwrap();
+        let meta = BackupMeta {
+            version: 1,
+            source_path: canonical_path(&source),
+            created_at: now_millis(),
+            original_size: 0,
+            original_modified_at: None,
+            original_extension: "png".into(),
+            source_sha256: None,
+            backup_sha256: None,
+            source_device: None,
+            source_inode: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        write_atomic(&store.backup_dir(&key).join(META_FILE), json.as_bytes()).unwrap();
+
+        // 用户改过文件：老备份证明不了它还代表这次要盖掉的原图 → 另起新槽位。
+        fs::write(&source, b"user-edited").unwrap();
+        let second = store.ensure_backup(&source).unwrap();
+        assert_ne!(second, first, "无证据的老备份不允许被静默复用");
+        assert_eq!(fs::read(&first).unwrap(), b"bytes1", "旧备份原样保留");
+        assert_eq!(fs::read(&second).unwrap(), b"user-edited");
+        // 复用判定看到的是 LegacyUnverified：恢复路径要求用户确认。
+        assert_eq!(
+            store.backup_verification(&first).unwrap(),
+            BackupVerification::LegacyUnverified
+        );
+    }
+
+    /// §2.3 内容对不上记录的备份：不可复用、恢复时拒绝，但绝不删除。
+    #[test]
+    fn a_backup_whose_content_no_longer_matches_its_record_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let source = sample_source(dir.path(), "a.png", b"bytes1");
+        let first = store.ensure_backup(&source).unwrap();
+        // 副本被外部换掉（保留大小不一致更真实）：记录还在，字节不是那份字节。
+        fs::write(&first, b"tampered-bytes-longer").unwrap();
+
+        fs::write(&source, b"user-edited").unwrap();
+        let second = store.ensure_backup(&source).unwrap();
+        assert_ne!(second, first, "内容对不上记录的备份不允许复用");
+        assert_eq!(fs::read(&first).unwrap(), b"tampered-bytes-longer", "不删除");
+        assert!(matches!(
+            store.backup_verification(&first),
+            Err(_) | Ok(BackupVerification::ContentMismatch)
+        ));
+    }
+
+    /// §2.2 备份过程横着一场并发编辑：复核发现源文件已经不是采集时的那份字节，
+    /// 快照作废、目录清掉、覆盖被拦下 —— 用户改过的内容原样留在磁盘上。
+    #[test]
+    fn a_snapshot_is_aborted_when_the_source_changes_during_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let source = sample_source(dir.path(), "a.png", b"bytes1");
+        TEST_FAULT_EDIT_SOURCE_AFTER_COPY.store(true, std::sync::atomic::Ordering::SeqCst);
+        let outcome = store.ensure_backup(&source);
+        TEST_FAULT_EDIT_SOURCE_AFTER_COPY.store(false, std::sync::atomic::Ordering::SeqCst);
+        let error = outcome.unwrap_err();
+        assert!(
+            error.contains("原图在备份过程中被修改"),
+            "失败原因必须说清是备份期间发生了并发修改: {error}"
+        );
+        assert_eq!(
+            fs::read(&source).unwrap(),
+            b"user-edited-during-backup",
+            "用户的并发编辑一个字节都不能动"
+        );
+        assert!(
+            store
+                .backups_dir()
+                .read_dir()
+                .map(|entries| entries.count())
+                .unwrap_or(0)
+                == 0,
+            "作废的快照不许留下冒充备份的目录"
+        );
+    }
+
+    /// §2.3 老备份恢复前必须由用户明确确认；确认也只能跳过"完整性未知"这一条，
+    /// 备份字节对得上记录的（Verified）从来不需要确认。
+    #[test]
+    fn restore_requires_confirmation_for_legacy_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let source = sample_source(dir.path(), "a.png", b"true-original");
+        let backup = store.ensure_backup(&source).unwrap();
+        // 记录降级成 v1（无指纹）+ 历史条目指向它：真实升级现场。
+        let key = backup_key_of(backup.to_str()).unwrap();
+        let meta = BackupMeta {
+            version: 1,
+            source_path: canonical_path(&source),
+            created_at: now_millis(),
+            original_size: 0,
+            original_modified_at: None,
+            original_extension: "png".into(),
+            source_sha256: None,
+            backup_sha256: None,
+            source_device: None,
+            source_inode: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        write_atomic(&store.backup_dir(&key).join(META_FILE), json.as_bytes()).unwrap();
+        fs::write(&source, b"compressed").unwrap();
+        let entry = entry_for(&source, &backup, now_millis());
+        store.add(entry.clone()).unwrap();
+
+        // 未确认：明确要求用户先看清这份备份来自旧版本。
+        match store.restore(&entry, false, false, open_access().as_ref(), &mut || false) {
+            Err(RestoreError::LegacyBackup) => {}
+            other => panic!("legacy 备份未确认必须报 LegacyBackup，实际: {other:?}"),
+        }
+        assert_eq!(fs::read(&source).unwrap(), b"compressed", "未确认绝不写回");
+
+        // 确认后恢复成功，备份字节原样写回。
+        let report = store
+            .restore(&entry, false, true, open_access().as_ref(), &mut || false)
+            .unwrap();
+        assert!(!report.already_restored);
+        assert_eq!(fs::read(&source).unwrap(), b"true-original");
     }
 
     #[test]
@@ -1963,7 +2322,7 @@ mod tests {
         store.add(entry.clone()).unwrap();
 
         let first = store
-            .restore(&entry, false, open_access().as_ref(), &mut || false)
+            .restore(&entry, false, false, open_access().as_ref(), &mut || false)
             .unwrap();
         assert_eq!(first.history_ids, vec![entry.id.clone()]);
         assert!(!first.already_restored);
@@ -1975,7 +2334,7 @@ mod tests {
 
         // 文件已经是原图字节：再看一眼指纹就够了，不需要备份、也不该报 Conflict。
         let second = store
-            .restore(&row, false, open_access().as_ref(), &mut || false)
+            .restore(&row, false, false, open_access().as_ref(), &mut || false)
             .unwrap();
         assert!(second.already_restored);
         assert_eq!(second.warning, None);
@@ -2003,12 +2362,12 @@ mod tests {
 
         assert!(HistoryStore::has_conflict(&entry));
         assert!(matches!(
-            store.restore(&entry, false, open_access().as_ref(), &mut || false),
+            store.restore(&entry, false, false, open_access().as_ref(), &mut || false),
             Err(RestoreError::Conflict)
         ));
         // 用户明确选择覆盖后仍然拿得回真正原图。
         store
-            .restore(&entry, true, open_access().as_ref(), &mut || false)
+            .restore(&entry, true, false, open_access().as_ref(), &mut || false)
             .unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"true-original");
     }
@@ -2041,7 +2400,7 @@ mod tests {
         // 目录只读：产物删不掉，但原图写回完全不受影响。
         fs::set_permissions(&out_dir, fs::Permissions::from_mode(0o555)).unwrap();
         let report = store
-            .restore(&entry, false, open_access().as_ref(), &mut || false)
+            .restore(&entry, false, false, open_access().as_ref(), &mut || false)
             .unwrap();
         fs::set_permissions(&out_dir, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -2073,7 +2432,7 @@ mod tests {
         assert!(row.backup_exists, "产物没了，备份不能跟着消失");
 
         let report = store
-            .restore(&entry, false, open_access().as_ref(), &mut || false)
+            .restore(&entry, false, false, open_access().as_ref(), &mut || false)
             .unwrap();
         assert_eq!(report.history_ids, vec![entry.id.clone()]);
         assert!(!report.already_restored);
@@ -2102,7 +2461,7 @@ mod tests {
         assert!(!row.output_exists && !row.backup_exists);
 
         assert!(matches!(
-            store.restore(&entry, false, open_access().as_ref(), &mut || false),
+            store.restore(&entry, false, false, open_access().as_ref(), &mut || false),
             Err(RestoreError::BackupGone)
         ));
         assert!(!source.exists(), "恢复失败不许在目标位置留下任何东西");

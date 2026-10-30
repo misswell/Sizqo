@@ -1,9 +1,9 @@
 //! Closed parameter contract: every selectable field is validated before argv generation.
-use super::{VideoOptions,MetadataPolicy,capabilities::CapabilityMatrix,probe::VideoProbe};
+use super::{VideoOptions,MetadataPolicy,capabilities::CapabilityMatrix,format_classifier,probe::VideoProbe};
 use serde::Serialize;
 use std::path::Path;
 #[derive(Debug,Clone,Serialize)]#[serde(rename_all="camelCase")]
-pub struct EncodePlan {pub encoder:String,pub container:String,pub bitrate_kbps:Option<u64>,pub crf:Option<f64>,pub width:u32,pub height:u32,pub passes:u32,pub threads:usize,pub warnings:Vec<String>,pub vfr_rate:Option<String>,
+pub struct EncodePlan {pub encoder:String,pub container:String,pub bitrate_kbps:Option<u64>,pub crf:Option<f64>,pub width:u32,pub height:u32,pub passes:u32,pub threads:usize,pub warnings:Vec<String>,
     /// §55 已解析的策略；序列化给前端时仍看 `options.metadataPolicy`，这里不额外暴露一份。
     #[serde(skip)] pub metadata_policy:MetadataPolicy,
     pub options:VideoOptions}
@@ -16,14 +16,18 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
     member(&options.subtitle_policy,&["copy","drop"],"subtitle policy")?;
     let metadata_policy=MetadataPolicy::parse(&options.metadata_policy).ok_or_else(||format!("Invalid metadata policy: {}",options.metadata_policy))?;
     if options.output_mode=="directory"||options.output_mode=="folder" {if options.output_dir.as_deref().filter(|s|!s.is_empty()).is_none(){return Err("Select an output directory".into());}}
-    if probe.hdr_kind!="sdr"{return Err(format!("{} input skipped: verified HDR / dynamic metadata preservation is unavailable",probe.hdr_kind));}
     let video=probe.video().ok_or("No video stream")?;
-    // 高位深除子串匹配的 10/12/16 外还有 32bit 浮点（grayf32le/gbrpf32le 不含数字字样）；
-    // 打包 alpha（bgra/argb/abgr）也不含 "rgba"。漏掉它们会被后面硬编码的 yuv420p
-    // 静默降级（丢 alpha / 掉位深），违反"先拒绝或说明，绝不无声转换"。
-    if video.pixel_format.contains("10")||video.pixel_format.contains("12")||video.pixel_format.contains("16")||video.pixel_format.contains("f32") {return Err("High bit-depth input requires a verified preservation path".into());}
-    if video.pixel_format.starts_with("yuva")||video.pixel_format.contains("rgba")||video.pixel_format.contains("gbrap")||["bgra","argb","abgr"].contains(&video.pixel_format.as_str()){return Err("Alpha video preservation is unavailable".into());}
-    if !["","unknown","progressive"].contains(&video.field_order.as_str()){return Err("Interlaced input needs an explicitly validated deinterlace plan".into());}
+    // §5.1 §5.2 位深 / Alpha / 浮点 / HDR / 隔行 / BT.2020-SDR 全部由能力分类器
+    // 按白名单与传递函数判定 —— 不再靠子串猜。拒绝原因照实说明，绝不静默转换。
+    format_classifier::classify(
+        &video.pixel_format,
+        video.color_transfer.as_str(),
+        video.color_primaries.as_str(),
+        &probe.hdr_kind,
+        video.field_order.as_str(),
+    )
+    .support_level
+    .map_err(|reason| format!("{reason} ({})", video.pixel_format))?;
     if probe.streams.iter().filter(|s|s.codec_type=="video"&&s.disposition["attached_pic"].as_u64()!=Some(1)).count()!=1{return Err("Multiple video streams cannot be silently discarded".into());}
     if probe.streams.iter().any(|s|s.codec_type=="video"&&s.disposition["attached_pic"].as_u64()==Some(1)){return Err("Attached picture preservation is not yet validated".into());}
     if probe.audio().count()>16{return Err("More than 16 audio tracks require manual review".into());}
@@ -31,7 +35,12 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
     if probe.streams.iter().any(|s|s.codec_type=="attachment")&&options.container!="mkv"{return Err("Attachments require MKV; no silent discarding".into());}
     if !probe.chapters.is_empty()&&metadata_policy!=MetadataPolicy::StripAll&&["webm","ts"].contains(&options.container.as_str()){return Err("Chapter preservation in WebM/TS is unavailable; choose MKV".into());}
     let mut warnings=probe.warnings.clone();
-    let vfr_rate=if options.frame_rate.is_none()&&probe.variable_frame_rate {video.raw["avg_frame_rate"].as_str().map(str::to_string)}else{None};
+    // §5.3 帧时间轴的默认行为：保留源 PTS（passthrough）。`r_frame_rate != avg_frame_rate`
+    // 不能严格判定 VFR，更不是把时间轴重排成平均帧率的理由；只有用户明确指定
+    // 帧率时才执行 CFR 转换。
+    if probe.variable_frame_rate && options.frame_rate.is_none(){
+        warnings.push("Variable-frame-rate source: original timestamps are preserved (passthrough)".into());
+    }
     if metadata_policy==MetadataPolicy::StripPrivate { warnings.push("Privacy mode removes GPS, location and device-model tags; ordinary metadata and chapters are preserved".into()); }
     let encoder=if options.encoder=="auto" {
         let preference=if options.container=="webm"{vec!["libsvtav1","libvpx-vp9"]}else if options.mode=="twoPass"||options.mode=="targetSize"{vec!["libx264"]}else if options.mode=="crf"{vec!["libx265","libx264","libvpx-vp9"]}else{vec!["hevc_videotoolbox","libx265","h264_videotoolbox","libx264"]};
@@ -87,15 +96,19 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
         let source=video.bit_rate.or(probe.bit_rate).unwrap_or(estimated*1000)/1000;
         let b=options.bitrate_kbps.unwrap_or(estimated.min(source*3/4).max(200));if !(32..=500000).contains(&b){return Err("Video bitrate range is 32…500000 kbps".into());}Some(b)
     }else{None};
-    Ok(EncodePlan {encoder,container:options.container.clone(),bitrate_kbps,crf,width,height,passes:if ["twoPass","targetSize"].contains(&options.mode.as_str()){2}else{1},threads:if options.threads==0{budget.max(1)}else{options.threads.max(1).min(budget.max(1))},warnings,vfr_rate,metadata_policy,options:options.clone()})
+    Ok(EncodePlan {encoder,container:options.container.clone(),bitrate_kbps,crf,width,height,passes:if ["twoPass","targetSize"].contains(&options.mode.as_str()){2}else{1},threads:if options.threads==0{budget.max(1)}else{options.threads.max(1).min(budget.max(1))},warnings,metadata_policy,options:options.clone()})
 }
 impl EncodePlan {
     pub fn argv(&self,input:&Path,output:&Path,pass:u32,passlog:&Path)->Vec<String>{
-        let mut a=vec!["-hide_banner".into(),"-nostdin".into(),"-n".into(),"-protocol_whitelist".into(),"file,pipe".into(),"-threads".into(),self.threads.to_string(),"-i".into(),input.to_string_lossy().into(),"-map".into(),"0:v:0".into(),"-c:v".into(),self.encoder.clone(),"-threads".into(),self.threads.to_string(),"-filter_threads".into(),self.threads.to_string(),"-pix_fmt".into(),"yuv420p".into(),"-vf".into(),format!("scale={}:{}",self.width,self.height),"-metadata:s:v:0".into(),"rotate=0".into()];
+        // §5.5 输入严格解码：`-err_detect explode`（在 -i 之前 = 输入侧）让损坏的
+        // 输入在解码时报错而不是被容错吞掉；`-xerror` 让任何一步出错都以非零退出。
+        // 两者一起保证"损坏视频伪装成压缩成功"在编码与验证两端都被拦下。
+        let mut a=vec!["-hide_banner".into(),"-nostdin".into(),"-xerror".into(),"-err_detect".into(),"explode".into(),"-n".into(),"-protocol_whitelist".into(),"file,pipe".into(),"-threads".into(),self.threads.to_string(),"-i".into(),input.to_string_lossy().into(),"-map".into(),"0:v:0".into(),"-c:v".into(),self.encoder.clone(),"-threads".into(),self.threads.to_string(),"-filter_threads".into(),self.threads.to_string(),"-pix_fmt".into(),"yuv420p".into(),"-vf".into(),format!("scale={}:{}",self.width,self.height),"-metadata:s:v:0".into(),"rotate=0".into()];
         let mut add=|k:&str,v:String|{a.push(k.into());a.push(v);};
         if self.encoder.ends_with("videotoolbox"){add("-allow_sw","0".into());}else if self.encoder=="libsvtav1"{let speed=match self.options.preset.as_str(){"ultrafast"=>12,"veryfast"=>10,"slow"=>4,_=>8};add("-preset",speed.to_string());add("-svtav1-params",format!("lp={}",self.threads));}else if self.encoder=="libvpx-vp9"{let cpu_used=match self.options.preset.as_str(){"ultrafast"=>"5","veryfast"=>"4","slow"=>"1",_=>"2"};add("-deadline","good".into());add("-cpu-used",cpu_used.into());add("-row-mt","1".into());}else{add("-preset",self.options.preset.clone());if self.encoder=="libx265"{add("-x265-params",format!("pools={}:frame-threads=1",self.threads));}}
         if let Some(c)=self.crf{add("-crf",c.to_string());if self.encoder=="libvpx-vp9"{add("-b:v","0".into());}}if let Some(b)=self.bitrate_kbps{add("-b:v",format!("{b}k"));}
-        if let Some(f)=self.options.frame_rate{add("-r",f.to_string());}else if let Some(rate)=&self.vfr_rate{add("-fps_mode","cfr".into());add("-r",rate.clone());}else{add("-fps_mode","passthrough".into());}
+        // §5.3 未指定帧率 = 保留源 PTS（passthrough）；只有用户明确指定才 CFR。
+        if let Some(f)=self.options.frame_rate{add("-r",f.to_string());}else{add("-fps_mode","passthrough".into());}
         if self.passes==2{add("-pass",pass.to_string());add("-passlogfile",passlog.to_string_lossy().into());}
         if self.encoder.contains("hevc")||self.encoder=="libx265"{if self.container=="mp4"||self.container=="mov"{add("-tag:v","hvc1".into());}}
         if self.passes==2&&pass==1{a.extend(["-an".into(),"-sn".into(),"-f".into(),"null".into(),"-progress".into(),"pipe:1".into(),"-nostats".into(),"-".into()]);return a;}
@@ -103,8 +116,10 @@ impl EncodePlan {
         if self.options.subtitle_policy=="copy"{a.extend(["-map".into(),"0:s?".into(),"-c:s".into(),"copy".into()]);}else{a.push("-sn".into());}
         if self.container=="mkv"{a.extend(["-map".into(),"0:t?".into(),"-c:t".into(),"copy".into()]);}
         match self.metadata_policy {
-            // §55 只有"全部移除"才配 -map_metadata -1 / -map_chapters -1。
-            MetadataPolicy::StripAll=>{a.extend(["-map_metadata".into(),"-1".into(),"-map_chapters".into(),"-1".into()]);}
+            // §6 只有"全部移除"才配 -map_metadata -1 / -map_chapters -1。
+            // 全局 -1 只清全局作用域：流级、章节级、program 级的 metadata 必须各自
+            // 清空，否则手机写的流标签会原样跟过去 —— 隐私承诺不能只覆盖一半。
+            MetadataPolicy::StripAll=>{a.extend(["-map_metadata".into(),"-1".into(),"-map_metadata:s".into(),"-1".into(),"-map_metadata:c".into(),"-1".into(),"-map_metadata:p".into(),"-1".into(),"-map_chapters".into(),"-1".into()]);}
             MetadataPolicy::KeepAll=>{a.extend(["-map_metadata".into(),"0".into(),"-map_chapters".into(),"0".into()]);}
             MetadataPolicy::StripPrivate=>{
                 // 普通 metadata 与章节照常保留；只把隐私键清空。作用域要覆盖全局、
@@ -130,16 +145,69 @@ impl EncodePlan {
     #[test]fn resolution_never_upscales_and_even(){let mut o=VideoOptions::default();o.resolution=1920;let p=build(&o,&probe(),&caps(),2).unwrap();assert_eq!((p.width,p.height),(720,1280));o.resolution=720;let p=build(&o,&probe(),&caps(),2).unwrap();assert_eq!(p.height,720);assert_eq!(p.width%2,0);assert_eq!(p.threads,2);}
     #[test]fn hdr_and_size_lower_bound_are_blocked(){let mut p=probe();p.hdr_kind="hdr".into();assert!(build(&VideoOptions::default(),&p,&caps(),3).is_err());let mut o=VideoOptions::default();o.encoder="libx264".into();o.mode="targetSize".into();o.target_mi_b=Some(0.0001);assert!(build(&o,&probe(),&caps(),3).is_err());}
     #[test]fn argv_preserves_paths_without_shell(){let mut o=VideoOptions::default();o.encoder="libx264".into();o.mode="crf".into();let p=build(&o,&probe(),&caps(),1).unwrap();let a=p.argv(Path::new("/tmp/a ' $().mov"),Path::new("/tmp/result.mp4"),1,Path::new("/tmp/stats"));assert!(a.contains(&"/tmp/a ' $().mov".into()));assert!(a.windows(2).any(|w|w==["-fps_mode","passthrough"]));assert!(!a.contains(&"-r".into()));}
-    #[test]fn variable_frame_rate_is_normalized_only_without_explicit_fps(){
+    /// §5.3 VFR 源的默认行为：保留源 PTS（passthrough），不再重排成平均帧率；
+    /// 只有用户明确指定帧率时才 CFR。
+    #[test]fn vfr_source_keeps_its_timestamps_unless_fps_is_explicit(){
         let mut o=VideoOptions::default();o.encoder="libx265".into();
         let p=build(&o,&vfr_probe(),&caps(),3).unwrap();
-        assert_eq!(p.vfr_rate.as_deref(),Some("130500/9191"));
+        assert!(p.warnings.iter().any(|w|w.contains("passthrough")),"VFR 源必须说明保留了原始时间戳");
         let a=p.argv(Path::new("in.mov"),Path::new("out.mp4"),1,Path::new("stats"));
-        assert!(a.windows(2).any(|w|w==["-fps_mode","cfr"]));assert!(a.windows(2).any(|w|w==["-r","130500/9191"]));assert!(!a.contains(&"passthrough".into()));
-        let cfr=build(&o,&probe(),&caps(),3).unwrap();assert_eq!(cfr.vfr_rate,None);
+        assert!(a.windows(2).any(|w|w==["-fps_mode","passthrough"]),"VFR 源默认 passthrough");
+        assert!(!a.windows(2).any(|w|w==["-fps_mode","cfr"]),"不许再自动归一化成 CFR");
+        assert!(!a.contains(&"-r".into()));
+        // CFR 源同样是 passthrough。
+        let cfr=build(&o,&probe(),&caps(),3).unwrap();
         assert!(cfr.argv(Path::new("in.mp4"),Path::new("out.mp4"),1,Path::new("stats")).windows(2).any(|w|w==["-fps_mode","passthrough"]));
-        o.frame_rate=Some(24.0);let explicit=build(&o,&vfr_probe(),&caps(),3).unwrap();assert_eq!(explicit.vfr_rate,None);
-        let a=explicit.argv(Path::new("in.mov"),Path::new("out.mp4"),1,Path::new("stats"));assert!(a.windows(2).any(|w|w==["-r","24"]));assert!(!a.contains(&"cfr".into()));
+        // 用户明确指定帧率才执行 CFR 转换。
+        o.frame_rate=Some(24.0);
+        let explicit=build(&o,&vfr_probe(),&caps(),3).unwrap();
+        let a=explicit.argv(Path::new("in.mov"),Path::new("out.mp4"),1,Path::new("stats"));
+        assert!(a.windows(2).any(|w|w==["-r","24"]));assert!(!a.contains(&"passthrough".into()));
+    }
+
+    /// §5.1 输入门由能力分类器判定：白名单外的像素格式给不出精确理由就拒绝。
+    #[test]fn pixel_format_whitelist_gates_the_pipeline(){
+        let mut root=serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":720,"height":1280,"codec_name":"h264","pix_fmt":"yuv410p9le","avg_frame_rate":"30/1"}],"format":{"duration":"10","format_name":"mp4"}});
+        let p=VideoProbe::parse(root.clone(),1234).unwrap();
+        assert!(build(&VideoOptions::default(),&p,&caps(),3).is_err(),"9-bit 子串匹配抓不到，白名单必须抓到");
+        root["streams"][0]["pix_fmt"]=serde_json::json!("bgra");
+        let p=VideoProbe::parse(root.clone(),1234).unwrap();
+        assert!(build(&VideoOptions::default(),&p,&caps(),3).is_err(),"packed alpha 必须拒绝");
+        root["streams"][0]["pix_fmt"]=serde_json::json!("grayf32le");
+        let p=VideoProbe::parse(root,1234).unwrap();
+        assert!(build(&VideoOptions::default(),&p,&caps(),3).is_err(),"浮点格式必须拒绝");
+    }
+
+    /// §5.2 BT.2020 原色 ≠ HDR，但不能按普通 BT.709 静默转换。
+    #[test]fn bt2020_sdr_is_rejected_with_a_color_reason(){
+        let mut root=serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":720,"height":1280,"codec_name":"h264","pix_fmt":"yuv420p","avg_frame_rate":"30/1","color_primaries":"bt2020","color_transfer":"bt709"}],"format":{"duration":"10","format_name":"mp4"}});
+        let p=VideoProbe::parse(root,1234).unwrap();
+        let error=build(&VideoOptions::default(),&p,&caps(),3).unwrap_err();
+        assert!(error.contains("color-management"),"拒绝理由必须说明是色彩空间问题: {error}");
+    }
+
+    /// §5.5 编码参数必须在输入侧声明严格解码：损坏的输入不许被容错吞掉。
+    #[test]fn argv_declares_strict_input_decoding(){
+        let p=build(&VideoOptions::default(),&probe(),&caps(),3).unwrap();
+        let a=p.argv(Path::new("in.mp4"),Path::new("out.mp4"),1,Path::new("stats"));
+        let input_position=a.iter().position(|x|x=="-i").unwrap();
+        let err_detect=a.iter().position(|x|x=="-err_detect").unwrap();
+        assert!(err_detect<input_position,"-err_detect 必须在 -i 之前才是输入侧选项");
+        assert_eq!(a.get(err_detect+1).map(String::as_str),Some("explode"));
+        assert!(a.contains(&"-xerror".into()));
+    }
+
+    /// §6 StripAll 覆盖全部作用域：流级、章节级、program 级 metadata 一并清空。
+    #[test]fn strip_all_clears_every_metadata_scope(){
+        let mut o=VideoOptions::default();
+        o.encoder="libx264".into();o.mode="crf".into();o.metadata_policy="strip".into();
+        let p=build(&o,&probe(),&caps(),3).unwrap();
+        let a=p.argv(Path::new("in.mp4"),Path::new("out.mp4"),1,Path::new("st"));
+        for flag in ["-map_metadata:s","-map_metadata:c","-map_metadata:p"] {
+            assert!(a.windows(2).any(|w|w[0]==flag&&w[1]=="-1"),"StripAll 缺少 {flag} -1");
+        }
+        assert!(a.windows(2).any(|w|w==["-map_metadata","-1"]));
+        assert!(a.windows(2).any(|w|w==["-map_chapters","-1"]));
     }
     #[test]fn target_mib_contract(){let v=serde_json::to_value(VideoOptions::default()).unwrap();assert!(v.get("targetMiB").is_some());}
     #[test]fn zero_threads_means_auto_budget(){let mut o=VideoOptions::default();o.threads=0;let p=build(&o,&probe(),&caps(),5).unwrap();assert_eq!(p.threads,5);o.threads=99;let p=build(&o,&probe(),&caps(),5).unwrap();assert_eq!(p.threads,5);}

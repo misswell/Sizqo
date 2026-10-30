@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 pub mod capabilities;
+pub mod format_classifier;
 pub mod plan;
 pub mod presets;
 pub mod probe;

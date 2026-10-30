@@ -545,6 +545,7 @@ pub fn run() {
             video_commands::probe_media,
             video_commands::get_video_capabilities,
             video_commands::validate_video_options,
+            video_commands::validate_video_batch,
             video_commands::get_video_presets,
             video_commands::save_video_preset,
             video_commands::start_video_session,

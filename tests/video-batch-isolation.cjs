@@ -24,8 +24,11 @@ const context = vm.createContext({
         ({ valid: !!probe.ok, errors: probe.ok ? [] : ['本地参数不兼容'] }),
     },
   },
-  invoke: async (command, { probe }) =>
-    probe.rejectBackend ? { valid: false, errors: ['与当前设置不兼容'] } : { valid: true, warnings: ['码率偏低'] },
+  // §7.2 批量接口：一次 invoke 收整批，逐文件独立作答。
+  invoke: async (command, { items }) =>
+    items.map(entry => entry.probe.rejectBackend
+      ? { path: entry.path, valid: false, reason: '与当前设置不兼容', warnings: [] }
+      : { path: entry.path, valid: true, reason: null, warnings: ['码率偏低'] }),
   taskStateFor: result => (result && result.outcome === 'failed' ? 'failed' : 'done'),
   showToast: message => toasts.push(message),
 });
@@ -36,7 +39,8 @@ vm.runInContext(slice, context);
   const verdict = await context.validateVideoBatch(files, {});
   assert.equal(verdict.valid, false);
   // vm 切片里产生的数组带着另一个 realm 的原型，先归一到宿主数组再比较。
-  assert.deepEqual(Array.from(verdict.failures, f => f.path), ['/v-bad.mp4', '/v-broken.mp4']);
+  // 顺序：本地判据先筛（v-broken），后端批量结果追加在后（v-bad）。
+  assert.deepEqual(Array.from(verdict.failures, f => f.path), ['/v-broken.mp4', '/v-bad.mp4']);
   assert.deepEqual(Array.from(verdict.warnings), ['码率偏低'], '有效视频的警告照常收集');
 
   // 预检失败只标记它自己：其余视频保持 pending，照常进入本轮会话。

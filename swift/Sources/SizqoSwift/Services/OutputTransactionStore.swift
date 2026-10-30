@@ -141,19 +141,31 @@ struct ReplaceTransaction: Codable {
     let expectedOutputSize: Int64
     /// §2.5 启动恢复的身份证据：这次事务认得哪份"改动前的原图"、哪份"我们写出的产物"。
     /// 有了它们，回滚前就能证明源位置上的字节确实是这次事务的产物或仍是原图。
-    /// 老日志没有这两个字段：按升级前的恢复契约处理（一律回滚）。
+    /// 老日志没有这两个字段：按 §3.4 的兼容恢复逻辑处理，不伪装成新版本记录。
     var originalSha256: String?
     var outputSha256: String?
+    /// §3.1 备份的内容指纹。回滚前先验它：备份字节和记账时刻对不上就拒绝
+    /// 自动恢复 —— 宁可保留现场，也不能把一份被换过的文件当原图写回去。
+    var backupSha256: String?
+    /// 输出占位文件的 `(dev,ino)`。恢复时它是"这个 0 字节文件是我们的占位"的凭证；
+    /// 没有凭证的空文件一律不删（§2.5 同款身份门）。
+    var placeholderIdentity: (device: Int64, inode: UInt64)?
     let createdAt: Int64
     /// PNG → JPG 这类跨格式 replace：压缩结果是个新文件，回滚时要一并删掉。
     let crossFormat: Bool
     let mode: TransactionMode
+    /// §3.1 记录版本。0 = 老版本日志（无此字段）：走独立的兼容恢复逻辑；
+    /// 2 = 本版本：覆盖事务必须带着完整的三份指纹落账。
+    var schemaVersion: Int
 
     init(id: String, historyId: String, sourcePath: String, outputPath: String,
          backupPath: String, tempOutputPath: String? = nil, originalSize: Int64,
          expectedOutputSize: Int64, originalSha256: String? = nil,
-         outputSha256: String? = nil, createdAt: Int64, crossFormat: Bool,
-         mode: TransactionMode = .replaceExisting) {
+         outputSha256: String? = nil, backupSha256: String? = nil,
+         placeholderIdentity: (device: Int64, inode: UInt64)? = nil,
+         createdAt: Int64, crossFormat: Bool,
+         mode: TransactionMode = .replaceExisting,
+         schemaVersion: Int = transactionSchemaVersion) {
         self.id = id
         self.historyId = historyId
         self.sourcePath = sourcePath
@@ -164,15 +176,19 @@ struct ReplaceTransaction: Codable {
         self.expectedOutputSize = expectedOutputSize
         self.originalSha256 = originalSha256
         self.outputSha256 = outputSha256
+        self.backupSha256 = backupSha256
+        self.placeholderIdentity = placeholderIdentity
         self.createdAt = createdAt
         self.crossFormat = crossFormat
         self.mode = mode
+        self.schemaVersion = schemaVersion
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, historyId, sourcePath, outputPath, backupPath, tempOutputPath
-        case originalSize, expectedOutputSize, originalSha256, outputSha256
-        case createdAt, crossFormat, mode
+        case originalSize, expectedOutputSize, originalSha256, outputSha256, backupSha256
+        case placeholderDevice, placeholderInode
+        case createdAt, crossFormat, mode, schemaVersion
     }
 
     init(from decoder: Decoder) throws {
@@ -187,19 +203,71 @@ struct ReplaceTransaction: Codable {
         expectedOutputSize = try container.decode(Int64.self, forKey: .expectedOutputSize)
         originalSha256 = try container.decodeIfPresent(String.self, forKey: .originalSha256)
         outputSha256 = try container.decodeIfPresent(String.self, forKey: .outputSha256)
+        backupSha256 = try container.decodeIfPresent(String.self, forKey: .backupSha256)
+        // 占位凭证拆成两个字段存：JSON 元组不能直接编解码。
+        if let device = try container.decodeIfPresent(Int64.self, forKey: .placeholderDevice),
+           let inode = try container.decodeIfPresent(UInt64.self, forKey: .placeholderInode) {
+            placeholderIdentity = (device, inode)
+        } else {
+            placeholderIdentity = nil
+        }
         createdAt = try container.decode(Int64.self, forKey: .createdAt)
         crossFormat = try container.decode(Bool.self, forKey: .crossFormat)
         // §29 老日志里没有这个字段：它们只可能来自覆盖模式，按覆盖模式读。
         // 认成 createNew 的话，恢复逻辑会当成"没动过原图"而不再写回备份，原图就回不来了。
         mode = try container.decodeIfPresent(TransactionMode.self, forKey: .mode) ?? .replaceExisting
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 0
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(historyId, forKey: .historyId)
+        try container.encode(sourcePath, forKey: .sourcePath)
+        try container.encode(outputPath, forKey: .outputPath)
+        try container.encode(backupPath, forKey: .backupPath)
+        try container.encode(tempOutputPath, forKey: .tempOutputPath)
+        try container.encode(originalSize, forKey: .originalSize)
+        try container.encode(expectedOutputSize, forKey: .expectedOutputSize)
+        try container.encode(originalSha256, forKey: .originalSha256)
+        try container.encode(outputSha256, forKey: .outputSha256)
+        try container.encode(backupSha256, forKey: .backupSha256)
+        try container.encode(placeholderIdentity?.device, forKey: .placeholderDevice)
+        try container.encode(placeholderIdentity?.inode, forKey: .placeholderInode)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(crossFormat, forKey: .crossFormat)
+        try container.encode(mode, forKey: .mode)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+    }
+
+    /// §3.1 凭证完整性门：新版本事务缺少必要身份信息时拒绝落账。
+    /// 一条没有凭证的覆盖日志 = 崩溃后谁都证明不了那次覆盖动的是谁的原图。
+    func validateForPrepare() -> String? {
+        guard schemaVersion >= transactionSchemaVersion else { return nil }
+        switch mode {
+        case .replaceExisting:
+            if backupPath.isEmpty { return "覆盖事务缺少备份路径" }
+            if originalSha256 == nil || outputSha256 == nil || backupSha256 == nil {
+                return "覆盖事务缺少身份凭证（原图/备份/产物 SHA-256），拒绝落账"
+            }
+            return nil
+        case .createNew:
+            if outputSha256 == nil { return "新建事务缺少产物内容指纹，拒绝落账" }
+            return nil
+        }
     }
 }
+
+/// 当前落账格式版本（与 Rust `SCHEMA_VERSION` 同一契约）。
+let transactionSchemaVersion = 2
 
 struct RecoveryReport {
     /// 历史已记录，只是删日志前崩溃：补删日志。
     var committed = 0
     /// 回滚成真正原图的事务数。
     var rolledBack = 0
+    /// §3.4 无法证明归属、现场原样保留、需要人工恢复的事务数。
+    var needsReview = 0
     var warnings: [String] = []
 }
 
@@ -377,6 +445,8 @@ final class OutputTransactionStore: @unchecked Sendable {
 
     /// 覆盖发生**之前**登记。写不进日志就不许覆盖 —— 没有记账凭证的覆盖等于不可恢复。
     func prepare(_ txn: ReplaceTransaction) -> String? {
+        // §3.1 凭证完整性门：新版本事务缺指纹不许落账。
+        if let error = txn.validateForPrepare() { return error }
         try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -467,7 +537,14 @@ final class OutputTransactionStore: @unchecked Sendable {
                 continue
             }
             if let error = Self.rollback(txn) {
-                report.warnings.append("\(txn.sourcePath) 回滚失败，原图仍在备份里: \(error)")
+                if error.hasPrefix(Self.rollbackNeedsReview) {
+                    report.needsReview += 1
+                    report.warnings.append(
+                        "\(txn.sourcePath) 需要人工恢复（事务现场已保留，原图备份未删除）: " +
+                        String(error.dropFirst(Self.rollbackNeedsReview.count)))
+                } else {
+                    report.warnings.append("\(txn.sourcePath) 回滚失败，原图仍在备份里: \(error)")
+                }
             } else {
                 finish(txn.id)
                 report.rolledBack += 1
@@ -476,13 +553,43 @@ final class OutputTransactionStore: @unchecked Sendable {
         return report
     }
 
+    /// §2.3 未完成事务还认领着的备份目录 key。退出清理的引用核对必须把它们
+    /// 当作存活引用 —— 历史里还没有这条记录，只看 history 会把备份当孤儿清掉。
+    func pendingBackupKeys() -> [String] {
+        list().compactMap { txn in
+            guard !txn.backupPath.isEmpty else { return nil }
+            let dir = (txn.backupPath as NSString).deletingLastPathComponent
+            return (dir as NSString).lastPathComponent
+        }
+    }
+
+    /// 回滚拒绝自动处理、需要人工介入的错误都带这个前缀；`recover` 据此
+    /// 归入"需要人工恢复"计数，而不是和普通失败混在一起。
+    static let rollbackNeedsReview = "NEEDS_REVIEW: "
+
+    /// §3.1 备份凭证：日志里记了备份指纹的，写回之前先确认备份还是记账时的那份字节。
+    /// 没记指纹的（老日志）跳过 —— 那条路径由 §3.4 的归属判定兜底。
+    private static func verifyBackupVoucher(_ txn: ReplaceTransaction) -> String? {
+        guard let expected = txn.backupSha256 else { return nil }
+        guard case .success(let actual) = sha256OfFile(txn.backupPath) else {
+            return "备份读不出来，不自动恢复原图；备份与日志原样保留"
+        }
+        if actual != expected {
+            return "备份内容与事务凭证不符，不自动恢复原图；备份与日志原样保留"
+        }
+        return nil
+    }
+
     /// 用备份把真正原图写回源位置，再清掉这次生成的压缩结果。
     ///
     /// 备份本身**不删**：回滚半途失败时它是唯一的原图副本，留给历史页/下次启动处理。
     ///
     /// §2.5：动手之前必须先确认源位置上的字节归属。带指纹的新日志里，能证明它是本次
     /// 写出的产物才允许盖回去；证明它还是原图就什么都不用盖；证明不了归属就保留现场。
-    /// 老日志（没有指纹）维持升级前的恢复契约：一律回滚。
+    ///
+    /// §3.4：老日志（没有指纹）**不再一律回滚** —— 旧契约会把用户在崩溃后写入的
+    /// 新内容盖掉。尽力识别：源位置字节等于备份字节 → 原图仍在原位，只清产物；
+    /// 其余无法证明归属 → 保留现场，交人工恢复。
     ///
     /// CreateNew 没有备份，也从未动过任何原图：它只许收拾自己生成的那个文件（§29）。
     static func rollback(_ txn: ReplaceTransaction) -> String? {
@@ -492,6 +599,7 @@ final class OutputTransactionStore: @unchecked Sendable {
                 return "备份已不存在，无法自动恢复原图"
             }
             let restore: () -> String? = {
+                if let error = verifyBackupVoucher(txn) { return error }
                 do { try HistoryStore.writeBackupBack(to: txn.sourcePath, backup: txn.backupPath) }
                 catch let error as RestoreError { return error.detail }
                 catch { return error.localizedDescription }
@@ -515,8 +623,19 @@ final class OutputTransactionStore: @unchecked Sendable {
                 return nil
             }
             if txn.outputSha256 == nil && txn.originalSha256 == nil {
-                // 老日志没有身份记录：维持升级前的恢复契约 —— 一律回滚。
-                return restore()
+                // §3.4 老日志没有身份记录：尽力识别，证明不了就保留现场。
+                // 唯一能自动做的：当前字节和备份字节相同 → 原图本来就在原位。
+                guard case .success(let backupBytes) = sha256OfFile(txn.backupPath) else {
+                    return Self.rollbackNeedsReview +
+                        "老版本事务的备份读不出来，无法证明当前文件的归属；不自动覆盖，请人工确认后恢复原图"
+                }
+                if backupBytes == current {
+                    removeGeneratedOutput(txn)
+                    return nil
+                }
+                return Self.rollbackNeedsReview +
+                    "老版本事务无法证明当前文件的归属；不自动覆盖，原图备份与事务日志都保留在原处" +
+                    "（备份: \(txn.backupPath)），请在确认后人工恢复原图"
             }
             return "源文件在事务结束前被外部修改过，无法确认归属；不自动覆盖，原图备份与事务日志都保留在原处"
         case .createNew:
@@ -527,15 +646,17 @@ final class OutputTransactionStore: @unchecked Sendable {
 
     /// 删掉这次压缩产生的新文件与临时文件。同格式 replace 的输出就是源文件本身，绝不删。
     ///
-    /// 跨格式的输出文件也只删"能证明是这次生成的"：新日志按内容指纹判断；
-    /// 老日志没有指纹，维持升级前契约照原样清。
+    /// 跨格式的输出文件只删"能证明是这次生成的"：新日志按内容指纹对账；
+    /// 老日志没有指纹，只删大小正好等于这次产出尺寸的文件 ——
+    /// 旧契约的"无条件清"会把用户在崩溃后放进这个路径的内容一并删掉。
     static func removeGeneratedOutput(_ txn: ReplaceTransaction) {
         if txn.crossFormat || !sameFile(txn.outputPath, txn.sourcePath) {
             let ours: Bool
             if let expected = txn.outputSha256 {
                 ours = (try? sha256OfFile(txn.outputPath).get()) == expected
             } else {
-                ours = true
+                ours = fileLength(txn.outputPath) == txn.expectedOutputSize
+                    && txn.expectedOutputSize > 0
             }
             if ours { try? FileManager.default.removeItem(atPath: txn.outputPath) }
         }
@@ -548,12 +669,18 @@ final class OutputTransactionStore: @unchecked Sendable {
     /// 都归这次事务；其它体积说明这位置已经被别人的内容占了，宁可留个来历不明的文件，
     /// 也不许拿它当自己的半成品删（删用户文件永远不是恢复的选项）。
     static func retireGeneratedOutput(_ txn: ReplaceTransaction) {
-        // §2.5 同款身份门：非空产物按内容指纹对账 —— 大小相同不等于内容还是我们写
-        // 出去的那份；没有指纹可对账的日志一律保留。空占位暂不自动清理（占位 inode
-        // 凭证接线之前，宁可多留一个空文件，也绝不凭"大小为零"删东西）。
         let size = fileLength(txn.outputPath)
-        if size > 0, size == txn.expectedOutputSize, let expected = txn.outputSha256,
-           case .success(let hash) = sha256OfFile(txn.outputPath), hash == expected {
+        if size == 0 {
+            // §2.5 占位 inode 凭证：journal 里记的 (dev,ino) 与磁盘上的实际身份
+            // 对得上才删。大小为零不构成身份，外部在崩溃后放进同一路径的空文件
+            // 分文不动 —— 没有凭证的空文件一律保留。
+            if let expected = txn.placeholderIdentity,
+               let actual = fileIdentity(txn.outputPath),
+               actual.device == expected.device && actual.inode == expected.inode {
+                try? FileManager.default.removeItem(atPath: txn.outputPath)
+            }
+        } else if size == txn.expectedOutputSize, let expected = txn.outputSha256,
+                  case .success(let hash) = sha256OfFile(txn.outputPath), hash == expected {
             try? FileManager.default.removeItem(atPath: txn.outputPath)
         }
         removeTemp(txn)
@@ -563,5 +690,13 @@ final class OutputTransactionStore: @unchecked Sendable {
         if let temp = txn.tempOutputPath {
             try? FileManager.default.removeItem(atPath: temp)
         }
+    }
+
+    /// 文件系统身份 `(dev,ino)`：占位凭证对账用。
+    static func fileIdentity(_ path: String) -> (device: Int64, inode: UInt64)? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let number = attributes[.systemNumber] as? NSNumber,
+              let inode = attributes[.systemFileNumber] as? NSNumber else { return nil }
+        return (device: number.int64Value, inode: inode.uint64Value)
     }
 }

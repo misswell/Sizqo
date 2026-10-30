@@ -51,7 +51,7 @@ const context = vm.createContext({
   files: [],
   inputPaths: [], fileRows: {},
   queueItems: new Map(),
-  queueRevision: 0, pendingAutoCompress: false, selectedQueueFile: null, runIntentSnapshot: null,
+  queueRevision: 0, preflightToken: 0, pendingAutoCompress: false, selectedQueueFile: null, runIntentSnapshot: null,
   isCompressing: false, compressionState: 'idle',
   COMPRESSION_IDLE: 'idle', COMPRESSION_RUNNING: 'running',
   COMPRESSION_PAUSED: 'paused', COMPRESSION_STOPPING: 'stopping',

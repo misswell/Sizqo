@@ -5,18 +5,120 @@ tracks. Rules: a feature is "supported" only with a command and its real
 outcome recorded here; pending or blocked work is never reported as passed.
 Update this file whenever a track's capability changes.
 
-Last updated: 2026-10-22
+Last updated: 2026-10-31
 
 ## Automated checks
 
 | Check | Command | Result |
 |-------|---------|--------|
-| Rust tests, Direct features | `cargo test` (in `src-tauri`) | ✅ 196 unit + 6 integration passed (2026-10-22; 1 ignored) |
-| Rust tests, shared in-process engines | `cargo test --features inproc-backends` | ✅ 198 unit + 6 integration passed (2026-10-22) |
-| Rust tests, App Store feature set | `cargo test --no-default-features --features inproc-backends` | ✅ 198 unit + 6 integration passed (2026-10-22) |
-| Frontend suites (queue, sessions, media import, video contract, i18n, history, CPU limit, settings, compare, update panel, parity, intent model, result contract, output destinations, bulk operations, UI contract) | `npm run test:frontend` (25 suites) | ✅ all pass (2026-10-22) |
-| Swift history / backup / pause / queue / settings / result-contract self-checks | `bash scripts/test_swift_history.sh` | ✅ all pass, checks [1]–[44] (2026-10-22) |
-| Swift full-source typecheck | `xcrun swiftc -typecheck -parse-as-library -target arm64-apple-macos13.0 -module-name SizqoSwift` over every `swift/Sources/SizqoSwift/**/*.swift` (24 files) | ✅ EXIT=0, zero diagnostics (2026-10-22) |
+| Rust tests, Direct features | `cargo test` (in `src-tauri`) | ✅ 236 unit + 11 integration passed (2026-10-31; 2 ignored real-fixture suites run separately) |
+| Rust real-media matrix (bundled ffmpeg) | `cargo test --lib real -- --ignored` (in `src-tauri`) | ✅ 2 suites passed (2026-10-31) |
+| Rust tests, shared in-process engines | `cargo test --features inproc-backends` | ✅ 238 unit + 11 integration passed (2026-10-31) |
+| Rust tests, App Store feature set | `cargo test --no-default-features --features inproc-backends` | ✅ 238 unit + 11 integration passed (2026-10-31) |
+| Frontend suites | `npm run test:frontend` (27 suites) | ✅ all pass (2026-10-31) |
+| Swift history / backup / pause / queue / settings / result-contract self-checks | `bash scripts/test_swift_history.sh` | ✅ all pass (2026-10-31) |
+
+## 0.3.6 file-safety overhaul (working state, unreleased)
+
+Baseline `3891103`. Implementation of the 0.3.6 file-safety / transaction /
+video-integrity plan. Items below are recorded with the tests that prove them;
+anything not listed as passed is **not** passed.
+
+### Passed (with evidence)
+
+- **统一身份采集（§2.1）**：`SourceIdentity::read_with_hash` 改为 fd 基采集
+  （打开的文件描述符上 fstat → 哈希 → 再 fstat，前后不一致报 `SourceError::Unstable`）。
+  测试 `read_with_hash_captures_identity_through_one_fd`。
+- **视频覆盖线接入内容指纹（§3.2）**：replace 模式视频用 `read_with_hash`，
+  备份提前到编码前（失败即任务失败，不烧几小时 CPU 才发现），commit 前完整
+  verify + 备份五态复核；视频事务 `originalSha256` 不再为空。
+- **备份五态复用判定（§2.3）**：`backup_reuse_decision`（Verified /
+  LegacyUnverified / ContentMismatch / Missing / Unreadable）。legacy 备份
+  无证据不再静默复用；凭历史 `sourceSha256` 证据自动升级为 v4 来历记录；
+  复用判定拒绝的旧槽原样保留。测试
+  `a_legacy_backup_without_any_evidence_is_not_silently_reused`、
+  `a_backup_whose_content_no_longer_matches_its_record_is_refused`、
+  `a_backup_made_under_the_legacy_hash_key_is_still_reused`（升级路径）。
+- **备份写入后源复核（§2.2）**：快照复制完成后整份重读源文件复核身份，
+  复制期间被改则快照作废、目录清除、覆盖被拦。故障注入测试
+  `a_snapshot_is_aborted_when_the_source_changes_during_backup`
+  （`TEST_FAULT_EDIT_SOURCE_AFTER_COPY`，仅测试可见）。
+- **事务 V2（§3.1）**：`schemaVersion=2` + `backupSha256`；prepare 前凭证
+  完整性门（覆盖缺三指纹之一 / 新建缺产物指纹 → 拒绝落账，legacy 不受限）。
+  测试 `a_v2_journal_without_full_credentials_is_refused_at_prepare`。
+- **原子交换提交（§3.3）**：`publish_replace_if_identity_matches` ——
+  macOS `renameatx_np(RENAME_SWAP)` / Linux `renameat2(RENAME_EXCHANGE)`，
+  交换后验证**被换出的**字节，不一致换回；换回失败保留现场并改名
+  `*.sizqo-conflict-N`。不支持的平台回退 verify+rename（与旧两道门同级）。
+  图片同格式 replace 与视频 replace 均已接线。测试
+  `publish_replace_swaps_and_verifies_the_swapped_out_bytes`、
+  `publish_replace_swaps_back_when_the_target_is_not_the_expected_original`。
+- **备份凭证回滚（§3.1）**：v2 事务回滚前验备份字节与凭证一致，不符拒绝
+  自动恢复、保留现场。测试 `rollback_verifies_the_backup_voucher_before_writing_back`。
+- **legacy 事务恢复语义（§3.4）**：无凭证老日志不再无条件回滚（旧契约会盖掉
+  用户崩溃后写入的内容）。尽力识别：源==备份字节 → 只清产物；其余 →
+  `NEEDS_REVIEW` 前缀错误，recover 计入 `needs_review` 并保留现场。
+  测试 `legacy_logs_are_identified_as_far_as_possible_and_never_clobber_unknown_content`、
+  `recovery_is_idempotent_when_run_twice_on_the_same_scene`。
+- **跨格式产物清理收紧**：legacy 无指纹日志只删"大小恰为承诺产出"的文件，
+  不再无条件删。图片线 / Swift 线同步。
+- **退出清理引用集（§2.3）**：`sweep_unreferenced_backups` 引用核对补入
+  未完成事务的备份 key（`pending_backup_keys`，Rust 与 Swift 同步）。
+- **恢复五态验证（§2.3/§4.2）**：Rust `restore` 与 Swift `restore` 在写回前
+  按五态验备份；legacy 需显式确认（Rust `accept_legacy` 命令参数 +
+  前端确认弹窗 + i18n；Swift 弹窗同语义）；`force` 不绕过备份验证。
+  测试 `restore_requires_confirmation_for_legacy_backups`（Rust）、
+  Swift 自检全套、`tests/history-view.cjs`（含 acceptLegacy 契约断言）。
+- **Swift 对齐（§4.1–§4.4）**：HistoryEntry 增 `outputSha256/backupSha256/
+  sourceSha256`（decode-if-present）；`conflictState` 五态（有指纹按内容判，
+  时间戳不再单独定罪）；Maintenance Lease（`beginMaintenance` RAII，
+  restore/restoreAll/clearHistory 持租约，与 tryBeginBatch 同锁仲裁）；
+  占位 `(dev,ino)` 凭证落账并在 retire 时对账（空占位无凭证不删）；
+  事务 V2 字段与凭证门；legacy 恢复语义与 Rust 相同；
+  记账时写入产物/备份指纹。Swift 自检全部通过。
+- **运行中禁止移除（§7.3）**：Swift `removeItem` 对 running 显示
+  「当前文件正在压缩，无法移除」，不再把"从队列隐藏"当成移除。
+- **视频输入能力分类器（§5.1/§5.2）**：新增 `video/format_classifier.rs`，
+  严格白名单（8-bit SDR 精确位深；9/10/12/16-bit、alpha、float、未知格式
+  一律拒绝并说明）；HDR 按传递函数（PQ/HLG/DOVI/HDR10+）判定，
+  BT.2020 原色单独拒绝并说明色彩空间原因。probe 不再把 BT.2020 原色当 HDR。
+- **VFR 保留源 PTS（§5.3）**：默认 `fps_mode passthrough`，不再自动归一化为
+  平均帧率 CFR；只有用户明确指定帧率才 CFR。
+  `core/media-task-protocol.md` 已同步。真实夹具测试（v0.3.2 真实文件链）
+  改为证 passthrough 语义。
+- **输入严格解码（§5.5）**：编码 argv 输入侧加 `-err_detect explode` +
+  全局 `-xerror`；损坏输入在解码层报错，不能被容错吞成"压缩成功"。
+- **输出验证契约（§5.4）**：时长容差按帧间隔（2 帧，250ms 下限）计算，
+  百分比阈值删除（2 小时丢 60 秒必失败）；输出视频流数必须恰为 1；
+  源里明确写过的 color transfer/primaries 输出不许丢。
+- **元数据隐私全作用域（§6）**：probe 增加 `-show_programs` 与
+  `programs` 字段；StripAll argv 增加流级/章节级/program 级清空
+  （`-map_metadata:s/c/p -1`）；StripPrivate 与 StripAll 的**验证**遍历
+  全局+每流+每章节+每 program；muxer 结构标签豁免清单扩展（DURATION 等）。
+  真实编码夹具测试 `metadata_policies_hold_on_real_encoded_fixtures` 通过。
+- **批量视频预检（§7.2）**：新命令 `validate_video_batch`（一次 IPC 整批、
+  逐文件独立作答）；前端本地判据先筛 + 批量结果标记失败。
+- **前端预检竞态（§7.1）**：`preflightToken` 代次 + 授权弹窗/批量校验每个
+  await 后复核 + `beginExecutionSession` 前重筛"仍在队列且 pending"；
+  clearAllFiles/startNextRound 作废预检。测试 `tests/video-batch-isolation.cjs`
+  （批量语义）、`tests/queue-progress.cjs` 等全套通过。
+- **导入扫描加固（§8.1）**：目录递归不跟随越出根的符号链接；探测 worker
+  panic 时该块文件按"探测失败"入队（带原因），其余块照常回收，整批不再
+  静默消失。
+
+### Not done (never report as passed)
+
+- **万级队列虚拟列表 / 1,000–5,000–10,000 性能基准 / 排序脏标记**：未实现，
+  §8 的性能验收不通过。
+- **tests/contracts/ 双引擎 JSON 契约测试向量**：未建立（本轮以 Rust 单测 +
+  Swift 自检分别钉住同一批行为，统一向量仍在清单上）。
+- **人工恢复界面**：legacy/无法证明归属的事务现场保留 + 启动警告 + 日志，
+  专用 GUI（展示当前文件与备份、一键恢复）未建。
+- **FaultInjector 全链路崩溃注入**：Rust 覆盖快照中断/恢复幂等/凭证；
+  "编码中途强制结束进程"级注入未做。
+- **三平台构建/签名/公证、App Store 沙盒运行、FFmpeg GPL 源义务审查、
+  luna_worker 委托**：未执行（本环境无 codex CLI，luna_worker 不可用，
+  已按全局规则在会话报告中说明）。发布门禁未通过，0.3.6 不得发版。
 
 ## Track: Direct (`com.misswell.sizqo`)
 
@@ -1124,13 +1226,11 @@ real_encoded_fixtures` 是 `#[ignore]` 的显式测试，常规套件并不运�
 
 ### 已知不对称与遗留（不冒充完成）
 
-- **Swift 占位 inode 凭证未接线**：Swift 的空占位清账暂保守保留（不删），
-  Rust 按 `(dev,ino)` 凭证清理；非空产物的指纹门两侧一致。
-- **Swift 调度器维护租约未加**：Swift 侧恢复闸门仍是 `isCompressing` 状态检查；
-  Rust 的 lifecycle 租约先行，Swift 接线列入下一轮。
+- ~~Swift 占位 inode 凭证未接线~~ / ~~Swift 调度器维护租约未加~~：
+  均已在 0.3.6 轮完成（见上节"Swift 对齐"），以 Swift 自检为证。
 - **视频 CreateNew 事务的崩溃恢复测试**：事务与 retire 语义与图片共用同一实现
   （output_transaction 测试覆盖），端到端视频崩溃注入未单独补。
-- **1,000/5,000/10,000 性能基准、排序脏标记、签名应用 GUI 点击验收、
+- **1,000/5,000/10,000 性能基准、虚拟列表、排序脏标记、签名应用 GUI 点击验收、
   App Store 沙盒运行**：仍未完成，继续标记为未通过。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))

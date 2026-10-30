@@ -340,7 +340,14 @@ do {
     entry.outputModifiedAt = current - 1_000
     check(!HistoryStore.hasConflict(entry), "1 秒抖动不误报")
     entry.outputModifiedAt = current - 60_000
-    check(HistoryStore.hasConflict(entry), "1 分钟差 = 真被改过")
+    // §4.1 有产物指纹按内容判：mtime 被碰过、字节没变，不是冲突。
+    check(!HistoryStore.hasConflict(entry), "只有时间戳变了、字节没变 = 不冲突")
+    // 同大小、同 mtime 的原地改动只有内容指纹看得出来。
+    entry.outputSha256 = sha256OfData(Data([7, 7]))
+    check(HistoryStore.hasConflict(entry), "内容换了 = 冲突（指纹说了算）")
+    // 老记录没有指纹：退回 size + mtime 弱验证，1 分钟差 = 真被改过。
+    entry.outputSha256 = nil
+    check(HistoryStore.hasConflict(entry), "无指纹的老记录退回 mtime 判据：1 分钟差 = 真被改过")
     // 非覆盖模式的产物被外部改过同样算冲突：撤销 = 删产物，静默删掉用户的编辑
     // 就是丢数据（与覆盖模式同一份判据）。
     entry.outputMode = "suffix"
@@ -837,9 +844,14 @@ do {
 print("[21] replace 事务与崩溃恢复")
 func transaction(_ id: String, source: String, output: String, backup: String,
                  crossFormat: Bool = false) -> ReplaceTransaction {
-    ReplaceTransaction(
+    // §3.1 现行版本凭证：三份指纹齐全。老日志（无指纹）的兼容恢复另有专门测试。
+    let backupHash = sha256OfData(Data(readBytes(backup)))
+    return ReplaceTransaction(
         id: id, historyId: id, sourcePath: source, outputPath: output, backupPath: backup,
         tempOutputPath: nil, originalSize: 3, expectedOutputSize: 1,
+        originalSha256: backupHash,
+        outputSha256: sha256OfData(Data(readBytes(crossFormat ? output : source))),
+        backupSha256: backupHash,
         createdAt: SizqoClock.nowMillis, crossFormat: crossFormat
     )
 }
@@ -876,9 +888,11 @@ do {
     check(committed.committed == 1 && committed.rolledBack == 0, "已提交的事务只销账")
     check(readBytes(source) == [9, 9, 9], "已提交的事务绝不动用户文件")
 
-    // 跨格式：PNG → JPG 的回滚要连转换出来的新文件一起删。
+    // 跨格式：PNG → JPG 的回滚要连转换出来的新文件一起删。跨格式从不覆盖
+    // 原文件本身，所以崩溃现场源位置就是原图字节 —— 恢复对它是无操作，
+    // 只按内容指纹收走转换产物。
     let png = canonicalPath(dir + "/photo.png")
-    makeFile(png, [9, 9])
+    makeFile(png, [1, 2, 3])
     let jpg = dir + "/photo.jpg"
     writeData(jpg, [8, 8])
     writeData(backupFile, [1, 2, 3])
@@ -921,6 +935,7 @@ do {
             backupPath: backupFile, tempOutputPath: nil,
             originalSize: 3, expectedOutputSize: 3,
             originalSha256: originalHash, outputSha256: outputHash,
+            backupSha256: originalHash,
             createdAt: SizqoClock.nowMillis, crossFormat: crossFormat)
     }
 
@@ -1763,9 +1778,13 @@ do {
     makeFile(legacySource, [9, 9, 9])
     let legacyBackup = dir + "/legacy-original.png"
     writeData(legacyBackup, [1, 2, 3])
+    let legacyHash = sha256OfData(Data(readBytes(legacyBackup)))
     check(legacyJournal.prepareDurable(ReplaceTransaction(
         id: "t-legacy", historyId: "t-legacy", sourcePath: legacySource, outputPath: legacySource,
         backupPath: legacyBackup, tempOutputPath: nil, originalSize: 3, expectedOutputSize: 1,
+        originalSha256: legacyHash,
+        outputSha256: sha256OfData(Data(readBytes(legacySource))),
+        backupSha256: legacyHash,
         createdAt: SizqoClock.nowMillis, crossFormat: false)) == nil,
         "覆盖模式的记账凭证要连目录一起落到磁盘")
     let legacyFile = legacyJournal.root + "/t-legacy.json"
@@ -1785,12 +1804,14 @@ do {
     let newSource = canonicalPath(dir + "/newsrc.png")
     makeFile(newSource, [4, 4, 4])
     let newOutput = dir + "/newsrc_compressed.png"
-    func newTxn(_ id: String, outputSize: Int64, temp: String? = nil, outputSha256: String? = nil) -> ReplaceTransaction {
+    func newTxn(_ id: String, outputSize: Int64, temp: String? = nil, outputSha256: String? = nil,
+                schemaVersion: Int = transactionSchemaVersion) -> ReplaceTransaction {
         ReplaceTransaction(
             id: id, historyId: id, sourcePath: newSource, outputPath: newOutput,
             backupPath: "", tempOutputPath: temp, originalSize: 4, expectedOutputSize: outputSize,
             originalSha256: nil, outputSha256: outputSha256,
-            createdAt: SizqoClock.nowMillis, crossFormat: false, mode: .createNew
+            createdAt: SizqoClock.nowMillis, crossFormat: false, mode: .createNew,
+            schemaVersion: schemaVersion
         )
     }
     writeData(newOutput, [9, 9])
@@ -1806,14 +1827,14 @@ do {
 
     // 体积对不上：这位置已被别人的内容占了，不许当成自己的半成品删掉。
     writeData(newOutput, [1, 2, 3, 4, 5])
-    _ = newJournal.prepare(newTxn("t-keep", outputSize: 2))
+    _ = newJournal.prepare(newTxn("t-keep", outputSize: 2, schemaVersion: 0))
     _ = newJournal.recover(newStore)
     check(fm.fileExists(atPath: newOutput) && readBytes(newOutput) == [1, 2, 3, 4, 5],
           "删掉一个来历不明的文件永远不是恢复的选项")
 
     // 历史已认账：只销账，产物留着。
     writeData(newOutput, [9, 9])
-    _ = newJournal.prepare(newTxn("t-committed-new", outputSize: 2))
+    _ = newJournal.prepare(newTxn("t-committed-new", outputSize: 2, schemaVersion: 0))
     _ = newStore.add(HistoryEntry.record(withId: "t-committed-new", source: newSource,
                                           result: result(file: newSource, size: 2), output: newOutput,
                                           backup: nil, retentionDays: 3))
@@ -1927,8 +1948,8 @@ do {
         .appendingPathComponent(HistoryStore.metaFileName)
     let recorded = ((try? JSONSerialization.jsonObject(
         with: fm.contents(atPath: metaPath) ?? Data())) as? [String: Any]) ?? [:]
-    check(recorded["version"] as? Int == 3,
-          "来历记录升到 v3：没有两份指纹就没法证明副本是原图")
+    check(recorded["version"] as? Int == 4,
+          "来历记录升到 v4：没有两份指纹就没法证明副本是原图")
     let sourceHash = recorded["sourceSha256"] as? String
     let copyHash = recorded["backupSha256"] as? String
     check(sourceHash?.count == 64 && sourceHash == copyHash,

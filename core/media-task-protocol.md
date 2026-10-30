@@ -36,10 +36,14 @@ x265 pools/SVT logical processor mappings. This is a parallelism bound, not a
 promise of a measured CPU/GPU percentage.
 
 Unknown duration means indeterminate video fraction/ETA. Target size and ETA
-are estimates. Frame rate defaults to source timing: constant-rate sources keep
-their timestamps, variable-rate sources are normalized to the source average
-frame rate so the output duration is preserved; an explicit frame rate wins.
-Encoder fallback happens only for `auto`, with an explicit warning; a specifically
+are estimates. Frame rate defaults to source timing: when no frame rate is
+selected the source PTS are preserved (`fps_mode passthrough`) — variable-rate
+sources keep their original timestamp distribution and are never silently
+normalized to the average frame rate; an explicit frame rate wins and converts
+to CFR. Input bit depth, alpha, float formats and HDR are decided by a strict
+whitelist / transfer-function classifier, which rejects with an explanation
+instead of silently down-converting. Encoder fallback happens only for `auto`,
+with an explicit warning; a specifically
 selected unavailable encoder is rejected. A claimed hardware encoder disables
 FFmpeg software fallback and must pass a runtime trial.
 

@@ -33,6 +33,9 @@ pub enum SourceError {
     Missing,
     /// 还在，但读不出来（权限、拔盘、IO 故障）。
     Unreadable(String),
+    /// 采集身份期间文件本身被换掉或修改：这份哈希不再是任何一份完整字节，
+    /// 拿它当覆盖依据等于盖在一份从没验证过的内容上。
+    Unstable(String),
 }
 
 impl fmt::Display for SourceError {
@@ -40,6 +43,9 @@ impl fmt::Display for SourceError {
         match self {
             SourceError::Missing => write!(formatter, "源文件已经不在这个位置"),
             SourceError::Unreadable(detail) => write!(formatter, "源文件读不出来（{detail}）"),
+            SourceError::Unstable(detail) => {
+                write!(formatter, "文件在读取身份期间发生了变化（{detail}）")
+            }
         }
     }
 }
@@ -73,10 +79,27 @@ impl SourceIdentity {
     }
 
     /// 快速指纹 + 内容指纹：§25 流程第一步，replace 模式编码前钉下的那份依据。
+    ///
+    /// 身份从**打开着的文件描述符**上取，而不是先 stat 路径再随手开一次：
+    /// 两步之间路径被换成另一个 inode 时，算出来的哈希就不再是 stat 看到的那份字节。
+    /// 哈希前后各 fstat 一次，两次指纹不一致 = 采集过程横着一场替换，这份结果作废。
     pub fn read_with_hash(path: &Path) -> Result<Self, SourceError> {
-        let mut identity = Self::read(path)?;
-        identity.sha256 = Some(sha256_of(path)?);
-        Ok(identity)
+        let mut file = fs::File::open(path).map_err(metadata_error)?;
+        let before = fd_identity(&file)?;
+        let sha256 = sha256_of_file(&mut file, path)?;
+        let after = fd_identity(&file)?;
+        if !before.same_fingerprint(&after) {
+            return Err(SourceError::Unstable(format!(
+                "{}: 哈希前后 stat 不一致",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            size: after.size,
+            modified: after.modified,
+            identity: after.identity,
+            sha256: Some(sha256),
+        })
     }
 
     /// §25 流程里那个"比较"：只看一次 `stat()` 读得到的三项。
@@ -123,7 +146,6 @@ impl SourceIdentity {
 
 /// 内容指纹。流式读：一张 200 MB 的 TIFF 不许整份进内存才算得出它是谁。
 pub fn sha256_of(path: &Path) -> Result<String, SourceError> {
-    use sha2::Digest;
     use std::io::ErrorKind;
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
@@ -132,6 +154,32 @@ pub fn sha256_of(path: &Path) -> Result<String, SourceError> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Err(SourceError::Missing),
         Err(error) => return Err(SourceError::Unreadable(format!("{}: {error}", path.display()))),
     };
+    sha256_of_file(&mut file, path)
+}
+
+/// 已经打开的文件上的身份：一次 `fstat`，不重开路径。
+fn fd_identity(file: &fs::File) -> Result<SourceIdentity, SourceError> {
+    let meta = file
+        .metadata()
+        .map_err(|error| SourceError::Unreadable(error.to_string()))?;
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    };
+    #[cfg(not(unix))]
+    let identity = None;
+    Ok(SourceIdentity {
+        size: meta.len(),
+        modified: meta.modified().ok(),
+        identity,
+        sha256: None,
+    })
+}
+
+/// 流式哈希一份已经打开的文件。
+fn sha256_of_file(file: &mut fs::File, path: &Path) -> Result<String, SourceError> {
+    use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     let mut buffer = [0u8; 256 * 1024];
     loop {
@@ -304,5 +352,26 @@ mod tests {
         fs::write(&path, b"clip-bytes").unwrap();
         let before = SourceIdentity::read(&path).unwrap();
         assert_eq!(before.verify(&path), SourceCheck::Unchanged);
+    }
+
+    #[test]
+    fn read_with_hash_captures_identity_through_one_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.png");
+        fs::write(&path, b"stable bytes").unwrap();
+        let hashed = SourceIdentity::read_with_hash(&path).unwrap();
+        let fast = SourceIdentity::read(&path).unwrap();
+        assert!(
+            hashed.same_fingerprint(&fast),
+            "fd 基采集拿到的 stat 指纹必须和路径 stat 一致"
+        );
+        assert_eq!(
+            hashed.sha256.as_deref(),
+            Some(sha256_of(&path).unwrap().as_str()),
+            "采集到的哈希就是这份字节的哈希"
+        );
+        // 采集的最终用途是覆盖依据：原地换内容必须查得出来。
+        fs::write(&path, b"replaced bytes").unwrap();
+        assert!(matches!(hashed.verify(&path), SourceCheck::Changed(_)));
     }
 }

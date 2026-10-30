@@ -7,7 +7,14 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
     let started=Instant::now();let mut result=VideoResult::pending(task_id,source,options);
     let outcome=(||->Result<(),String>{
         let source=source.canonicalize().map_err(|e|e.to_string())?;
-        let identity=transaction::SourceIdentity::read(&source).map_err(|e|e.to_string())?;
+        // §3.2 覆盖模式必须先算出内容指纹：事务凭证、崩溃恢复、备份复用
+        // 全都靠它，stat 三项在"同大小同时间戳的原地改动"面前什么也证明不了。
+        // 新建模式保持只 stat（§2.1：普通输出不必为每个源文件额外算哈希）。
+        let identity=if options.output_mode=="replace"{
+            transaction::SourceIdentity::read_with_hash(&source).map_err(|e|e.to_string())?
+        }else{
+            transaction::SourceIdentity::read(&source).map_err(|e|e.to_string())?
+        };
         let source_probe=probe::probe(&source)?;
         let plan=plan::build(options,&source_probe,caps,budget)?;
         result.encoder_actual=plan.encoder.clone();result.warnings=plan.warnings.clone();
@@ -16,14 +23,17 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
         let estimated=plan.bitrate_kbps.zip(source_probe.duration_us).map(|(b,t)|b.saturating_mul(1000).saturating_mul(t/1000000)/8).unwrap_or(source_probe.size_bytes);
         let needed=estimated.max(source_probe.size_bytes/4).saturating_mul(2).saturating_add(64*1024*1024);
         if transaction::available_space(parent)?<needed{return Err(format!("Insufficient output disk space: reserve at least {} bytes",needed));}
-        if options.output_mode=="replace" {
-            // Reserve on the persistent backup volume independently; never put originals in temp.
+        // §3.2 覆盖模式在**编码之前**备好原图备份（§2.2 顺序：身份 → 备份 → 编码）。
+        // 编码期间用户改了文件，commit 的两次完整复核会拦住；但备份必须先落盘，
+        // 否则"备份失败"这种最需要停止的情况会等到烧完几个小时 CPU 才被发现。
+        let backup=if options.output_mode=="replace"{
             let backup_root=logs.parent().ok_or("Application data directory missing")?;
             let mut needed_backup=source_probe.size_bytes.saturating_add(64*1024*1024);
             #[cfg(unix)]{use std::os::unix::fs::MetadataExt;if fs::metadata(parent).map_err(|e|e.to_string())?.dev()==fs::metadata(backup_root).map_err(|e|e.to_string())?.dev(){needed_backup=needed_backup.saturating_add(needed);}}
             if transaction::available_space(backup_root)?<needed_backup{return Err("Insufficient disk space for the persistent original backup and encoded output".into());}
             result.warnings.push(format!("Replace keeps a persistent original backup of {} bytes",source_probe.size_bytes));
-        }
+            Some(history.ensure_backup_verified(&source,identity.sha256.as_deref()).map_err(|e|e.to_string())?)
+        }else{None};
         fs::create_dir_all(logs).map_err(|e|e.to_string())?;
         let id=crate::history::HistoryEntry::new_id(&source);
         let log_path=logs.join(format!("{id}.log"));
@@ -59,7 +69,7 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
         }
         if encoded.size_bytes>=source_probe.size_bytes{result.warnings.push("Larger output retained by explicit professional-mode choice".into());}
         result.elapsed_ms=started.elapsed().as_millis()as u64;
-        transaction::commit(&source,&partial,&target,options,&source_probe,&mut result,history,transactions,retention,&identity)?;
+        transaction::commit(&source,&partial,&target,options,&source_probe,&mut result,history,transactions,retention,&identity,backup.as_deref())?;
         result.success=true;result.stage="completed".into();result.outcome=Some(ResultOutcome::Committed);Ok(())
     })();
     result.elapsed_ms=started.elapsed().as_millis()as u64;
@@ -238,8 +248,8 @@ mod tests {
         assert_eq!(multi_encoded.subtitles().count(),1,"字幕丢了");
         assert_eq!(multi_encoded.chapters.len(),1,"章节丢了");
 
-        // ② VFR 源：探得 VFR，计划带归一化帧率，产物时长与源一致（v0.3.2 修复的真实文件证明）。
-        // 用 mp4 + passthrough：mkv 会把丢帧后的时间戳归一化，探不出 r≠avg。
+        // ② VFR 源：§5.3 默认 passthrough —— 保留源 PTS，不重排时间轴。
+        // 用 mp4：mkv 会把丢帧后的时间戳归一化，探不出 r≠avg。
         let vfr=make_fixture(root,"vfr.mp4",&[
             "-f","lavfi","-i","testsrc2=size=160x120:rate=30:duration=2",
             "-vf","select='not(mod(n\\,5))'","-fps_mode","passthrough",
@@ -248,16 +258,21 @@ mod tests {
         assert!(vfr_probe.variable_frame_rate,"夹具必须真的是 VFR（r≠avg）");
         let mut vfr_options=base.clone();vfr_options.audio_policy="none".into();vfr_options.container="mp4".into();
         let vfr_plan=plan::build(&vfr_options,&vfr_probe,&caps,2).unwrap();
-        assert!(vfr_plan.vfr_rate.is_some(),"VFR 源未指定帧率时计划必须带归一化帧率");
+        let vfr_argv=vfr_plan.argv(&vfr,&root.join("vfr-out.mp4"),1,&root.join("stats"));
+        assert!(vfr_argv.windows(2).any(|w|w==["-fps_mode","passthrough"]),"VFR 源默认保留原始时间戳");
+        assert!(!vfr_argv.windows(2).any(|w|w==["-fps_mode","cfr"]),"不许再自动归一化成 CFR");
         let vfr_encoded=encode_with(root,&vfr,&vfr_options);
-        // 归一化的意义就是输出变成 CFR：平均帧率必须等于计划里的源平均帧率，
-        // 时长漂移不超过 §56 校验自身的容差（max(1%, 250ms)）。
+        // passthrough 的意义就是时间轴原样：时长漂移不超过帧间隔容差（§5.4），
+        // 产物平均帧率等于源平均帧率（时间戳没被重排的证据）。
         let src_secs=vfr_probe.duration_us.unwrap() as f64/1e6;
         let out_secs=vfr_encoded.duration_us.unwrap() as f64/1e6;
-        let tolerance=(src_secs*0.01).max(0.25);
+        let fps=vfr_probe.frame_rate.unwrap_or(30.0);
+        let tolerance=((1e6/fps)*2.0/1e6).max(0.25);
         assert!((src_secs-out_secs).abs()<=tolerance,"VFR 产物时长漂移超容差：{src_secs} → {out_secs}");
-        let expected=probe::rational(vfr_plan.vfr_rate.as_deref().unwrap()).unwrap();
-        assert!((vfr_encoded.frame_rate.unwrap()-expected).abs()<1e-6,"产物平均帧率应等于源平均帧率");
+        let expected=vfr_probe.frame_rate.unwrap();
+        // passthrough 保留的是时间戳本身；容器写回的 avg_frame_rate 有取整，
+        // 2% / 0.5fps 内即视为时间轴未被重排。
+        assert!((vfr_encoded.frame_rate.unwrap()-expected).abs()<(expected*0.02).max(0.5),"产物平均帧率应约等于源平均帧率");
 
         // ③ 带透明通道：argb/qtrle 必须在编码前被拒，绝不静默去掉 alpha。
         let alpha=make_fixture(root,"alpha.mov",&[

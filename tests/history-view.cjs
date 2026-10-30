@@ -287,7 +287,9 @@ const actionsOf = row => row.querySelector('.media-actions').children
   await context.restoreFromHistory(entry());
   const forced = last('restore_history_entry');
   assert.equal(forced[1].force, true, 'confirming retries with force');
-  assert.deepEqual(Object.keys(forced[1]).sort(), ['force', 'historyId'], '前端不拼路径，只交 historyId');
+  assert.deepEqual(
+    Object.keys(forced[1]).sort(), ['acceptLegacy', 'force', 'historyId'],
+    '前端不拼路径，只交 historyId（acceptLegacy 是 §2.3 旧备份确认位，false 也是显式交）');
 
   // 主队列的「恢复原图」必须走同一个后端服务：前端只交 filePath，路径由后端从历史里取。
   restoreReply = { success: true, conflict: false, filePath: '/Pictures/a.png', historyIds: ['e1'] };
@@ -298,7 +300,9 @@ const actionsOf = row => row.querySelector('.media-actions').children
     result: { file: '/Pictures/a.png', outcome: 'committed', backupPath: '/app/backup/a.png', outputPath: '/Pictures/a.png' },
   });
   await context.restoreOriginal('/Pictures/a.png');
-  assert.deepEqual(Object.keys(last('restore_original')[1]).sort(), ['filePath', 'force'], '主队列只交 filePath');
+  assert.deepEqual(
+    Object.keys(last('restore_original')[1]).sort(), ['acceptLegacy', 'filePath', 'force'],
+    '主队列只交 filePath（acceptLegacy 是 §2.3 旧备份确认位）');
   assert.equal(context.queueItems.get('/Pictures/a.png').state, 'restored', '恢复过的项离开结果集');
   assert.equal(context.queueItems.get('/Pictures/a.png').result, null, '结果一并清掉');
   assert.equal(rowA.querySelector('.media-meta').textContent, '已恢复');

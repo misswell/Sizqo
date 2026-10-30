@@ -347,12 +347,13 @@ final class AppState: ObservableObject {
         alert.addButton(withTitle: "清空")
         alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        // runModal 的嵌套 runloop 里可能已经开跑新一轮（自动压缩的 asyncAfter
-        // 就在等这种时机）：确认之后必须再核一次闸门，确认前的判据不作数。
-        guard !scheduler.isBatchActive else {
+        // §4.3 维护租约在弹窗确认**之后**抢：runModal 的嵌套 runloop 里可能已经
+        // 开跑新一轮，抢不到租约就一个文件都不动（与 Rust clear_history 同一契约）。
+        guard let lease = scheduler.beginMaintenance() else {
             showToast("压缩进行中，无法清空历史记录")
             return
         }
+        defer { lease.release() }
         guard !transactions.hasPending() else {
             showToast("仍有文件事务正在处理，暂时无法清空历史记录")
             return
@@ -741,9 +742,15 @@ final class AppState: ObservableObject {
         // 堵在闸门上的 worker 得被叫醒才会发现"自己要处理的文件已经不在队列里"。
         scheduler.wakeWaiters()
         if let idx = items.firstIndex(where: { $0.path == path }) {
-            if items[idx].status == .pending || items[idx].status == .running {
-                items[idx].status = .removed
+            guard items[idx].status == .pending else {
+                // §7.3 运行中禁止移除：压缩引擎仍会执行完并落盘，"从队列隐藏"
+                // 会把 UI 状态和真实执行状态撕开。前端同款语义（pending 才显示移除）。
+                if items[idx].status == .running {
+                    showToast("当前文件正在压缩，无法移除")
+                }
+                return
             }
+            items[idx].status = .removed
         }
     }
 
@@ -1222,6 +1229,14 @@ final class AppState: ObservableObject {
             placement = .createNew
         }
         let crossFormat = placement.crossFormat
+        // §3.1 占位凭证：独占申请来的 0 字节占位的 (dev,ino)。崩溃恢复时
+        // "这个空文件是我们的占位"全靠它证明，没有凭证的空文件一律不删。
+        let placeholderIdentity: (device: Int64, inode: UInt64)?
+        if placement.crossFormat || placement.transactionMode == .createNew {
+            placeholderIdentity = OutputTransactionStore.fileIdentity(target)
+        } else {
+            placeholderIdentity = nil
+        }
 
         // ① 事务 id 必须在动手之前定下来：历史落盘成功与否就靠它和 transaction 对账。
         //    两种模式都要记账 —— 新建模式那份日志负责"证明不了提交就删掉自己生成的文件"（§32）。
@@ -1247,6 +1262,10 @@ final class AppState: ObservableObject {
             // 证明不了就不会拿备份去盖一个被外部改过的文件。
             originalSha256: replaceIdentity?.sha256,
             outputSha256: sha256OfData(compressed),
+            // §3.1 备份凭证：来历记录里有就抄，老备份没有记录就现场算一份。
+            // 覆盖事务缺这份凭证会在 prepare 处被拒绝落账。
+            backupSha256: backupFile.flatMap { history.recordedBackupSha256(of: $0) },
+            placeholderIdentity: placeholderIdentity,
             createdAt: SizqoClock.nowMillis,
             crossFormat: crossFormat,
             mode: placement.transactionMode
@@ -1339,7 +1358,8 @@ final class AppState: ObservableObject {
         restoreBlockedBySession && (action == .restore || action == .deleteOutput)
     }
 
-    /// 恢复一条历史记录。压缩之后又被外部改过时先问用户，坚持才 force 覆盖。
+    /// 恢复一条历史记录。压缩之后又被外部改过时先问用户，坚持才 force 覆盖；
+    /// 备份来自旧版本（§2.3）时单独确认，确认也不绕过备份字节验证。
     /// 所有路径都由历史记录提供，调用方不参与拼路径。
     @discardableResult
     func restore(entry: HistoryEntry) -> Bool {
@@ -1347,6 +1367,13 @@ final class AppState: ObservableObject {
             showToast(restoreBlockedText)
             return false
         }
+        // §4.3 维护租约：与会话启动在同一把条件锁上仲裁，恢复与压缩不可能各拿
+        // 一半检查再各走各的。租约持有到本次恢复结束（RAII），弹窗期间也在场。
+        guard let lease = scheduler.beginMaintenance() else {
+            showToast(restoreBlockedText)
+            return false
+        }
+        defer { lease.release() }
         var outcome = history.restoreOutcome(entry: entry, force: false)
         if outcome.conflict {
             let alert = NSAlert()
@@ -1359,13 +1386,18 @@ final class AppState: ObservableObject {
             alert.addButton(withTitle: "仍然继续")
             alert.addButton(withTitle: "取消")
             guard alert.runModal() == .alertFirstButtonReturn else { return false }
-            // 模态的嵌套 runloop 里批次状态可能已经变了（自动压缩恰好起跑）：
-            // 强制恢复之前再核一次会话闸门，冲突确认不等于会话闸门确认。
-            guard !restoreBlockedBySession else {
-                showToast(restoreBlockedText)
-                return false
-            }
+            // 模态期间租约一直在场：批次开不起来，不需要再核会话闸门。
             outcome = history.restoreOutcome(entry: entry, force: true)
+        }
+        if outcome.legacyBackup {
+            let alert = NSAlert()
+            alert.messageText = "这份备份来自旧版本，缺少内容指纹。"
+            alert.informativeText = "Sizqo 无法验证它的完整性。是否仍要尝试用这份备份恢复原图？"
+            alert.addButton(withTitle: "仍要恢复")
+            alert.addButton(withTitle: "取消")
+            guard alert.runModal() == .alertFirstButtonReturn else { return false }
+            // 用户确认的只是"完整性未知"，备份字节对不上记录的照样拒绝（§2.3）。
+            outcome = history.restoreOutcome(entry: entry, force: false, acceptLegacy: true)
         }
         guard outcome.success else {
             showToast(outcome.error ?? "恢复失败")
@@ -1418,8 +1450,17 @@ final class AppState: ObservableObject {
         alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
+        // §4.3 整批持同一把维护租约：批内逐条恢复，压缩会话起不来。
+        // 与 Rust restore_all 一把租约的形状一致。
+        guard let lease = scheduler.beginMaintenance() else {
+            showToast(restoreBlockedText)
+            return
+        }
+        defer { lease.release() }
+
         var restored = 0
         var conflicts = 0
+        var legacyBackups = 0
         var failed = 0
         var cleanupWarnings = 0
         for item in restorable {
@@ -1434,6 +1475,10 @@ final class AppState: ObservableObject {
                 markItemsRestored(forSource: entry.sourcePath)
             } else if outcome.conflict {
                 conflicts += 1
+            } else if outcome.legacyBackup {
+                // 批量不接受 legacy 确认：老备份逐条在单文件恢复里确认（§2.3），
+                // 整批"全部接受"会让用户在没看清的情况下回写无法验证的内容。
+                legacyBackups += 1
             } else {
                 failed += 1
             }
@@ -1442,6 +1487,7 @@ final class AppState: ObservableObject {
         // 冲突不静默覆盖：整批里遇到的都记下来，让用户去历史页逐个确认。
         var message = "已恢复 \(restored) 个文件到原图"
         if conflicts > 0 { message += "，\(conflicts) 个文件压缩后又被修改过，请在历史记录里逐个确认" }
+        if legacyBackups > 0 { message += "，\(legacyBackups) 个备份来自旧版本，请在历史记录里逐个确认恢复" }
         if cleanupWarnings > 0 { message += "，\(cleanupWarnings) 个压缩结果未能删除" }
         if failed > 0 { message += "，\(failed) 个未能恢复" }
         showToast(message)

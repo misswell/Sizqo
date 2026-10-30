@@ -28,6 +28,10 @@ final class CompressionScheduler: @unchecked Sendable {
     private var stopping = false
     /// 是否有批次在跑，只影响 UI 显示的 state 文案。
     private var batchRunning = false
+    /// §4.3 维护互斥：与批次共用同一个状态仲裁。与 Rust 的
+    /// LIFECYCLE_IDLE/BATCH/MAINTENANCE 同一契约 —— 压缩会话与维护操作
+    /// （恢复/清理）之间是真正的互斥，不再是一次状态检查加祈祷。
+    private var maintenanceActive = false
     private var maxParallelism: Int
     private var active = 0
 
@@ -121,7 +125,11 @@ final class CompressionScheduler: @unchecked Sendable {
     /// 暂停 / 停止 / 取消账本一起清零 —— 「点了暂停却还在压」就是这么来的。
     func tryBeginBatch(maxParallelism limit: Int? = nil) -> Bool {
         condition.lock()
-        guard !batchRunning else { condition.unlock(); return false }
+        guard !batchRunning, !maintenanceActive else {
+            // 维护租约在场时同样拒绝：恢复/清理进行中，压缩会话开不起来。
+            condition.unlock()
+            return false
+        }
         if let limit { maxParallelism = max(Self.minParallelism, limit) }
         paused = false
         stopping = false
@@ -139,6 +147,51 @@ final class CompressionScheduler: @unchecked Sendable {
         active = 0
         condition.broadcast()
         condition.unlock()
+    }
+
+    // MARK: 维护租约（§4.3，与 Rust MaintenanceLease 同一契约）
+
+    /// 抢维护互斥：与 `tryBeginBatch` 在同一把条件锁上仲裁。
+    /// 返回 nil = 有批次在跑（或另一份维护租约在场），调用方**一个文件都不许动**。
+    ///
+    /// 以下操作必须先拿到租约：恢复单个文件、恢复全部、清空历史、清理备份、
+    /// 修复异常事务。租约是 RAII：持有到操作结束，忘不掉也漏不掉。
+    func beginMaintenance() -> MaintenanceLease? {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !batchRunning, !maintenanceActive else { return nil }
+        maintenanceActive = true
+        return MaintenanceLease(scheduler: self)
+    }
+
+    /// 维护租约是否在场 —— `exitCleanupPermitted` 等判据的组成部分。
+    var isMaintenanceActive: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return maintenanceActive
+    }
+
+    fileprivate func endMaintenance() {
+        condition.lock()
+        maintenanceActive = false
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    /// 一份维护互斥。忘记 end 也不会永久卡死压缩 —— deinit 兜底释放。
+    final class MaintenanceLease: @unchecked Sendable {
+        private var scheduler: CompressionScheduler?
+
+        fileprivate init(scheduler: CompressionScheduler) {
+            self.scheduler = scheduler
+        }
+
+        func release() {
+            scheduler?.endMaintenance()
+            scheduler = nil
+        }
+
+        deinit { release() }
     }
 
     /// 运行中改上限：不抢回已在跑的名额，只影响之后的启动。
