@@ -56,6 +56,7 @@ fn run_crash_child(phase: &str, workdir: &Path) -> ! {
         output_sha256: Some(compressed_hash.clone()),
         backup_sha256: Some(original_hash.clone()),
         placeholder_identity: None,
+        temp_identity: None,
         created_at: sizqo_lib::history::now_millis(),
         cross_format: false,
         mode: TransactionMode::ReplaceExisting,
@@ -258,5 +259,11 @@ fn main() {
             }
             _ => assert!(!transactions.has_pending(), "{phase}: 已收口的现场保持收口"),
         }
+        // 门禁日志要能自证：静默通过的崩溃注入在 CI 上和"没跑"看不出区别。
+        println!(
+            "崩溃注入 {phase} → {expectation}：一次恢复 回滚{}/补账{}，二次恢复幂等",
+            report.rolled_back, report.committed
+        );
     }
+    println!("崩溃注入 6 个阶段（每阶段 SIGKILL + 两次恢复）全部通过");
 }

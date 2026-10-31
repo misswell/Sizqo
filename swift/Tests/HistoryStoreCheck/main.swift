@@ -1805,25 +1805,70 @@ do {
     makeFile(newSource, [4, 4, 4])
     let newOutput = dir + "/newsrc_compressed.png"
     func newTxn(_ id: String, outputSize: Int64, temp: String? = nil, outputSha256: String? = nil,
+                tempIdentity: (device: Int64, inode: UInt64)? = nil,
                 schemaVersion: Int = transactionSchemaVersion) -> ReplaceTransaction {
         ReplaceTransaction(
             id: id, historyId: id, sourcePath: newSource, outputPath: newOutput,
             backupPath: "", tempOutputPath: temp, originalSize: 4, expectedOutputSize: outputSize,
             originalSha256: nil, outputSha256: outputSha256,
+            tempIdentity: tempIdentity,
             createdAt: SizqoClock.nowMillis, crossFormat: false, mode: .createNew,
             schemaVersion: schemaVersion
         )
     }
     writeData(newOutput, [9, 9])
+    let newTemp = dir + "/t-new.tmp"
+    writeData(newTemp, [0])
     check(newJournal.prepare(newTxn("t-new", outputSize: 2,
-                                    temp: dir + "/t-new.tmp",
-                                    outputSha256: sha256OfData(Data([9, 9])))) == nil,
+                                    temp: newTemp,
+                                    outputSha256: sha256OfData(Data([9, 9])),
+                                    tempIdentity: OutputTransactionStore.fileIdentity(newTemp))) == nil,
           "新建模式也要记账：没有这条日志，磁盘上多出来的产物没人认领")
-    writeData(dir + "/t-new.tmp", [0])
     check(newJournal.recover(newStore).rolledBack == 1, "历史不认账 → 新建模式收场")
     check(!fm.fileExists(atPath: newOutput), "orphan output 被删掉")
-    check(!fm.fileExists(atPath: dir + "/t-new.tmp"), "崩溃留下的临时文件一起清掉")
+    check(!fm.fileExists(atPath: newTemp), "崩溃留下的临时文件一起清掉（带认领凭证）")
     check(readBytes(newSource) == [4, 4, 4], "新建模式的恢复绝不碰原图")
+
+    // §28 审查修复（P0-2）：残骸的清理也要过归属门。零字节不构成身份 ——
+    // 外部把我们的占位删掉再放进同一路径的空文件（新 inode），在旧代码里和我们的
+    // 占位长得一模一样，一句 `removeItem` 就删掉了用户的文件。
+    let foreignTemp = dir + "/t-foreign.tmp"
+    writeData(foreignTemp, [0])
+    check(newJournal.prepare(newTxn("t-foreign", outputSize: 2,
+                                    temp: foreignTemp,
+                                    outputSha256: sha256OfData(Data([9, 9])))) == nil,
+          "老日志没有临时名凭证：照样得能落账（兼容，不是拒绝）")
+    _ = newJournal.recover(newStore)
+    check(fm.fileExists(atPath: foreignTemp), "无凭证的零字节残骸一律保留")
+
+    // 凭证对不上（路径上的 inode 已被换掉）同样拒绝清理，哪怕字节小得像半成品。
+    let swappedTemp = dir + "/t-swapped.tmp"
+    writeData(swappedTemp, [3])
+    check(newJournal.prepare(newTxn("t-swapped", outputSize: 2,
+                                    temp: swappedTemp,
+                                    outputSha256: sha256OfData(Data([9, 9])),
+                                    tempIdentity: OutputTransactionStore.fileIdentity(swappedTemp))) == nil,
+          "记账")
+    // 崩溃后外部把这条路径换成自己的文件：记账时的凭证随之失效（inode 变了）。
+    let intruder = dir + "/t-swapped-intruder"
+    writeData(intruder, [8, 8])
+    check(Darwin.unlink(swappedTemp) == 0, "测试前提：外部拆掉我们的占位")
+    check(Darwin.rename(intruder, swappedTemp) == 0, "测试前提：外部换入占位路径")
+    _ = newJournal.recover(newStore)
+    check(readBytes(swappedTemp) == [8, 8], "交换失败现场里的外部字节不许被当残骸清掉")
+
+    // `.protected` 标记压过一切归属推断：即使凭证与字节都对得上也不删。
+    let markedTemp = dir + "/t-marked.tmp"
+    writeData(markedTemp, [9, 9])
+    check(newJournal.prepare(newTxn("t-marked", outputSize: 2,
+                                    temp: markedTemp,
+                                    outputSha256: sha256OfData(Data([9, 9])),
+                                    tempIdentity: OutputTransactionStore.fileIdentity(markedTemp))) == nil,
+          "记账")
+    check(TempOwnership.writeMarker(markedTemp) == nil, "标记写得上")
+    _ = newJournal.recover(newStore)
+    check(fm.fileExists(atPath: markedTemp), "带保护标记的现场一个字节都不许动")
+    check(TempOwnership.isProtected(markedTemp), "标记不许被顺手清掉：现场还在被声明保护")
 
     // 体积对不上：这位置已被别人的内容占了，不许当成自己的半成品删掉。
     writeData(newOutput, [1, 2, 3, 4, 5])
@@ -2340,6 +2385,248 @@ do {
           "无凭证路径按普通发布处理")
     check(readBytes(claimedPath) == [7, 7], "无凭证发布落位")
 }
+// ─── 45. §28 审查修复（P0-2）：临时路径归属门、保护标记与跨格式隔离 ──────────
+print("[45] §28 P0-2 临时归属门 / 保护标记 / 交换失败现场 / 跨格式隔离复验")
+do {
+    let dir = freshRoot("45")
+    let target = canonicalPath(dir + "/photo.png")
+    makeFile(target, [1])
+
+    // ① 自家半成品该清得掉：归属门不是「什么都留着」，否则用户目录会长满孤儿 .tmp。
+    guard let mine = StagedWrite.claim(target: target) else {
+        check(false, "临时名该认领成功"); exit(1)
+    }
+    check(mine.claimedIdentity != nil, "认领那一刻就把 (dev,ino) 钉成凭证")
+    mine.discard()
+    check(!fileExists(at: mine.temp), "自家零字节占位（凭证对得上）该清掉")
+
+    // ② 写满之后放弃：内容指纹是第二条归属依据。
+    guard var written = StagedWrite.claim(target: target) else {
+        check(false, "临时名该认领成功"); exit(1)
+    }
+    check(written.writeSyncedRecording(Data([1, 1])), "候选该写满并记下指纹")
+    written.discard()
+    check(!fileExists(at: written.temp), "证明得了归属的半成品该清掉")
+
+    // ③ 零字节外部文件：外部拆掉我们的占位，再往同一路径放回一个空文件（新 inode）。
+    //    旧代码按「大小为 0 就是我们的半成品」删 —— 删掉的却是别人的文件。
+    guard let foreign = StagedWrite.claim(target: target) else {
+        check(false, "临时名该认领成功"); exit(1)
+    }
+    check(Darwin.unlink(foreign.temp) == 0, "测试前提：外部拆掉我们的占位")
+    writeData(foreign.temp, [])
+    foreign.discard()
+    check(fileExists(at: foreign.temp), "零字节不等于归属：外部放回的空文件不许当残骸清掉")
+
+    // ④ 凭证与字节都对得上，但现场被显式声明保护：标记压过一切推断。
+    guard var marked = StagedWrite.claim(target: target) else {
+        check(false, "临时名该认领成功"); exit(1)
+    }
+    check(marked.writeSyncedRecording(Data([2, 2])), "带标记的现场本来就是我们自己的字节")
+    check(TempOwnership.writeMarker(marked.temp) == nil, "标记写得上")
+    check(TempOwnership.isProtected(marked.temp), "标记读得出")
+    marked.discard()
+    check(fileExists(at: marked.temp), "声明了保护的位置一个字节都不许动")
+    check(fileExists(at: TempOwnership.markerPath(marked.temp)), "标记不许被顺手清掉：现场还在被声明保护")
+
+    // ⑤ 标记写不上必须把原因报出来。`try?` 吞掉它 = 「没写成」和「写成了」同一个值，
+    //    下一条清理入口随即按「没有标记」删掉用户的字节。
+    let markerUnwritable = dir + "/marker-fails.tmp"
+    writeData(markerUnwritable, [3])
+    try? fm.createDirectory(atPath: TempOwnership.markerPath(markerUnwritable),
+                            withIntermediateDirectories: false)
+    let markerError = TempOwnership.writeMarker(markerUnwritable)
+    check(markerError != nil && markerError?.isEmpty == false, "标记写不上时报得出一句能看的原因")
+    let markerWritable = dir + "/marker-ok.tmp"
+    writeData(markerWritable, [3])
+    check(TempOwnership.writeMarker(markerWritable) == nil, "写得上的标记不许报错")
+
+    // ⑥ 交换回滚失败后的现场处置：迁到冲突名 → 迁不动就写标记 → 两条都不通也绝不删。
+    let roDir = dir + "/read-only"
+    let rwDir = dir + "/writable"
+    try? fm.createDirectory(atPath: roDir, withIntermediateDirectories: true)
+    try? fm.createDirectory(atPath: rwDir, withIntermediateDirectories: true)
+    let sceneB = rwDir + "/b.tmp"
+    writeData(sceneB, [6, 6])
+    let sceneC = roDir + "/c.tmp"
+    writeData(sceneC, [5, 5, 5])
+    let targetB = roDir + "/b.png"
+    let targetC = rwDir + "/c.png"
+    writeData(targetC, [1])
+    check(chmod(roDir, 0o500) == 0, "测试前提：目标目录改成只读")
+
+    // (a) 迁得动：字节整体搬到用户看得见的冲突名，临时路径不留空壳。
+    let sceneA = rwDir + "/a.tmp"
+    writeData(sceneA, [7, 7])
+    let targetA = rwDir + "/a.png"
+    writeData(targetA, [1])
+    let expectedA = TempOwnership.conflictSibling(for: targetA)
+    let movedA = TempOwnership.protectForeignBytes(from: sceneA, nextTo: targetA)
+    check(movedA == expectedA && readBytes(movedA) == [7, 7], "外部字节迁到冲突名后一个字节都不少")
+    check(!fileExists(at: sceneA), "搬完的临时路径不留空壳")
+    check(readBytes(targetA) == [1], "迁移不许碰目标位置上的文件")
+
+    // (b) 迁不动：退回 `.protected` 标记，字节停在原地继续被声明保护。
+    let movedB = TempOwnership.protectForeignBytes(from: sceneB, nextTo: targetB)
+    check(movedB == sceneB && readBytes(sceneB) == [6, 6], "迁不动时字节仍留在原路径")
+    check(TempOwnership.isProtected(sceneB), "迁不动就把保护标记写下去")
+
+    // (c) 两条都不通：既不删，也不假装保护成功了。
+    let movedC = TempOwnership.protectForeignBytes(from: sceneC, nextTo: targetC)
+    check(movedC == sceneC && readBytes(sceneC) == [5, 5, 5], "两条保护都没走通时字节只能留在原路径")
+    check(!fileExists(at: TempOwnership.markerPath(sceneC)), "标记确实没写成 —— 不许把它当成写过了")
+    // 凭证对账（恢复入口）：现场躺着外部字节，日志里的两条凭证指向的都是自家候选 ——
+    // inode 对不上、内容也不是承诺的产物，只能留着。这条现场放在可写目录里，
+    // 归属门一旦被拿掉，`removeItem` 就真的会把这三份字节删掉。
+    guard let fileIdentityOfOurCandidate = OutputTransactionStore.fileIdentity(targetC) else {
+        check(false, "测试前提：候选的 inode 凭证该读得到"); exit(1)
+    }
+    let sceneD = rwDir + "/d.tmp"
+    writeData(sceneD, [4, 4, 4])
+    let sceneDTxn = ReplaceTransaction(
+        id: "p02-d", historyId: "p02-d", sourcePath: targetC, outputPath: targetC,
+        backupPath: "", tempOutputPath: sceneD, originalSize: 1, expectedOutputSize: 2,
+        outputSha256: sha256OfData(Data([9, 9])), tempIdentity: fileIdentityOfOurCandidate,
+        createdAt: SizqoClock.nowMillis, crossFormat: false, mode: .createNew)
+    OutputTransactionStore.removeTemp(sceneDTxn)
+    check(fileExists(at: sceneD) && readBytes(sceneD) == [4, 4, 4],
+          "两条凭证都证明不了归属时，恢复入口拒绝删除")
+
+    // ⑦ 同格式覆盖的原子交换：被换出的字节不是基线 → 换回并拒绝，外部内容原样保留。
+    let swapTarget = dir + "/swap.png"
+    writeData(swapTarget, [1, 2])
+    guard case let .success(baseline) = SourceIdentity.readWithHash(swapTarget),
+          let baselineHash = baseline.sha256 else {
+        check(false, "该读得到带内容哈希的基线"); exit(1)
+    }
+    writeData(swapTarget, [3, 4])                       // 提交窗口内被外部改掉
+    guard var stagedSwap = StagedWrite.claim(target: swapTarget) else {
+        check(false, "临时名该认领成功"); exit(1)
+    }
+    check(stagedSwap.writeSyncedRecording(Data([9, 9])), "候选该写满并记下指纹")
+    let swapOutcome = stagedSwap.publishReplaceIfIdentityMatches(to: swapTarget, baselineSha256: baselineHash)
+    check(swapOutcome == .refused, "换出来的不是基线字节 → 拒绝（覆盖没发生）")
+    check(readBytes(swapTarget) == [3, 4], "外部刚改的内容一个字节都不许动")
+    check(!fileExists(at: stagedSwap.temp), "拒绝之后自家候选该收回去")
+
+    // ⑧ 四态发布：覆盖已发生必须与「目标没动」是两个态，且关联值带得出位置。
+    check(StagedWrite.PublishOutcome.swappedButUnrecovered("现场") != .refused,
+          "覆盖已发生与目标没动不许是同一个态")
+    check(StagedWrite.PublishOutcome.swappedButUnrecovered("现场")
+            == .swappedButUnrecovered("现场"), "四态比较不许漏掉关联值")
+    check(StagedWrite.PublishOutcome.published != .publishedButNotDurable,
+          "落盘没成的发布不许冒充已发布")
+
+    // ⑨ 跨格式删原图：复核与删除之间不许留窗口。
+    let retireDir = freshRoot("45r")
+    func retireResidue() -> [String] {
+        ((try? fm.contentsOfDirectory(atPath: retireDir)) ?? [])
+            .filter { $0.contains(".sizqo-retire-") }.sorted()
+    }
+
+    let origA = canonicalPath(retireDir + "/a.png")
+    makeFile(origA, [1, 2, 3])
+    guard case let .success(idA) = SourceIdentity.readWithHash(origA) else {
+        check(false, "该读得到基线"); exit(1)
+    }
+    check(OriginalRetirement.retire(file: origA, baseline: idA) == nil, "没被外部动过的原图该删掉")
+    check(!fileExists(at: origA) && retireResidue().isEmpty, "删干净且不留隔离名")
+
+    let origB = canonicalPath(retireDir + "/b.png")
+    makeFile(origB, [1, 2, 3])
+    guard case let .success(idB) = SourceIdentity.readWithHash(origB) else {
+        check(false, "该读得到基线"); exit(1)
+    }
+    writeData(origB, [9, 9, 9])
+    check(OriginalRetirement.retire(file: origB, baseline: idB) != nil
+            && readBytes(origB) == [9, 9, 9], "改过的原图只留警告，一个字节都不删")
+
+    // 快速门看不出的原地改写（同大小、时间戳钉回）：靠隔离后的完整复验收住。
+    let origC = canonicalPath(retireDir + "/c.png")
+    makeFile(origC, [1, 2, 3, 4])
+    guard case let .success(idC) = SourceIdentity.readWithHash(origC) else {
+        check(false, "该读得到基线"); exit(1)
+    }
+    let editedC: [UInt8] = [5, 6, 7, 8]
+    writeData(origC, editedC)
+    var frozen = [timespec(tv_sec: 0, tv_nsec: 0), timespec(tv_sec: 0, tv_nsec: 0)]
+    frozen[0] = timespec(tv_sec: Int(idC.modified / 1_000_000_000),
+                         tv_nsec: Int(idC.modified % 1_000_000_000))
+    frozen[1] = frozen[0]
+    check(origC.withCString { utimensat(AT_FDCWD, $0, &frozen, 0) } == 0, "测试工具：时间戳钉得住")
+    check(idC.fingerprintIntact(at: origC) == .unchanged, "测试前提：快速门看不出这次同大小改写")
+    let msgC = OriginalRetirement.retire(file: origC, baseline: idC)
+    check(msgC != nil && readBytes(origC) == editedC, "复核门看出的改动，字节必须放回原位")
+    check(msgC?.contains("已放回原位") == true, "警告要说清字节现在在哪")
+    check(retireResidue().isEmpty, "放回原位后隔离名不许留在目录里")
+
+    // 原图已不在原位：如实回报，不许把「删不掉」写成「删好了」。
+    let origD = canonicalPath(retireDir + "/d.png")
+    check(OriginalRetirement.retire(file: origD, baseline: idB) != nil,
+          "原图不在原位时只回报，不做任何删除")
+
+    // 隔离窗口内原位被外部占了：只有原子交换能保证「放回原图」不等于「盖掉别人的文件」。
+    let swapBackDir = freshRoot("45s")
+    let origE = canonicalPath(swapBackDir + "/e.png")
+    guard let quarantineE = OriginalRetirement.claimQuarantineName(for: origE) else {
+        check(false, "隔离名该独占认领成功"); exit(1)
+    }
+    writeData(quarantineE, [1, 1])
+    writeData(origE, [2, 2])
+    if case let .inPlaceForeignKept(kept) = OriginalRetirement.restoreQuarantined(quarantineE, to: origE) {
+        check(readBytes(origE) == [1, 1] && readBytes(kept) == [2, 2],
+              "放回原图不许盖掉外部那份，外部字节留在隔离名上")
+    } else {
+        check(false, "原位被外部占了时该走原子交换")
+    }
+
+    // 放回失败（原图所在目录此刻不可写）：字节必须还在磁盘上，回报交人工确认。
+    let stuckDir = freshRoot("45k")
+    guard let quarantineF = OriginalRetirement.claimQuarantineName(for: stuckDir + "/g.png") else {
+        check(false, "隔离名该独占认领成功"); exit(1)
+    }
+    writeData(quarantineF, [3, 3])
+    check(chmod(stuckDir, 0o500) == 0, "测试前提：原图所在目录改成只读")
+    if case let .kept(kept) = OriginalRetirement.restoreQuarantined(quarantineF, to: stuckDir + "/g.png") {
+        check(readBytes(kept) == [3, 3], "放回失败时字节必须还在磁盘上")
+    } else {
+        check(false, "放回失败必须回报为「保留下来等人工确认」")
+    }
+    chmod(stuckDir, 0o700)
+
+    // ⑩ 落盘调用方对四态的处置：这两态不许走 withdraw（销账 + discard 正对着用户的字节）。
+    let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+    func sourceText(_ relative: String) -> String {
+        (try? String(
+            contentsOfFile: repoRoot.appendingPathComponent(relative).path, encoding: .utf8)) ?? ""
+    }
+    let appState = sourceText("swift/Sources/SizqoSwift/ViewModels/AppState.swift")
+    guard let armStart = appState.range(of: "case .swappedButUnrecovered") else {
+        check(false, "四态发布少了一态没人接"); exit(1)
+    }
+    let arm = String(appState[armStart.lowerBound...].components(separatedBy: "\n        }")[0])
+    check(arm.contains("return recoverCoveredWrite(") && !arm.contains("withdraw("),
+          "覆盖已经发生的现场走 withdraw：销账让这次覆盖看起来从未发生，discard 正对着用户的字节")
+    guard let recoverStart = appState.range(of: "func recoverCoveredWrite") else {
+        check(false, "两态共用的处置没写成函数"); exit(1)
+    }
+    let recoverBody = String(appState[recoverStart.lowerBound...].components(separatedBy: "\n        }")[0])
+    check(recoverBody.contains("OutputTransactionStore.rollback(txn)")
+            && recoverBody.range(of: "rollback(txn)")!.upperBound
+               < recoverBody.range(of: "transactions.finish")!.lowerBound,
+          "收回原图之前不许销账：日志没了，下次启动就没人知道这条路径上躺着用户的字节")
+    check(recoverBody.contains("return .rollbackFailed"),
+          "回滚没成时如实报错，不许冒充已经收回原图")
+    let txnSource = sourceText("swift/Sources/SizqoSwift/Services/OutputTransactionStore.swift")
+    check(!txnSource.contains("try? TempOwnership.writeMarker"),
+          "标记写失败被 try? 吞掉，就等于把「没写成」当成「写成了」")
+    check(txnSource.components(separatedBy: "TempOwnership.protectForeignBytes(from: self.temp, nextTo: target)").count - 1 == 2,
+          "两处交换回滚失败都必须把外部字节交给保护处置")
+    chmod(roDir, 0o700)
+}
+
 runContractVectors()
 
 print(failures == 0

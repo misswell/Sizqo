@@ -1358,6 +1358,10 @@ fn commit_output(
             .as_ref()
             .and_then(|backup| history.recorded_backup_sha256(backup)),
         placeholder_identity: placeholder,
+        // §28 审查修复：临时名的认领凭证同时落账 —— 启动恢复/回滚清理临时文件时，
+        // 这是"路径上的字节还是不是我们那份"的唯一硬依据（换回失败的现场里，
+        // 躺在那儿的可能是用户的文件）。
+        temp_identity: staged.identity(),
         created_at: crate::history::now_millis(),
         cross_format,
         mode: placement.transaction_mode(),
@@ -1465,34 +1469,24 @@ fn commit_output(
     }
 
     if cross_format {
-        // §28 审查修复：删除原图前的**最后一道身份门**。此前的 ①⑤ 复核
+        // §28 审查修复（本轮 P0-1）：删除原图前的最后一道身份门。此前的 ①⑤ 复核
         // 与删除之间隔着整个落盘流程，外部完全可能在窗口里改掉原图 ——
         // 备份保住的是旧字节，用户刚写的新字节只有这次复核看得见。
-        // 改过 → 保留文件（跨格式产物照常成立），警告说清。
-        let identity_stale = match replace.as_ref() {
-            Some(identity) => !matches!(identity.verify(file_path), SourceCheck::Unchanged),
+        //
+        // 上一轮这里只是**记了警告**（"已保留原文件"）却继续往下删：警告与磁盘事实
+        // 相反。现在删除整件事交给 `retire_original`：身份不匹配根本不进删除，
+        // 匹配也要先隔离改名、复验后才删，删除窗口里被改动的字节一律放回。
+        let retired = match replace.as_ref() {
             // 无基线（理论上不可能：cross_format 必有覆盖依据）时保守拒绝删除。
-            None => true,
+            None => Err("缺少原图身份依据，不能证明要删的是哪份字节".to_string()),
+            Some(identity) => output_transaction::retire_original(file_path, identity),
         };
-        if identity_stale {
-            log::warn!("跨格式替换：原图在提交窗口内被外部修改，已保留原文件");
+        if let Err(detail) = retired {
+            log::warn!("跨格式替换：未删除原图 —— {detail}");
             result
                 .warnings
                 .get_or_insert_with(Vec::new)
-                .push(format!(
-                    "原文件在提交前被修改，已保留: {}（跨格式产物照常生成）",
-                    file_path.display()
-                ));
-            // 不 return：产物已落盘，历史照常记、事务照常销账 —— 只是原图留着。
-        }
-        // 删不掉（权限/被占用）时不许静默：磁盘上会同时留着原图和新格式产物。
-        // 产物已提交、历史已记，不能反过来撤销一次成功的压缩 —— 留警告给用户。
-        if let Err(error) = fs::remove_file(file_path) {
-            log::warn!("跨格式替换：原文件删除失败（产物已保留）: {error}");
-            result
-                .warnings
-                .get_or_insert_with(Vec::new)
-                .push(format!("原格式文件删除失败，已保留: {}", file_path.display()));
+                .push(format!("{detail}（跨格式产物照常生成）"));
         }
     }
     // 输出方式是历史要记的**输入事实**，不是结论；产物路径要等 Publish 才写。
@@ -3159,7 +3153,6 @@ fn sanitize_compare_payload(mut payload: serde_json::Value) -> Result<serde_json
                 .position(|result| result.get("file").and_then(|value| value.as_str()) == Some(file))
         })
         .unwrap_or(0);
-    drop(results);
     payload["index"] = serde_json::json!(new_index);
     Ok(payload)
 }
@@ -4793,6 +4786,151 @@ mod tests {
         let entry = history.list().into_iter().next().unwrap();
         assert!(PathBuf::from(entry.backup_path.unwrap()).exists());
         assert!(!transactions.has_pending());
+    }
+
+    /// §28 审查修复（P0-1）接线侧：删除窗口里原图被外部改写时，产物照常、**原图一个
+    /// 字节都不许少**，而警告必须和磁盘上的事实一致。
+    ///
+    /// RC.3 在这条线上是"记一句已保留原文件，然后照删" —— 243 个测试全绿也照样带着它，
+    /// 因为没有任何一个测试走到过这个分支。这里用 `retire_original` 的隔离窗口故障注入
+    /// 复现"①⑤ 复核全过、删除那一刻字节已经变了"的现场。
+    #[test]
+    fn a_cross_format_conversion_keeps_an_original_that_changed_in_the_delete_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = history_in(temp.path());
+        let transactions = transactions_in(temp.path());
+        let input = temp.path().join("photo.png");
+        let original = png_fixture(64, 64, 16);
+        fs::write(&input, &original).unwrap();
+
+        let converted_bytes = jpeg_fixture(8, 8, 3);
+        let engine_result = EngineResult {
+            success: true,
+            compressed: converted_bytes.clone(),
+            out_type: "jpg".into(),
+            algorithm: "mozjpeg".into(),
+            error: None,
+            ..Default::default()
+        };
+        let mut result = build_result(&input.to_string_lossy(), &engine_result);
+        let options = CompressOptions {
+            output_mode: "replace".into(),
+            output_format: "jpg".into(),
+            ..Default::default()
+        };
+
+        crate::output_transaction::set_fault_in_retire_window(1);
+        let outcome = write_output(
+            &mut result,
+            &engine_result,
+            &input,
+            &options,
+            &history,
+            &transactions,
+            3,
+        );
+        crate::output_transaction::set_fault_in_retire_window(0);
+        outcome.expect("原图受保护不等于这次转换失败：产物已经落盘");
+
+        let converted = temp.path().join("photo.jpg");
+        assert_eq!(fs::read(&converted).unwrap(), converted_bytes);
+        assert!(input.exists(), "身份不匹配时绝不删除原图");
+        let kept = fs::read(&input).unwrap();
+        assert_eq!(
+            &kept[..b"still-writing".len()],
+            b"still-writing",
+            "改写者最新的字节必须放回原位，一个都不许丢"
+        );
+        assert_ne!(kept, original, "现场本身要被看得见");
+        assert!(
+            result
+                .warnings
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|warning| warning.contains("未删除原图") || warning.contains("保留")),
+            "警告要说实话: {:?}",
+            result.warnings
+        );
+        assert_eq!(
+            leftovers(temp.path(), "photo.png"),
+            vec!["photo.jpg".to_string()],
+            "拒绝删除不许留下隔离名或临时文件"
+        );
+        assert!(!transactions.has_pending(), "已提交的覆盖必须销账");
+    }
+
+    /// §28 审查修复（P0-2）接线侧：**无论发生哪种异常都不许提前销账**。这条现场一次
+    /// 踩中两个失败：产物已提交、原图却在删除窗口里被外部换成别人的字节（回滚证明不了
+    /// 归属，只能拒绝），而历史又没写成。旧写法在这里照样 `finish` 并回报失败 ——
+    /// 磁盘上留下一份"谁也说不清是谁的原图"+ 一份没人认领的产物，而日志已经没了，
+    /// 下次启动连再试一次的机会都没有。
+    #[test]
+    fn a_rollback_that_cannot_prove_ownership_leaves_the_journal_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = history_in(temp.path());
+        let transactions = transactions_in(temp.path());
+        let input = temp.path().join("photo.png");
+        let original = png_fixture(64, 64, 16);
+        fs::write(&input, &original).unwrap();
+
+        let converted_bytes = jpeg_fixture(8, 8, 3);
+        let engine_result = EngineResult {
+            success: true,
+            compressed: converted_bytes.clone(),
+            out_type: "jpg".into(),
+            algorithm: "mozjpeg".into(),
+            error: None,
+            ..Default::default()
+        };
+        let mut result = build_result(&input.to_string_lossy(), &engine_result);
+        let options = CompressOptions {
+            output_mode: "replace".into(),
+            output_format: "jpg".into(),
+            ..Default::default()
+        };
+
+        // 历史写不成的现场：history.json 的位置放一个非空目录，原子改名必撞 EISDIR。
+        assert!(history.list().is_empty());
+        fs::create_dir_all(
+            temp.path().join("history").join("history.json").join("stale"),
+        )
+        .unwrap();
+
+        // 提交之后、记账之前，原图的位置被外部换成别人的字节。
+        crate::output_transaction::set_fault_in_retire_window(2);
+        let outcome = write_output(
+            &mut result,
+            &engine_result,
+            &input,
+            &options,
+            &history,
+            &transactions,
+            3,
+        );
+        crate::output_transaction::set_fault_in_retire_window(0);
+
+        let detail = match outcome {
+            Err(OutputWriteError::RollbackFailed(detail)) => detail,
+            Err(error) => panic!("回滚证明不了归属必须报 RollbackFailed，实际 {error:?}"),
+            Ok(_) => panic!("历史没写成且回滚拒绝：这次落盘绝不能算成功"),
+        };
+        assert!(detail.contains("外部修改"), "{detail}");
+        assert!(
+            transactions.has_pending(),
+            "回滚没成时事务日志必须留在现场，交给下次启动的恢复"
+        );
+        assert_eq!(
+            fs::read(&input).unwrap(),
+            b"external-new-version",
+            "拒绝回滚就是拒绝动那份字节 —— 备份不是拿来盖掉外部改写的"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("photo.jpg")).unwrap(),
+            converted_bytes,
+            "已提交的产物不许被一次失败的收场偷偷删掉"
+        );
+        assert!(history.list().is_empty(), "历史没写成就是没写成，不许留下半条记录");
     }
 
     /// 目标扩展名已经被占用（规则 8）：另起一个不冲突的名字，绝不覆盖邻居。

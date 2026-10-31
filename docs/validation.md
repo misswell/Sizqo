@@ -1378,6 +1378,191 @@ real_encoded_fixtures` 是 `#[ignore]` 的显式测试，常规套件并不运�
 - **1,000/5,000/10,000 性能基准、虚拟列表、排序脏标记、签名应用 GUI 点击验收、
   App Store 沙盒运行**：仍未完成，继续标记为未通过。
 
+## 第三轮审查修复与平台取证（2026-11-01，0.3.6-rc.4）
+
+基准：远端 `main` = `9ee0394`（`v0.3.6-rc.3`）。本轮先把 RC.3 的提交说明与磁盘上的
+源码逐条对照，再补齐没做到的部分，并把取证从"编译通过"推进到"现场可复现"。
+**结论：RC.3 提交说明里那四项"已修复"，逐项对源码核对后没有一项在磁盘上完整成立**，
+审查的 P0-1 / P0-2 / P0-3 / P1-4 判断全部正确，本轮按这些判断重做。
+
+### 先更正：RC.3 提交说明与 `git show 9ee0394` 的差距
+
+| RC.3 声称 | 磁盘上的真实状态（RC.3 版本） |
+| --- | --- |
+| 跨格式删除门 | `commands.rs` 复核后只 `log::warn!("…已保留原文件")`，紧接着**无条件** `fs::remove_file(file_path)`（RC.3 第 1478 → 1490 行）——报的是保留、做的是删除 |
+| 交换失败外部文件保护 | `remove_temp` 只认 `.protected` 标记，无标记即 `fs::remove_file(temp)`；标记是 `let _ = fs::write(…)` 写的，写失败＝没有保护。外部放进临时路径的零字节文件会被当自家残骸删掉。Swift 侧同构缺陷（RC.3 的 `OutputTransactionStore.swift` 里 `TempOwnership`/`swappedButUnrecovered`/`OriginalRetirement` 出现 0 次） |
+| Windows 目录 fsync | Windows 分支以**只读**句柄打开目录再 `sync_all()`；`FlushFileBuffers` 要求句柄具写权限，运行时必然 `ACCESS_DENIED`。RC.3 只有 `cargo check` 通过，`cargo test` 从没在 Windows 上跑过 |
+| LRU | `fileRowOrder` 按创建顺序淘汰（FIFO），重新访问旧行不搬序 —— 代码注释称 LRU，行为不是 |
+| 标签 | `v0.3.6-rc.3` 指向 `e6e3eae`，而把版本号写成 0.3.6-rc.3 的提交是 `9ee0394` —— 标签与内容错开一个提交 |
+
+### P0-1 跨格式替换的原图删除门（Rust）
+
+新增 `output_transaction::retire_original(file, identity)`，把"删原图"从一个
+`verify → remove_file` 的两步（中间塞得进一次外部改写）拆成三步，每一步只删得到
+自己证明得了归属的字节：
+
+1. 动手前最后一次完整复核（stat 三项 + 内容哈希）：不是原图就**根本不进删除**；
+2. `claim_quarantine_name` 以 `O_EXCL` 独占认领隔离名，`fs::rename` 过去 —— 此后
+   外部在该目录里怎么折腾都碰不到即将被删的那份字节；
+3. 复验隔离出来的字节：对得上才删；对不上（改名窗口里还有人持 fd 在写）就放回原位，
+   原位被外部占了就用原子交换顶回来，外部那份落到隔离名上，一个字节都不动。
+
+三条路都走不通时的结果一律是"字节还在磁盘上"＋一句说实话的警告，绝不会再是
+"报了保留却把文件删了"。接线在 [commands.rs:1479](../src-tauri/src/commands.rs#L1479)：
+`Err(detail)` 只落警告，跨格式产物照常成立。
+
+### P0-2 临时归属门、保护标记与「不提前销账」（Rust + Swift）
+
+Rust：
+
+- journal 新增 `temp_identity (dev,ino)`（schema v2），`remove_temp` 的第一依据是
+  记账时认领的 inode，其次才是内容 sha256；两条都证明不了 → **一律保留**。
+- `.protected` 仍然先查，它是"这里的字节属于外部"的显式声明，压过一切归属推断。
+- `write_protected_marker` 返回 `Result<(), String>`：以前 `let _ = fs::write(…)` 把
+  "没写成"和"写成了"当成同一件事。写不上时日志明说"归属门仍会拒绝清理"，且 inode
+  凭证照样拒删 —— 保护不再依赖单一手段成功。
+- `SwapPublishError { swapped: bool, detail }` 把"覆盖已发生"与"目标没动"分成两种态；
+  ⑥ 交换失败分支回滚成功后才 `finish`，⑦ 收场失败分支返回 `RollbackFailed` 且
+  **不 `finish`** —— 日志留在现场，交给下次启动的恢复。
+
+Swift（`OutputTransactionStore.swift` +236/-21、`AppState.swift` +62）：
+
+- `TempOwnership`：`isProtected` / `writeMarker -> String?`（失败必须报出来）/
+  `isOurs(claimed:expectedSha256:)` / `protectForeignBytes` / `conflictSibling`。
+- `StagedWrite.PublishOutcome` 四态：`published / refused / publishedButNotDurable /
+  swappedButUnrecovered(String)` —— `.refused` 与"交换失败且现场未恢复"不再混为一谈。
+- `OriginalRetirement`：与 Rust 同构的隔离改名 + 复验，`restoreQuarantined` 三态
+  （`inPlace` / `inPlaceForeignKept` / `kept`）。
+- `AppState` 的覆盖写回路径先 `recoverCoveredWrite(…)`，收回原图之前不许 `finish`；
+  两处交换回滚失败都必须把外部字节交给 `protectForeignBytes` 处置。
+- 测试断言的是生产源码本身（无 Swift 故障注入惯例）：`try? TempOwnership.writeMarker`
+  必须不存在、`rollback(txn)` 必须排在 `transactions.finish` 之前，等等。
+
+### P0-3 Windows 目录 fsync
+
+`history::sync_dir` 成为唯一一处按平台开句柄的实现：Windows 用
+`FILE_FLAG_BACKUP_SEMANTICS + .write(true) + share_mode(READ|WRITE|DELETE)`（写权限是
+`FlushFileBuffers` 的硬要求，共享位保证不把并发写入者挡在门外）；unix 沿用
+`File::open + sync_all`；未知平台**如实返回 Err**，不假装成功。
+
+调用方一律不再吞错：`commands.rs:1457` fsync 失败 → 用备份回滚（回滚也失败才
+`RollbackFailed`，且此时不销账）；`video/transaction.rs:55,88` 直接 `?`／
+`map_err(|e|(e,false))`，其本地 `sync_dir` 只转调 `history::sync_dir`。
+
+取证限制（如实记录）：本机交叉编译不可行 ——
+`cargo check --lib --tests --target x86_64-pc-windows-msvc` EXIT=101，`ring` 的 cc-rs 报
+`fatal error: 'assert.h' file not found`。因此 Windows 运行时行为只能由 CI 的
+`windows-tests` 作业取证，本轮**不声称** Windows 已通过。
+
+### P1-4 没有原子交换时的覆盖
+
+`publish_replace_if_identity_matches` 在交换不被支持时走
+`publish_replace_via_quarantine`：① 目标改名进独占隔离名；② 复验隔离出来的正是本次
+编码所依据的原图，不是就放回原位并拒绝；③ 用**不会覆盖**的方式把候选放进目标位 ——
+`install_at_free_path` 先 `fs::hard_link`（原子判空，撞 `AlreadyExists` 即拒绝），
+不让硬链接的卷退回"查空 + 改名"。旧写法"复核指纹 → `fs::rename`"会把刚出现在该位置
+的任何字节直接盖掉，正是审查报的那次事故。
+
+Windows 上这条路是**唯一**路径而不是降级：`atomic_swap` 在非 unix 直接返回
+`ErrorKind::Unsupported`，`swap_unsupported` 认得它，于是 `publish_replace_if_identity_matches`
+必定进隔离改名；`restore_quarantined` 在 Windows 上交换不了外部占用的原位，只会落到
+`Restored::Kept`（把字节留在隔离名里报路径），也就绝不会用"放回原图"的名义盖掉别人的文件。
+`quarantine_publish_*` / `installing_a_candidate_*` 这 5 项测试直接驱动这些原语，
+不带平台门，因此同一份断言会随新的 `windows-tests` 作业在 Windows 上真跑。
+
+### 平台分支的测试（不再"编译通过就当通过"）
+
+- `engine.rs`：`system_mode_does_not_pretend_to_have_run_a_budget_search` 加
+  `#[cfg(target_os = "macos")]`（ImageIO 真的会跑才有"不许冒充体积搜索"可断言）；
+  新增 `#[cfg(not(target_os = "macos"))] system_mode_reports_unsupported_off_macos`，
+  断言 Linux/Windows 上系统模式**如实失败**：`UnsupportedFormat` + `Rejected`、
+  交回原图字节非空、`target_bytes` 回显但 `target_met == Some(false)`、`error` 里
+  看得见"系统转换仅支持 macOS"。测试没有被删掉，只是每个平台断言各自成立的那一半。
+- `history.rs`：产物清理失败的现场按平台构造 —— unix 把目录改成 `0o555`，Windows 用
+  "另一句柄打开产物"（`PermissionsExt` 在 Windows 上根本编不过，这也是 RC.3 的
+  `cargo test` 从未在 Windows 跑起来的原因之一）；两者共用同一组断言
+  `restore_survives_a_failed_output_cleanup`：原图写回、产物仍在原位、警告文案、
+  `RestoredWithWarning`。
+
+### 前端行缓存：从 FIFO 改成真 LRU
+
+`pruneFileRowCache(list, usedFiles)` 把"本轮窗口用过 / 仍挂在 DOM"的行搬到顺序表的
+最近使用端，逐出只从最久未使用端开始；`resetQueue` 清表；全量渲染分支传整张有序表，
+走同一套规则。缓存与 DOM 从不分家 —— 仍挂在 list 上的行一律受保护。
+
+`tests/queue-virtualization.cjs` 新增三组场景（+153 行）：① 反复回看的窗口第二次访问
+不得重建 DOM（`timesCreated == 1`）；② 早创建但每轮都被重新访问的行必须存活，而
+"只看一次的晚创建行"必须已被逐出；③ 单调下滚时缓存条数恒 ≤ 上限且逐出从最久未访问端走。
+只断言"滚走再滚回来不重建"分辨不了 FIFO 与 LRU，所以场景按"是否发生过逐出"设计。
+
+### 发布与 CI
+
+- `release.yml`：PowerShell 路径里的 ASCII TAB 全部改为正斜杠（两个工作流现在
+  `grep -n $'\t'` 均 0 命中）；版本守卫扩为 `tauri.conf.json` / `Cargo.toml` /
+  `package.json` 三方一致，不一致 `exit 1`。
+- `tests.yml`：`windows-build-check` → **`windows-tests`**（`cargo check --lib` +
+  `cargo test --lib` + 契约向量），Windows 分支从此有运行时取证；
+  新增 **`rust-tests-macos`**（default + `--features inproc-backends` + 崩溃注入）——
+  此前没有任何作业真的在 macOS 上跑 `cargo test`，平台分支的断言无人守；
+  崩溃注入步骤加 `-- --nocapture`，harness 里逐阶段 `println`（这条门禁成功时以前
+  一行输出都没有，CI 日志里与"没跑"看不出区别）。
+- 顺手去掉 `sanitize_compare_payload` 里对 `&mut Vec` 的 `drop(results)`：no-op，
+  且每次构建都产生 `dropping_references` 警告（lib 警告数 7 → 6）。
+- 标签决策：`v0.3.6-rc.3` 已随 RC 发布分发，**不覆盖、不改指**；本轮把工作完成态
+  标在新的 `v0.3.6-rc.4`（指向 0.3.6-rc.4 的版本提交）。正式版 `v0.3.6` 仍受发布门禁
+  约束（见文末）。
+
+### 本轮门禁命令与结果（macOS 本机，2026-11-01）
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib` | 258 passed / 0 failed / 2 ignored（23.63s），EXIT=0 |
+| `cargo test --lib --features inproc-backends` | 260 / 0 / 0（43.10s），EXIT=0 |
+| `cargo test --no-default-features --features inproc-backends` | lib 260 / 0；`compression_test` 6 / 0；`real_media_matrix` 5 / 0；主程序与 doc-test 0；EXIT=0（43.75s） |
+| `cargo test --test crash_injection -- --nocapture` | 6 阶段逐条打印（`after_backup`→backup_only、`after_journal`/`after_partial`→residue_only、`after_rename`→restored、`after_history`→committed、`legacy_after_rename`→preserved），每阶段两次恢复且二次幂等，EXIT=0 |
+| `cargo test --lib rust_executes_every_contract` | 1 passed / 259 filtered，32 条契约向量与 Swift 期望一致 |
+| `cargo test --lib real -- --ignored` | 2 passed（含 `s11_real_media_matrix`，bundled FFmpeg 实编实探） |
+| `npm run test:frontend` | 29 个套件全绿，EXIT=0；基准 N=1000 scroll×100=81.1ms、N=5000=155.4ms、N=10000=164.8ms（windowRows=20），10k 全量渲染参考 first=562.5ms / clean=14.93ms |
+| `bash scripts/test_swift_history.sh` | 546 项 `ok`，0 项 FAIL，EXIT=0（`swiftc -O` 编译 12 个产品源文件 + 自检；`[45]` 节约 93 项，其中 4 项为"测试前提"） |
+
+新增测试：**Rust 17 项**（`src-tauri/src` 里 `#[test]`/`#[tokio::test]` 计数
+248 → 265，无一项被删除；含 `output_transaction` 的隔离窗口 / 占名 / 发布门、
+`commands` 接线 2 项、`history` 的 Windows 现场 1 项、`engine` 的非 macOS 平台 1 项），
+**Swift `[45]` 93 项**，**前端 3 组 LRU 场景**。
+`cargo test --lib` 的 258 与带 `inproc-backends` 的 260 都在这轮实测复跑过（表见上）。
+
+### 负向对照（本轮亲手拆门，证这些门不是空话）
+
+每次改完立刻从备份逐字节还原并核对 md5，还原后复跑为绿。
+
+| 拆掉的门 | 结果 |
+| --- | --- |
+| `retire_original` 第③步隔离复验（改成永不 Changed） | `a_writer_holding_the_fd_open_does_not_lose_its_bytes` FAILED、`a_cross_format_conversion_keeps_an_original_that_changed_in_the_delete_window` FAILED；`an_external_file_reoccupying_the_original_path_is_never_touched` 仍 ok —— 那条现场靠的是第②步隔离改名，不是复验。两条门各管各的现场，测试没有互相冒充 |
+| `temp_is_protected`（改成恒 false） | `temp_cleanup_only_deletes_bytes_it_can_prove_ours` FAILED、`a_protected_marker_reports_whether_it_was_actually_written` FAILED |
+| `install_at_free_path` 的硬链接占名 + 查空门（模拟 RC.3 的裸 `fs::rename`） | `installing_a_candidate_never_overwrites_a_foreign_file_at_the_target` FAILED、`quarantine_publish_refuses_to_install_over_a_file_dropped_into_the_free_slot` FAILED |
+| Swift `TempOwnership.isOurs`（改成恒 true） | `scripts/test_swift_history.sh` EXIT=1，报 4 项 FAIL：无凭证的零字节残骸一律保留 / 交换失败现场里的外部字节不许被当残骸清掉 / 零字节不等于归属 / 两条凭证都证明不了归属时恢复入口拒绝删除 |
+| 前端"本轮用过→搬到最近使用端"（改成恒假，即退回 FIFO） | `node tests/queue-virtualization.cjs` ERR_ASSERTION：第二次回到 A 窗口重建 2 行（期望 1） |
+
+还原核对：`output_transaction.rs` md5 `c722cb99…` 与改前一致（diffstat 仍是 +790/-48）、
+`OutputTransactionStore.swift` md5 `bd3952d2…` 一致（+236/-21）、`frontend/app.js`
+md5 `bb6f122a…` 一致，三者复跑均为绿。
+
+### 已知不对称与遗留（不冒充完成）
+
+- **Windows 运行时**：本轮只做到"CI 里有作业真的跑 `cargo test --lib`"，其结果待推送
+  后以 Actions 为准；本机无法交叉编译（见 P0-3 取证限制）。在拿到 `windows-tests` 的
+  绿色记录之前，Windows 线的目录 fsync 与隔离改名都按"未验证"处理。
+- **非 unix 平台的 inode 凭证**：`file_identity` 在非 unix 返回 `None`，归属判定的第一
+  依据退化为内容对账；只有 `output_sha256` 也没记上的老日志才会走"一律保留"。
+  宁留孤儿残骸（可能残留 `.tmp`），不删别人的字节。
+- **不让硬链接的卷**（部分网络盘 / FAT）：`install_at_free_path` 退化为"查空 + 改名"，
+  该窗口非原子；最坏结果是拒绝提交，不是删他人内容。
+- **Swift 无进程级崩溃注入**：以可直接驱动的原语（`TempOwnership` /
+  `OriginalRetirement` / `restoreQuarantined`）+ 对生产源码的门断言替代；视频
+  `CreateNew` 的端到端崩溃注入仍未单独补（语义与图片共用 `output_transaction`）。
+- **发布门禁**：签名应用 GUI 点击验收、App Store 沙盒运行时、FFmpeg GPL 对应源码
+  义务与 §11 fixture 矩阵其余条目**未完成** → `v0.3.6-rc.4` 依旧只是预发布标签。
+
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
 Before any tag/Release: full three-track build, signed Direct runtime check,

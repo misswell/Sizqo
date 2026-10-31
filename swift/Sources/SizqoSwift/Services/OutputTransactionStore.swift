@@ -150,6 +150,13 @@ struct ReplaceTransaction: Codable {
     /// 输出占位文件的 `(dev,ino)`。恢复时它是"这个 0 字节文件是我们的占位"的凭证；
     /// 没有凭证的空文件一律不删（§2.5 同款身份门）。
     var placeholderIdentity: (device: Int64, inode: UInt64)?
+    /// §28 审查修复（P0-2）：临时文件**认领那一刻**的 `(dev,ino)`。
+    ///
+    /// 原子交换"成功 → 验证不过 → 换回也失败"的现场里，被换出来的**外部字节**恰好
+    /// 停在临时路径上。只有路径名不足以分辨它 —— 以前的清理入口见到 `.tmp` 就删，
+    /// 删的正是用户的文件。这条凭证才是"路径上还是不是我们独占认领的那个文件"的硬依据。
+    /// 老日志没有这个字段（nil）：清理时证明不了归属，宁可留一个孤儿 `.tmp`。
+    var tempIdentity: (device: Int64, inode: UInt64)?
     let createdAt: Int64
     /// PNG → JPG 这类跨格式 replace：压缩结果是个新文件，回滚时要一并删掉。
     let crossFormat: Bool
@@ -167,6 +174,7 @@ struct ReplaceTransaction: Codable {
          expectedOutputSize: Int64, originalSha256: String? = nil,
          outputSha256: String? = nil, backupSha256: String? = nil,
          placeholderIdentity: (device: Int64, inode: UInt64)? = nil,
+         tempIdentity: (device: Int64, inode: UInt64)? = nil,
          createdAt: Int64, crossFormat: Bool,
          mode: TransactionMode = .replaceExisting,
          schemaVersion: Int = transactionSchemaVersion,
@@ -183,6 +191,7 @@ struct ReplaceTransaction: Codable {
         self.outputSha256 = outputSha256
         self.backupSha256 = backupSha256
         self.placeholderIdentity = placeholderIdentity
+        self.tempIdentity = tempIdentity
         self.createdAt = createdAt
         self.crossFormat = crossFormat
         self.mode = mode
@@ -194,6 +203,7 @@ struct ReplaceTransaction: Codable {
         case id, historyId, sourcePath, outputPath, backupPath, tempOutputPath
         case originalSize, expectedOutputSize, originalSha256, outputSha256, backupSha256
         case placeholderDevice, placeholderInode
+        case tempIdentityDevice, tempIdentityInode
         case createdAt, crossFormat, mode, schemaVersion, backupLegacyUnverified
     }
 
@@ -216,6 +226,13 @@ struct ReplaceTransaction: Codable {
             placeholderIdentity = (device, inode)
         } else {
             placeholderIdentity = nil
+        }
+        // 临时名的认领凭证同样拆两个字段存（§28 P0-2）。老日志没有 = 清理时证明不了归属。
+        if let device = try container.decodeIfPresent(Int64.self, forKey: .tempIdentityDevice),
+           let inode = try container.decodeIfPresent(UInt64.self, forKey: .tempIdentityInode) {
+            tempIdentity = (device, inode)
+        } else {
+            tempIdentity = nil
         }
         createdAt = try container.decode(Int64.self, forKey: .createdAt)
         crossFormat = try container.decode(Bool.self, forKey: .crossFormat)
@@ -243,6 +260,8 @@ struct ReplaceTransaction: Codable {
         try container.encode(backupSha256, forKey: .backupSha256)
         try container.encode(placeholderIdentity?.device, forKey: .placeholderDevice)
         try container.encode(placeholderIdentity?.inode, forKey: .placeholderInode)
+        try container.encode(tempIdentity?.device, forKey: .tempIdentityDevice)
+        try container.encode(tempIdentity?.inode, forKey: .tempIdentityInode)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(crossFormat, forKey: .crossFormat)
         try container.encode(mode, forKey: .mode)
@@ -374,6 +393,78 @@ enum StagedTemp {
     }
 }
 
+// MARK: - §28 临时路径的归属凭证
+
+/// 一条 `.tmp` 路径上的字节到底是谁的，靠这三样东西分辨。
+///
+/// 以前清理入口只看路径名 —— "叫 `.tmp` 的就是我们的半成品"。可原子交换"成功 →
+/// 验证不过 → 换回也失败"的现场里，被换出来的**用户内容**恰好停在这条路径上；
+/// 而 `.protected` 标记是 `try?` 写下去的，写失败就等于没有保护。
+/// 现在的第一依据是记账时落盘的 `(dev,ino)`，标记只是显式声明，字节指纹是补充。
+enum TempOwnership {
+    /// `.protected` 标记的路径：临时文件名 + `.protected`。
+    static func markerPath(_ temp: String) -> String { temp + ".protected" }
+
+    /// 这条路径是否被显式声明为"外部字节所在"。
+    static func isProtected(_ temp: String) -> Bool {
+        fileExists(at: markerPath(temp))
+    }
+
+    /// 尽力写下保护标记。**失败必须报出来**：`try?` 吞掉它，就等于把
+    /// "没写成"和"写成了"当成同一件事，下一条清理入口随即按"没有标记"删掉用户字节。
+    static func writeMarker(_ temp: String) -> String? {
+        do {
+            try Data("protected".utf8).write(to: URL(fileURLWithPath: markerPath(temp)))
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    /// 这条路径上是不是我们自己的字节：认领时的 `(dev,ino)` 对得上，
+    /// 或内容正是我们承诺/写下去的那份。两条都证明不了 → 一律保留。
+    static func isOurs(_ temp: String, claimed: (device: Int64, inode: UInt64)?,
+                       expectedSha256: String?) -> Bool {
+        if let claimed, let actual = OutputTransactionStore.fileIdentity(temp),
+           claimed.device == actual.device, claimed.inode == actual.inode {
+            return true
+        }
+        // inode 对不上或拿不到：退到内容对账。字节都不同就没人能证明
+        // 这条路径上的东西是这次事务写的，一律保留。
+        guard let expected = expectedSha256,
+              case .success(let actual) = sha256OfFile(temp), actual == expected else {
+            return false
+        }
+        return true
+    }
+
+    /// 交换回滚失败后的现场处置：停在临时路径上的是**外部字节**。
+    /// 先尽力把它迁到用户看得见的冲突名；迁不动才写 `.protected` 标记。
+    /// 两条路都没走通也绝不删 —— `isOurs` 的 inode 门照样拒绝清理。
+    /// 返回这份字节现在所在的路径，调用方把它写进给人看的说明里。
+    static func protectForeignBytes(from temp: String, nextTo target: String) -> String {
+        let conflict = conflictSibling(for: target)
+        if Darwin.rename(temp, conflict) == 0 { return conflict }
+        if let detail = writeMarker(temp) {
+            NSLog("Sizqo: 保护标记写入失败（归属门仍会拒绝清理）: %@", detail)
+        }
+        return temp
+    }
+
+    /// 与目标同目录、用户看得见的冲突保留名。
+    static func conflictSibling(for target: String) -> String {
+        let directory = (target as NSString).deletingLastPathComponent
+        let name = (target as NSString).lastPathComponent
+        for index in 0..<1000 {
+            let candidate = (directory as NSString)
+                .appendingPathComponent("\(name).sizqo-conflict-\(index)")
+            if !fileExists(at: candidate) { return candidate }
+        }
+        return (directory as NSString)
+            .appendingPathComponent("\(name).sizqo-conflict-\(getpid())")
+    }
+}
+
 /// 临时文件必须和目标同目录，否则 rename 跨挂载点就不是原子操作了。
 struct StagedWrite {
     let temp: String
@@ -381,6 +472,9 @@ struct StagedWrite {
     /// "这条临时路径上是谁" —— 原子交换换回失败时，外部内容恰好停在这里，
     /// 无凭证的 discard 会把用户的文件当半成品删掉。
     private(set) var writtenSha256: String?
+    /// §28 审查修复（P0-2）：独占认领那一刻的 `(dev,ino)` —— discard 的第一依据。
+    /// 零字节只说明"还没写"，不说明"这是我们的"。
+    private(set) var claimedIdentity: (device: Int64, inode: UInt64)?
 
     fileprivate mutating func recordWritten() {
         writtenSha256 = try? sha256OfFile(temp).get()
@@ -392,7 +486,10 @@ struct StagedWrite {
     static func claim(target: String) -> StagedWrite? {
         let parent = (target as NSString).deletingLastPathComponent
         guard let temp = StagedTemp.claim(in: parent, prefix: ".sizqo-write") else { return nil }
-        return StagedWrite(temp: temp)
+        var staged = StagedWrite(temp: temp)
+        // 认领成功 = 这条路径此刻由我们独占：把它的身份钉下来当凭证。
+        staged.claimedIdentity = OutputTransactionStore.fileIdentity(temp)
+        return staged
     }
 
     /// 写满已独占的临时文件 → fsync → 原子改名到目标。
@@ -428,21 +525,26 @@ struct StagedWrite {
         return true
     }
 
-    /// §28 身份门：只有能证明"这条路径上是我们的字节"（哈希对上我们写的
-    /// 候选，或还是空占位）才允许删；证明不了就原样保留并告警。
+    /// §28 审查修复（P0-2）身份门：只有**证明得了归属**才允许删。
+    ///
+    /// 顺序是 标记 → inode 凭证 → 内容指纹。`.protected` 是"这里的字节属于外部"的
+    /// 显式声明，压过一切推断；凭证是记账时认领的那个 inode；两者都拿不到时才看字节。
+    /// 以前的"零字节就删"是最危险的一支：外部把我们的占位删掉后放进自己的空文件，
+    /// 在旧代码里和我们的占位长得一模一样，一个字节都不是我们的。
     func discard() {
-        let attrs = try? FileManager.default.attributesOfItem(atPath: temp)
-        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
-        if size == 0 {
-            try? FileManager.default.removeItem(atPath: temp)
+        // 已经改名成目标了（正常提交）：无物可清，也不必假装这里有过别人的文件。
+        guard fileExists(at: temp) else { return }
+        if TempOwnership.isProtected(temp) {
+            NSLog("Sizqo: 临时路径带保护标记，已原样保留: %@", temp)
             return
         }
-        if let written = writtenSha256,
-           case .success(let actual) = sha256OfFile(temp), actual == written {
+        if TempOwnership.isOurs(temp, claimed: claimedIdentity, expectedSha256: writtenSha256) {
             try? FileManager.default.removeItem(atPath: temp)
+            try? FileManager.default.removeItem(atPath: TempOwnership.markerPath(temp))
             return
         }
-        NSLog("Sizqo: 临时路径上的内容无法证明归属（%lld 字节），已原样保留: %@", size, temp)
+        NSLog("Sizqo: 临时路径上的内容证明不了归属（%lld 字节），已原样保留: %@",
+              fileLength(temp), temp)
     }
 
     /// 把已经 fsync 的临时文件原子改名到目标。改名之前该核的都必须已经核过。
@@ -456,14 +558,20 @@ struct StagedWrite {
         return syncDirectory(at: (target as NSString).deletingLastPathComponent)
     }
 
-    /// 发布结果三态：调用方据此决定 withdraw（目标没动）/ 回滚（覆盖已发生）。
-    enum PublishOutcome {
+    /// 发布结果四态：调用方据此决定 withdraw（目标没动）/ 回滚（覆盖已发生）。
+    /// §28 审查修复（P0-2）：`refused` 与"覆盖已发生却没能恢复"**必须**是两个态 ——
+    /// 把后者当前者收场会销掉事务日志并删掉停在临时路径上的用户内容。
+    enum PublishOutcome: Equatable {
         /// 发布完整成立（含目录 fsync）。
         case published
         /// 目标没被动过（交换被换回 / 验证失败 / rename 失败）。
         case refused
         /// 覆盖已发生但目录 fsync 失败：调用方必须回滚。
         case publishedButNotDurable
+        /// 覆盖已发生（交换成功），且**换回也失败**：用户的内容停在临时路径上。
+        /// 关联值是那份字节现在所在的路径。调用方必须回滚并保住事务日志，
+        /// 绝不能用 withdraw 假装什么都没发生。
+        case swappedButUnrecovered(String)
     }
 
     /// §3.3 审查修复：统一发布入口 —— 占位凭证（新建/跨格式）用 inode 验证，
@@ -504,10 +612,12 @@ struct StagedWrite {
                 discard()
                 return .refused
             }
-            let _ = try? Data("protected".utf8).write(
-                to: URL(fileURLWithPath: self.temp + ".protected"))
-            NSLog("Sizqo: 交换回滚失败，外部内容已加保护标记: %@", self.temp)
-            return .refused
+            // 换回失败：覆盖**已经发生**，此刻停在临时路径上的是用户的内容。
+            // 这里绝不能走 discard 之外的任何"清残骸"路径。
+            let relocated = TempOwnership.protectForeignBytes(from: self.temp, nextTo: target)
+            NSLog("Sizqo: 交换回滚失败，外部内容已迁到保护位置: %@", relocated)
+            return .swappedButUnrecovered(
+                "目标文件在提交前一刻被外部修改，交换回滚也失败；原内容保留在 \(relocated)")
         }
         try? FileManager.default.removeItem(atPath: self.temp)
         return syncDirectory(at: (target as NSString).deletingLastPathComponent)
@@ -550,9 +660,12 @@ struct StagedWrite {
                 discard()
                 return .refused
             }
-            // 换回失败：绝对保留现场 —— 候选与外部内容都不删，交人工。
-            NSLog("Sizqo: 占位交换验证失败且换回失败，现场保留（%@" , target)
-            return .refused
+            // 换回失败：目标位置上现在是我们的候选，外部内容停在临时路径上 ——
+            // 覆盖已经发生（§28 P0-2 要求这个态与 `refused` 分开）。
+            let relocated = TempOwnership.protectForeignBytes(from: self.temp, nextTo: target)
+            NSLog("Sizqo: 占位交换验证失败且换回失败，外部内容已迁到保护位置: %@", relocated)
+            return .swappedButUnrecovered(
+                "输出位置在提交前一刻被外部改动，交换回滚也失败；那份内容保留在 \(relocated)")
         }
         // 不支持原子交换：退回"先验身份再 rename"（与旧门同级）。
         guard let actual = OutputTransactionStore.fileIdentity(target),
@@ -570,6 +683,95 @@ struct StagedWrite {
         return staged.writeAndPublish(bytes, to: target) ? staged : nil
     }
 
+}
+
+// MARK: - §28 跨格式替换：删掉原图时的归属证明
+
+/// 跨格式（PNG → JPG 这一类）里「删掉原图」那一步。
+///
+/// 「复核一次 → 按原路径 removeItem」在复核与删除之间隔着一次系统调用：复核看到的
+/// 是旧字节，删掉的却是**此刻路径上的任何东西**（本轮审查在 Rust 侧报的 P0-1 就是它，
+/// 那边甚至是"记了警告却照样删"）。这里拆成三步，每一步只删得到自己证明得了归属的字节：
+///   ① 动手前的快速门（stat 三项）：明显不是原来那份就根本不进删除；
+///   ② 原子改名到独占认领的隔离名 —— 从这一刻起，外部在这个目录里怎么折腾都改不到
+///      我们即将删的那份字节；
+///   ③ 复验隔离出来的这份（含内容哈希）：对得上才删；对不上放回原位，
+///      原位被外部占了就用原子交换顶回来。
+/// 任何一条路走不通，结果都是"字节还在磁盘上" + 一句说实话的警告。
+enum OriginalRetirement {
+    /// 在同目录独占认领一个隔离名（O_EXCL）：改名过去不可能盖掉任何人的文件。
+    static func claimQuarantineName(for file: String) -> String? {
+        let directory = (file as NSString).deletingLastPathComponent
+        for _ in 0..<16 {
+            let candidate = (directory as NSString).appendingPathComponent(
+                ".sizqo-retire-\(UUID().uuidString.lowercased()).keep")
+            let handle = Darwin.open(candidate, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+            if handle >= 0 {
+                Darwin.close(handle)
+                return candidate
+            }
+            if errno != EEXIST { return nil }
+        }
+        return nil
+    }
+
+    /// 隔离后的字节回到原位的结果，三种现场各有各的实话。
+    enum Restored {
+        /// 原图已回到原位，磁盘上没有需要额外处置的东西。
+        case inPlace
+        /// 原图回到原位，外部那份被原子交换进了隔离名 —— 那条路径不是我们的，留着。
+        case inPlaceForeignKept(String)
+        /// 放回失败：字节仍在返回的路径上，交人工确认。
+        case kept(String)
+    }
+
+    /// 把隔离出来的字节放回原位。原位已被外部占了时只有原子交换能保证
+    /// 「放回原图」不等于「盖掉别人的文件」。
+    static func restoreQuarantined(_ quarantine: String, to original: String) -> Restored {
+        if fileExists(at: original) {
+            return OutputTransactionStore.atomicSwap(quarantine, original)
+                ? .inPlaceForeignKept(quarantine) : .kept(quarantine)
+        }
+        return Darwin.rename(quarantine, original) == 0 ? .inPlace : .kept(quarantine)
+    }
+
+    /// 放回原位的三种现场各自的那句实话。`action` 说清是哪一步没走通。
+    private static func restoredMessage(_ restored: Restored, detail: String,
+                                        action: String = "原文件在隔离窗口内被外部修改") -> String {
+        switch restored {
+        case .inPlace:
+            return "\(action)（\(detail)），已放回原位并保留"
+        case .inPlaceForeignKept(let kept):
+            return "\(action)（\(detail)），已放回原位；外部那份保留在 \(kept)，未删除"
+        case .kept(let kept):
+            return "\(action)（\(detail)），原位又被外部占用；字节保留在 \(kept)，请人工确认"
+        }
+    }
+
+    /// `nil` = 原图已删除；非 nil = 原图保留，返回值是给用户看的原话。
+    static func retire(file: String, baseline: SourceIdentity) -> String? {
+        if case .changed(let detail) = baseline.fingerprintIntact(at: file) {
+            return "原文件在提交窗口内被外部修改（\(detail)），已保留"
+        }
+        guard let quarantine = claimQuarantineName(for: file) else {
+            return "无法在原图旁边独占一个隔离名（\(errorText())），原图已保留"
+        }
+        guard Darwin.rename(file, quarantine) == 0 else {
+            let detail = errorText()
+            try? FileManager.default.removeItem(atPath: quarantine)
+            return "原图改名隔离失败（\(detail)），已保留"
+        }
+        // ③ 复验：改名之后这条路径归我们独占，此刻的字节就是即将被删的字节。
+        //    这里必须是完整 verify —— 快速门看不出"同大小、同时间戳"的原地改写。
+        if case .changed(let detail) = baseline.verify(at: quarantine) {
+            return restoredMessage(restoreQuarantined(quarantine, to: file), detail: detail)
+        }
+        guard (try? FileManager.default.removeItem(atPath: quarantine)) != nil else {
+            return restoredMessage(restoreQuarantined(quarantine, to: file),
+                                   detail: errorText(), action: "原图删除失败")
+        }
+        return nil
+    }
 }
 
 // MARK: - 事务存储
@@ -840,10 +1042,23 @@ final class OutputTransactionStore: @unchecked Sendable {
         removeTemp(txn)
     }
 
+    /// §28 审查修复（P0-2）：临时残骸也必须走归属门 —— 这是启动恢复与回滚里的
+    /// 另一个清理入口，以前它照着日志里的路径直接删，`.protected` 标记根本不认。
+    /// 交换失败现场里那条路径上躺着的是用户的文件。
     static func removeTemp(_ txn: ReplaceTransaction) {
-        if let temp = txn.tempOutputPath {
-            try? FileManager.default.removeItem(atPath: temp)
+        guard let temp = txn.tempOutputPath, fileExists(at: temp) else { return }
+        if TempOwnership.isProtected(temp) {
+            NSLog("Sizqo: 事务临时路径带保护标记（交换失败的外部内容），已原样保留: %@", temp)
+            return
         }
+        // 凭证一：记账时认领的那个 inode；凭证二：这次承诺的产物字节。
+        guard TempOwnership.isOurs(temp, claimed: txn.tempIdentity,
+                                   expectedSha256: txn.outputSha256) else {
+            NSLog("Sizqo: 事务临时路径上的字节证明不了归属，已原样保留: %@", temp)
+            return
+        }
+        try? FileManager.default.removeItem(atPath: temp)
+        try? FileManager.default.removeItem(atPath: TempOwnership.markerPath(temp))
     }
 
     // MARK: - §3.4 人工恢复：现场分类与处置

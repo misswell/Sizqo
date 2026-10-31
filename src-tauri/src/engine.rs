@@ -2481,6 +2481,8 @@ mod intent_tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2, "第二档查询后就必须停");
     }
 
+    /// macOS：系统转换真的会跑，所以必须证明"没跑体积搜索"这件事**不许**冒充成达成目标。
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn system_mode_does_not_pretend_to_have_run_a_budget_search() {
         let dir = tempfile::tempdir().unwrap();
@@ -2495,6 +2497,41 @@ mod intent_tests {
         assert!(result.success, "{:?}", result.error);
         assert_eq!(result.target_met, Some(false), "没跑搜索就不能报达成");
         assert!(warn_text(&result).contains("系统转换不做指定体积搜索"), "{:?}", result.warnings);
+    }
+
+    /// 非 macOS：`convert_with_system` 只有"拒绝"这一条诚实的回答，绝不许它把失败
+    /// 说成成功。断言的是这次系统模式**如实失败**：判据是 UnsupportedFormat + Rejected
+    /// （不是 Failed/Unknown 那种含糊），请求的体积目标原样回显但绝不报达成，
+    /// 文案里必须看得见"系统转换仅支持 macOS"。
+    ///
+    /// 注意文案的位置：`rejected()` 把话写进 `error`，而 `system_mode_result` 只在
+    /// `success` 为真时才追加告警 —— 所以这条线上 `warnings` 是空的，必须读 `error`。
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn system_mode_reports_unsupported_off_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_jpeg(dir.path(), "photo.jpg", &noise_rgb(900, 600, 21), 92);
+
+        let mut opts = CompressOptions::default();
+        opts.processing_mode = "system".into();
+        opts.max_output_bytes = Some(10); // 这条路径连搜索都没有，谈不上命中
+        let result = compress_image(&file, &opts).await;
+
+        assert!(!result.success, "非 macOS 的系统转换必须如实失败，不能报成功");
+        assert_eq!(result.reason, ReasonCode::UnsupportedFormat);
+        assert_eq!(result.encode, EncodeVerdict::Rejected);
+        // 交回的是原图字节：这说明失败判据来自"格式不支持"，而不是源文件没读到
+        // （读失败是 encode=Failed + SourceReadFailed/NotFound，见 read_source）。
+        assert!(!result.compressed.is_empty(), "拒绝不是产出一个空文件");
+        assert_eq!(result.target_bytes, Some(10), "被拒绝也要把用户要的目标说清楚");
+        assert_ne!(result.target_met, Some(true), "什么都没编码，绝不能报达成");
+        assert_eq!(result.target_met, Some(false));
+        let message = result.error.unwrap_or_default();
+        assert!(
+            message.contains("系统转换仅支持 macOS"),
+            "error={message:?}, warnings={:?}",
+            result.warnings
+        );
     }
 
     // ─── 线上字段契约 ───────────────────────────────────────────

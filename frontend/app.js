@@ -1696,6 +1696,9 @@ function applyQueueView() {
 // visibleList 只在排序/筛选/成员变化时重算；滚动事件只做窗口切片。
 // fileRows 是有上限的 LRU —— 一万行滚一遍不会在内存里攒一万个 detached 节点，
 // 业务状态始终在 queueItems，被逐出的行滚回来时按需重建。
+// fileRowOrder 是它的**最近使用顺序表**：表头 = 最久未使用，表尾 = 本轮刚用过，
+// 逐出从表头开始（见 pruneFileRowCache）。行只在创建时入表，之后每轮由 prune
+// 按"本轮是否真的被窗口用到"重排 —— 只按创建时间淘汰是 FIFO，来回滚动会反复重建 DOM。
 var queueViewCache = { visibleFiles: [], dirty: true, membersRef: null };
 var fileRowOrder = [];
 var FILE_ROW_CACHE_LIMIT = 600;
@@ -1781,6 +1784,7 @@ function attachQueueView(list, failedOnly, mediaView, membersArg) {
       if (!entry.row) {
         entry.row = createQueueRow(entry.file);
         fileRows[entry.file] = entry.row;
+        // 新建行 = 刚被用过：入顺序表尾，本轮的完整重排由 pruneFileRowCache 收口。
         fileRowOrder.push(entry.file);
         paintQueueRow(entry.file);
         var failedRow = queueState(entry.file) === 'failed';
@@ -1813,7 +1817,8 @@ function attachQueueView(list, failedOnly, mediaView, membersArg) {
     });
     queueVirtual.topSpacer = removeQueueSpacer(list, queueVirtual.topSpacer);
     queueVirtual.bottomSpacer = removeQueueSpacer(list, queueVirtual.bottomSpacer);
-    pruneFileRowCache(list, null);
+    // 全量渲染的"本轮窗口"就是整张有序表：顺序维护与逐出规则和虚拟分支一致。
+    pruneFileRowCache(list, orderedEntries.map(function(entry) { return entry.file; }));
   }
   var empty = document.getElementById('queueFilterEmpty');
   if (empty) empty.hidden = !failedOnly || visible > 0;
@@ -1840,29 +1845,39 @@ function removeQueueSpacer(list, existing) {
 }
 /// §8 审查修复（第二轮）：LRU 保护集只含**当前视口窗口**的行 ——
 /// 用完整 visibleFiles 当保护集会让逐滚全表的 10k 行全部豁免，上限失效。
-/// 非保护行（不在窗口 / 已从队列删除）超出上限即逐出：元素交 GC，
-/// 滚回来由窗口循环按需重建；queueItems 里的业务状态从不依赖行存在。
-function pruneFileRowCache(list, windowFiles) {
-  var windowSet = new Set(windowFiles);
-  var kept = [];
+/// §8 审查修复（第三轮）：保护集里的行必须搬到顺序表的**最近使用端**，
+/// 淘汰从**最久未使用端**开始 —— 否则 fileRowOrder 只是创建顺序（FIFO），
+/// "早创建但刚滚回来看过"的行会先被逐出，往返滚动反复重建 DOM。
+/// 全量渲染分支传整张有序表，走的是同一套顺序维护与淘汰规则。
+/// 逐出（不在本轮窗口、且已离屏）的行：元素交 GC，滚回来由窗口循环按需重建；
+/// queueItems 里的业务状态从不依赖行存在。仍挂在 list 上的行一律受保护 ——
+/// 缓存与 DOM 从不分家（把在屏的行逐出会让下一轮重复建出两个节点）。
+/// 成本：单遍重排 O(顺序表长度)。虚拟分支里表长由 FILE_ROW_CACHE_LIMIT 兜住
+/// （受保护的"刚用过"只有窗口行），所以与队列规模无关；全量渲染分支的行本来就
+/// 全部挂在 DOM 上，表长与本轮真正渲染的行数同阶，不构成额外留存。
+function pruneFileRowCache(list, usedFiles) {
+  var used = usedFiles ? new Set(usedFiles) : null;
+  var stale = [];   // 本轮没用到：逐出候选，越靠前越久未访问
+  var fresh = [];   // 本轮用到 / 仍在 DOM：搬到最近使用端，受保护不逐出
+  var seen = new Set();
   var evicted = 0;
-  for (var i = 0; i < fileRowOrder.length; i++) {
-    var file = fileRowOrder[i];
-    var row = fileRows[file];
+  var kept = [];
+  var i, file, row;
+  for (i = 0; i < fileRowOrder.length; i++) {
+    file = fileRowOrder[i];
+    if (seen.has(file)) continue;                 // 同一文件重复入表：只认第一次
+    row = fileRows[file];
     if (!row) { continue; } // 已删队列文件：从顺序表剔除，绝不复活
-    if (windowSet.has(file) && row.parentNode === list) { kept.push(file); continue; }
-    if (fileRowOrder.length - kept.length + (fileRowOrder.length - i - 1) <= FILE_ROW_CACHE_LIMIT) {
-      // 剩余总数不超限：全部保留（含未检查的尾部）。
-      kept.push(file);
-      continue;
-    }
-    if (kept.length + (fileRowOrder.length - i) <= FILE_ROW_CACHE_LIMIT) {
-      kept.push(file);
-      continue;
-    }
-    delete fileRows[file];
-    evicted++;
+    seen.add(file);
+    if ((used && used.has(file)) || row.parentNode === list) { fresh.push(file); continue; }
+    stale.push(file);
   }
+  // 超出上限的部分从表头（最久未访问）开始逐出；受保护行占用的额度不减别人。
+  var over = stale.length + fresh.length - FILE_ROW_CACHE_LIMIT;
+  evicted = over > 0 ? Math.min(over, stale.length) : 0;
+  for (i = evicted; i < stale.length; i++) kept.push(stale[i]);
+  for (i = 0; i < fresh.length; i++) kept.push(fresh[i]);
+  for (i = 0; i < evicted; i++) delete fileRows[stale[i]];
   fileRowOrder = kept;
   return evicted;
 }
@@ -2883,6 +2898,8 @@ function resetQueue() {
   inputPaths = [];
   queueItems = new Map();
   fileRows = {};
+  // 行缓存的顺序表跟着行本体一起清：留着只有一堆已删文件的空壳。
+  fileRowOrder = [];
   pendingAutoCompress = false;
   selectedQueueFile = null;
   runIntentSnapshot = null;

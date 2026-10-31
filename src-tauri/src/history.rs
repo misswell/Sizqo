@@ -1628,8 +1628,16 @@ pub(crate) fn sync_dir(path: &Path) -> Result<(), String> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE：目录是共享的，
+        // 同步用的句柄不许把并发写入者挡在门外。
+        const FILE_SHARE_ALL: u32 = 0x0000_0007;
+        // §28 审查修复：FlushFileBuffers 要求句柄具有写权限 —— 只读句柄即使带着
+        // FILE_FLAG_BACKUP_SEMANTICS 开成功，落盘那一步也必然返回 ACCESS_DENIED。
+        // RC.3 的 Windows 分支就是这么写的，所以"Windows 编译通过"从没证明过
+        // 目录 fsync 真的能成。这里按原生 API 的要求开：backup semantics + 写访问。
         fs::OpenOptions::new()
-            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_ALL)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)
             .and_then(|file| file.sync_all())
@@ -1638,7 +1646,10 @@ pub(crate) fn sync_dir(path: &Path) -> Result<(), String> {
     #[cfg(not(any(unix, windows)))]
     {
         // 未知平台：没有可信的目录同步原语，宁可如实失败也不假装成功。
-        Err(format!("{}: directory sync unsupported on this platform", path.display()))
+        Err(format!(
+            "{}: directory sync unsupported on this platform",
+            path.display()
+        ))
     }
 }
 
@@ -2563,13 +2574,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_failed_output_cleanup_keeps_the_restore_but_reports_a_warning() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let store = store_in(dir.path());
-        let src_dir = dir.path().join("src");
-        let out_dir = dir.path().join("out");
+    /// 「产物删不掉」这段现场的两个平台各造各的，期望的实话完全一样：
+    /// 原图写回照常成立，历史记成"带警告恢复"，失败必须回给用户而不是吞掉。
+    fn output_cleanup_failure_scene(
+        dir: &Path,
+    ) -> (HistoryStore, HistoryEntry, PathBuf, PathBuf, PathBuf) {
+        let store = store_in(dir);
+        let src_dir = dir.join("src");
+        let out_dir = dir.join("out");
         fs::create_dir_all(&src_dir).unwrap();
         fs::create_dir_all(&out_dir).unwrap();
         let source = src_dir.join("photo.png");
@@ -2586,6 +2598,29 @@ mod tests {
         entry.output_sha256 = crate::source_identity::sha256_of(&output).ok();
         fs::write(&source, b"converted").unwrap();
         store.add(entry.clone()).unwrap();
+        (store, entry, source, output, out_dir)
+    }
+
+    fn restore_survives_a_failed_output_cleanup(
+        report: &RestoreReport,
+        row: &HistoryEntry,
+        source: &Path,
+        output: &Path,
+    ) {
+        assert_eq!(fs::read(source).unwrap(), b"true-original");
+        assert!(output.exists());
+        let warning = report.warning.as_deref().expect("清理失败必须回给用户");
+        assert!(warning.contains("压缩文件删除失败"), "{warning}");
+        assert_eq!(row.status, HistoryStatus::RestoredWithWarning);
+        assert!(row.restored_at.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_output_cleanup_keeps_the_restore_but_reports_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (store, entry, source, output, out_dir) = output_cleanup_failure_scene(dir.path());
 
         // 目录只读：产物删不掉，但原图写回完全不受影响。
         fs::set_permissions(&out_dir, fs::Permissions::from_mode(0o555)).unwrap();
@@ -2594,14 +2629,29 @@ mod tests {
             .unwrap();
         fs::set_permissions(&out_dir, fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert_eq!(fs::read(&source).unwrap(), b"true-original");
-        assert!(output.exists());
-        let warning = report.warning.expect("清理失败必须回给用户");
-        assert!(warning.contains("压缩文件删除失败"), "{warning}");
         let row = store.find(&entry.id).unwrap();
-        assert_eq!(row.status, HistoryStatus::RestoredWithWarning);
-        assert!(row.restored_at.is_some());
-        assert!(store.find_latest_for_source(&row.source_path).is_none());
+        restore_survives_a_failed_output_cleanup(&report, &row, &source, &output);
+        assert!(store.find_latest_for_source(&entry.source_path).is_none());
+    }
+
+    /// Windows 上「删不掉」的自然形态：另一个句柄还开着（没给 FILE_SHARE_DELETE），
+    /// `remove_file` 直接 ACCESS_DENIED。权限位在那边不管用，所以这一支单独造现场，
+    /// 断言的是同一句实话 —— 平台不同，契约不能不同。
+    #[cfg(windows)]
+    #[test]
+    fn an_output_held_open_by_another_handle_fails_cleanup_but_not_the_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, entry, source, output, _) = output_cleanup_failure_scene(dir.path());
+        let blocker = fs::File::open(&output).unwrap();
+        let report = store
+            .restore(&entry, false, false, open_access().as_ref(), &mut || false)
+            .unwrap();
+        drop(blocker);
+
+        let row = store.find(&entry.id).unwrap();
+        restore_survives_a_failed_output_cleanup(&report, &row, &source, &output);
+        assert!(output.exists(), "句柄释放后产物仍在原位：恢复从不靠删掉它");
+        assert!(store.find_latest_for_source(&entry.source_path).is_none());
     }
 
     /// §76 产物在访达里被删掉不等于记录坏了：原图备份还在，恢复照常成立。

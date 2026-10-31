@@ -20,13 +20,32 @@ jobs:
         run: cargo test --lib
       - name: crash injection (SIGKILL × 6 phases + idempotent re-recovery)
         working-directory: src-tauri
-        run: cargo test --test crash_injection
+        # --nocapture：崩溃注入的逐阶段结论就是这条门禁的证据，
+        # 静默通过的 harness 在 CI 日志里和"没跑"看不出区别。
+        run: cargo test --test crash_injection -- --nocapture
       - name: contract vectors (Rust side)
         working-directory: src-tauri
         run: cargo test --lib rust_executes_every_contract
       - name: real media matrix (bundled ffmpeg, --ignored)
         working-directory: src-tauri
         run: cargo test --lib real -- --ignored
+
+  # macOS 才成立的行为（ImageIO 系统转换等）以前只被 swift-checks 间接碰到，
+  # 没有任何作业真的在 macOS 上跑 cargo test —— 平台分支的断言因此无人守。
+  rust-tests-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test --lib (default)
+        working-directory: src-tauri
+        run: cargo test --lib
+      - name: cargo test --lib --features inproc-backends
+        working-directory: src-tauri
+        run: cargo test --lib --features inproc-backends
+      - name: crash injection on macOS (APFS 上的真实 SIGKILL 现场)
+        working-directory: src-tauri
+        run: cargo test --test crash_injection -- --nocapture
 
   frontend-tests:
     runs-on: ubuntu-latest
@@ -45,14 +64,22 @@ jobs:
       - name: Swift history/backup/scheduler self-checks + contract vectors
         run: bash scripts/test_swift_history.sh
 
-  windows-build-check:
+  # §28 审查修复（P0-3）：`cargo check` 只能证明 Windows 分支编得过，证明不了
+  # 目录 fsync 真跑得通（读句柄上 sync_all 会直接失败）。这一段要的是运行时结论。
+  windows-tests:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: cargo check (Windows 编译 + sync_dir 原生路径)
+      - name: cargo check (Windows 编译)
         working-directory: src-tauri
         run: cargo check --lib
+      - name: cargo test --lib (Windows 运行时：目录 fsync / 隔离改名 / 句柄占用)
+        working-directory: src-tauri
+        run: cargo test --lib
+      - name: contract vectors (Windows side)
+        working-directory: src-tauri
+        run: cargo test --lib rust_executes_every_contract
 
   appstore-tests:
     runs-on: ubuntu-22.04

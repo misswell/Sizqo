@@ -1273,6 +1273,10 @@ final class AppState: ObservableObject {
             // 覆盖事务缺这份凭证会在 prepare 处被拒绝落账。
             backupSha256: backupFile.flatMap { history.recordedBackupSha256(of: $0) },
             placeholderIdentity: placeholderIdentity,
+            // §28 审查修复（P0-2）：临时名的认领凭证同时落账 —— 启动恢复/回滚清理
+            // 那条路径时，这是"上面的字节还是不是我们那份"的唯一硬依据（交换失败
+            // 的现场里，躺在那儿的可能是用户的文件）。
+            tempIdentity: staged.claimedIdentity,
             createdAt: SizqoClock.nowMillis,
             crossFormat: crossFormat,
             mode: placement.transactionMode,
@@ -1320,8 +1324,20 @@ final class AppState: ObservableObject {
         }
 
         // ⑥ 原子发布。同格式覆盖用基线哈希走原子交换（验证被换出的字节）；
-        // 占位凭证在场时验证认领的 inode。三态：refused = 目标没动（withdraw）；
-        // publishedButNotDurable = 覆盖已发生但目录没落盘（用备份回滚）。
+        // 占位凭证在场时验证认领的 inode。四态：refused = 目标没动（withdraw）；
+        // publishedButNotDurable / swappedButUnrecovered = 覆盖**已经发生**，
+        // 只能按事务凭证把原图收回来，收回来才销账（§28 审查修复 P0-2）。
+        //
+        // 这两态共用的处置：`rollback` 按模式各自收拾 —— 覆盖模式验过备份凭证才写回
+        // 真正原图，新建模式只删自己生成的那个文件。它证明不了归属时会拒绝并回报，
+        // 那时事务日志必须留在现场，交给下次启动的恢复，而不是提前 `finish` 假装收口。
+        func recoverCoveredWrite(_ situation: String) -> OutputWriteError {
+            if let rollbackError = OutputTransactionStore.rollback(txn) {
+                return .rollbackFailed("\(situation)，且自动恢复没成功：\(rollbackError)")
+            }
+            transactions.finish(txn.id)
+            return .outputWriteFailed("\(situation)，已按事务凭证收回原图")
+        }
         switch staged.publishWithOwnershipVerification(
             to: target,
             placeholderIdentity: placeholderIdentity,
@@ -1332,35 +1348,25 @@ final class AppState: ObservableObject {
         case .refused:
             return withdraw(.outputWriteFailed("无法改名到 \(target)（所有权/身份验证未通过，目标内容已保留）"))
         case .publishedButNotDurable:
-            if let backup = backupFile,
-               (try? HistoryStore.writeBackupBack(to: path, backup: backup)) == nil {
-                return .outputWriteFailed("目录 fsync 失败且回滚失败；原图备份已保留")
-            }
-            transactions.finish(txn.id)
-            return .outputWriteFailed("输出目录未能落盘，已用备份恢复原图")
+            return recoverCoveredWrite("输出目录未能落盘")
+        case .swappedButUnrecovered(let detail):
+            // 覆盖已经发生，用户的内容停在临时路径上（带 `.protected` 标记或已迁到
+            // 冲突名）。这里绝不能 withdraw：销账会让这次覆盖看起来从未发生，
+            // 而 discard 那条路径正对着用户的字节。
+            return recoverCoveredWrite("提交前一刻目标被外部改动且交换未能恢复（\(detail)）")
         }
 
         if crossFormat {
-            // §28 审查修复：删除原图前的最后一道身份门 —— 落盘流程里外部
-            // 可能改掉原图，备份保住的是旧字节，用户刚写的新字节只有这次
-            // 复核看得见。改过 → 保留文件，跨格式产物照常成立。
-            var identityStale = true
-            if let identity = replaceIdentity {
-                if case .unchanged = identity.verify(at: path) { identityStale = false }
-            }
-            if identityStale {
-                // 不 return：产物已落盘，历史照常记、事务照常销账 —— 只是原图留着。
-                result.warnings.append(
-                    "原文件在提交前被修改，已保留: \(path)（跨格式产物照常生成）"
-                )
-            } else {
-                do { try fm.removeItem(atPath: path) }
-            catch {
-                // 删不掉（权限/被占用）时不许静默：磁盘上会同时留着原图和新格式产物。
-                // 产物已提交、历史已记，不能反过来撤销一次成功的压缩 —— 留警告给用户。
-                NSLog("Sizqo 跨格式替换：原文件删除失败（产物已保留）: %@", error.localizedDescription)
-                result.warnings.append("原格式文件删除失败，已保留: \(path)")
-            }
+            // §28 审查修复（与 Rust 侧 P0-1 同一条门）：删除原图整件事交给隔离改名 ——
+            // 复核与删除之间不再留着可以塞进竞争的窗口，删的只有"证明得了归属"的那份字节。
+            // 原图保留下来时产物照常成立：这次转换本身已经成功，只是老文件还在 ——
+            // 警告必须与磁盘事实一致，也不许反过来撤销一次成功的压缩。
+            let retired: String? = replaceIdentity.map {
+                OriginalRetirement.retire(file: path, baseline: $0)
+            } ?? "缺少原图身份依据，不能证明要删的是哪份字节，原图已保留"
+            if let detail = retired {
+                NSLog("Sizqo: 跨格式替换未删除原图 —— %@", detail)
+                result.warnings.append("\(detail)（跨格式产物照常生成）")
             }
         }
         result.outputPath = target
