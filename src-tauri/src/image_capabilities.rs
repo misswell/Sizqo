@@ -246,6 +246,31 @@ mod tests {
         }
     }
 
+    /// 「这一刻用不了」必须自己说清楚：有理由、且不混进输出目标。
+    /// 这一条不分平台，也不分 feature —— Windows 上缺 cwebp、Linux 上缺 HEIC、
+    /// App Store 里没链接 libjxl，走的都是同一句实话。
+    #[test]
+    fn every_unavailable_format_explains_itself_and_stays_out_of_the_targets() {
+        let matrix = capabilities();
+        let mut reported_unavailable = 0;
+        for format in &matrix.formats {
+            if format.available {
+                continue;
+            }
+            reported_unavailable += 1;
+            assert!(format.reason.is_some(), "{} 不可用却没给用户理由", format.id);
+            assert!(
+                !matrix.output_targets.contains(&format.id),
+                "{} 不可用却出现在输出目标里",
+                format.id
+            );
+        }
+        assert!(
+            reported_unavailable > 0,
+            "这台机器上没有任何不可用格式，这条门是空跑的"
+        );
+    }
+
     #[test]
     fn system_targets_are_exactly_the_imageio_containers() {
         let matrix = capabilities();
@@ -275,12 +300,34 @@ mod tests {
     fn direct_reports_the_tools_it_actually_bundles() {
         let matrix = capabilities();
         assert_eq!(matrix.backend, "cli");
-        // 仓库自带 resources/bin：这台机器上这些目标应当可用。
-        for id in ["jpg", "png", "webp"] {
+        // jpg/png 有进程内兜底编码器：任何平台都真写得出来，这一条不许按平台放宽。
+        for id in ["jpg", "png"] {
             assert!(matrix.output_targets.contains(&id), "Direct 缺少 {id} 输出");
         }
         if cfg!(target_os = "macos") {
             assert!(matrix.output_targets.contains(&"heif"));
+        }
+        // webp 这类只有外部 CLI 一条路：矩阵必须跟着"这台机器上到底有没有这个编码器"走，
+        // 凭空许诺就等于下拉框里出现一个点了不生效的目标。
+        let webp = by_id(&matrix, "webp");
+        assert_eq!(
+            webp.available,
+            crate::engine::tool_available("cwebp"),
+            "webp 的可用性必须等于 cwebp 的在场与否"
+        );
+        if !webp.available {
+            assert!(
+                !matrix.output_targets.contains(&"webp"),
+                "编码器不在场，webp 不许进输出目标"
+            );
+            let reason = webp.reason.as_deref().expect("不可用必须给用户一个理由");
+            assert!(reason.contains("cwebp"), "理由没点名缺哪个编码器：{reason}");
+        }
+        // Windows Direct 的随包事实：resources/bin 里全是 macOS 的 Mach-O 二进制，
+        // 一个 .exe 都没有 —— 那边此刻真的写不出 webp。将来真带上 cwebp.exe 时，
+        // 该改的是打包，不是这条断言（它会自己翻成"应当可用"）。
+        if cfg!(target_os = "windows") {
+            assert!(!webp.available, "Windows Direct 没随包 cwebp.exe，矩阵不许声称可用");
         }
     }
 }

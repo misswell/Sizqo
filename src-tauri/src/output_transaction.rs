@@ -139,15 +139,23 @@ impl ReplaceTransaction {
     }
 }
 
-/// 文件系统身份 `(dev,ino)`。非 unix 平台拿不到：所有依赖它的凭证在那些平台上
-/// 退化为旧行为，不做平台差异性的安全承诺。
+/// 文件系统身份 `(dev,ino)`。
+///
+/// unix 走 `stat()`；Windows 走 `GetFileInformationByHandle` 的
+/// `(dwVolumeSerialNumber, nFileIndex)` —— 同一卷内唯一、重开不变、被换成新文件就变，
+/// 与 unix 的 `ino` 同语义。打不开/查不到就返回 `None`：所有依赖它的凭证门在
+/// 拿不到身份时一律按"证明不了归属 → 保留"处理，方向永远是宁可不删。
 pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::win32_fs::file_identity(path)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         None
@@ -1244,8 +1252,8 @@ impl ClaimedOutput {
     fn still_ours(&self) -> bool {
         match (self.identity, file_identity(&self.path)) {
             (Some(expected), Some(actual)) => expected == actual,
-            // 没有身份可比（非 unix / 文件已消失）：文件已消失时删除无意义也无害；
-            // 非 unix 平台退化为旧行为，维持平台覆盖面。
+            // 取不到身份（其他平台、或这个位置根本打不开）：文件已经不在了才无事可做，
+            // 还在就一律不碰 —— 证明不了归属就不删。
             (None, None) => !self.path.exists(),
             _ => false,
         }

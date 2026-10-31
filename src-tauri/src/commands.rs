@@ -4041,7 +4041,13 @@ mod tests {
 
         assert_eq!(
             result.output_path.as_deref(),
-            Some(output_root.join("nested/photo.png").to_string_lossy().as_ref())
+            Some(
+                output_root
+                    .join("nested")
+                    .join("photo.png")
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
     }
 

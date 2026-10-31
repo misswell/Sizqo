@@ -16,6 +16,8 @@ mod source_root;
 mod system_info;
 #[cfg(target_os = "macos")]
 mod system_image;
+#[cfg(windows)]
+mod win32_fs;
 
 use commands::AppState;
 use std::collections::HashSet;

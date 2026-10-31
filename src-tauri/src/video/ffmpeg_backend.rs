@@ -30,6 +30,8 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
             let backup_root=logs.parent().ok_or("Application data directory missing")?;
             let mut needed_backup=source_probe.size_bytes.saturating_add(64*1024*1024);
             #[cfg(unix)]{use std::os::unix::fs::MetadataExt;if fs::metadata(parent).map_err(|e|e.to_string())?.dev()==fs::metadata(backup_root).map_err(|e|e.to_string())?.dev(){needed_backup=needed_backup.saturating_add(needed);}}
+            // Windows 上"是不是同一块盘"看卷号；查不到就按同一盘处理（多要空间是安全方向）。
+            #[cfg(windows)]{let same=match (crate::win32_fs::volume_id_of_path(parent),crate::win32_fs::volume_id_of_path(backup_root)){(Some(a),Some(b))=>a==b,_=>true};if same{needed_backup=needed_backup.saturating_add(needed);}}
             if transaction::available_space(backup_root)?<needed_backup{return Err("Insufficient disk space for the persistent original backup and encoded output".into());}
             result.warnings.push(format!("Replace keeps a persistent original backup of {} bytes",source_probe.size_bytes));
             Some(history.ensure_backup_verified(&source,identity.sha256.as_deref()).map_err(|e|e.to_string())?)

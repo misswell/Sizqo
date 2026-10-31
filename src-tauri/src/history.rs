@@ -2634,15 +2634,28 @@ mod tests {
         assert!(store.find_latest_for_source(&entry.source_path).is_none());
     }
 
-    /// Windows 上「删不掉」的自然形态：另一个句柄还开着（没给 FILE_SHARE_DELETE），
-    /// `remove_file` 直接 ACCESS_DENIED。权限位在那边不管用，所以这一支单独造现场，
+    /// Windows 上「删不掉」的自然形态：另一个句柄还开着且**不给共享删除位**，
+    /// `remove_file` 直接 sharing violation。权限位在那边不管用，所以这一支单独造现场，
     /// 断言的是同一句实话 —— 平台不同，契约不能不同。
+    ///
+    /// 共享位必须精确到 `READ | WRITE`，两个方向都会把这条测试变成假绿：
+    /// - std 的 `File::open` 默认带 `FILE_SHARE_DELETE`，那种"打开中"拦不住删除
+    ///   （只是延后到句柄关闭），"删不掉"被悄悄测成"删得掉"；
+    /// - `share_mode(0)` 又过头：恢复要先读产物指纹做归属判定，独占会把这步一起打死，
+    ///   于是走的是"证明不了归属所以不删"，跟"删的时候失败"根本不是同一条分支。
     #[cfg(windows)]
     #[test]
     fn an_output_held_open_by_another_handle_fails_cleanup_but_not_the_restore() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
         let dir = tempfile::tempdir().unwrap();
         let (store, entry, source, output, _) = output_cleanup_failure_scene(dir.path());
-        let blocker = fs::File::open(&output).unwrap();
+        let blocker = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&output)
+            .unwrap();
         let report = store
             .restore(&entry, false, false, open_access().as_ref(), &mut || false)
             .unwrap();

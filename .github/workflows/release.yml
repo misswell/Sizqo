@@ -280,7 +280,7 @@ jobs:
         shell: pwsh
         run: |
           $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-          if ($conf.version -match '-(pre.*)$') {
+          if ($conf.version -match '-') {
             $numeric = ($conf.version -split '-')[0]
             $conf.version = $numeric
             $conf | ConvertTo-Json -Depth 32 | Set-Content src-tauri/tauri.conf.json -Encoding UTF8
@@ -482,7 +482,9 @@ jobs:
           path: artifacts
 
       - name: Prepare release files
+        id: kind
         run: |
+          set -euo pipefail
           mkdir -p release
           find artifacts -name "*.dmg" -exec cp {} release/ \;
           find artifacts -name "*.exe" -exec cp {} release/ \;
@@ -492,17 +494,28 @@ jobs:
           find artifacts -name "*.tar.gz" -exec cp {} release/ \;
           find artifacts -name "*.sig" -exec cp {} release/ \;
           VERSION="${RELEASE_TAG#v}"
-          ARCHIVE="Sizqo_${RELEASE_TAG}_macos_universal.app.tar.gz"
-          SIGNATURE="$(cat "release/${ARCHIVE}.sig")"
-          DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${ARCHIVE}"
-          jq -n \
-            --arg version "$VERSION" \
-            --arg notes "Sizqo ${VERSION}" \
-            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --arg signature "$SIGNATURE" \
-            --arg url "$DOWNLOAD_URL" \
-            '{version:$version,notes:$notes,pub_date:$pub_date,platforms:{"darwin-aarch64":{signature:$signature,url:$url},"darwin-x86_64":{signature:$signature,url:$url}}}' \
-            > release/latest.json
+          # 带 '-' 的标签就是预发布（vX.Y.Z-rc.N）。它绝不能变成 "latest"，
+          # 也不能生成 latest.json —— 那等于把在线更新源指向一个门禁还没齐的构建。
+          case "${RELEASE_TAG}" in
+            *-*) PREVIEW=true ;;
+            *)   PREVIEW=false ;;
+          esac
+          echo "preview=${PREVIEW}" >> "${GITHUB_OUTPUT}"
+          if [ "${PREVIEW}" = true ]; then
+            echo "预发布 ${RELEASE_TAG}：不产出 latest.json，应用内更新源保持指向上一个正式版"
+          else
+            ARCHIVE="Sizqo_${RELEASE_TAG}_macos_universal.app.tar.gz"
+            SIGNATURE="$(cat "release/${ARCHIVE}.sig")"
+            DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${ARCHIVE}"
+            jq -n \
+              --arg version "$VERSION" \
+              --arg notes "Sizqo ${VERSION}" \
+              --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --arg signature "$SIGNATURE" \
+              --arg url "$DOWNLOAD_URL" \
+              '{version:$version,notes:$notes,pub_date:$pub_date,platforms:{"darwin-aarch64":{signature:$signature,url:$url},"darwin-x86_64":{signature:$signature,url:$url}}}' \
+              > release/latest.json
+          fi
           ls -la release/
 
       - name: Create GitHub Release
@@ -542,5 +555,7 @@ jobs:
           files: release/*
           fail_on_unmatched_files: true
           draft: false
-          prerelease: false
-          make_latest: true
+          # 预发布标签（vX.Y.Z-rc.N）标成 pre-release 且不抢 "latest"：
+          # 验收矩阵/许可/公证链路没跑完之前，正式版才是用户默认拿到的那一个。
+          prerelease: ${{ steps.kind.outputs.preview == 'true' }}
+          make_latest: ${{ steps.kind.outputs.preview != 'true' }}

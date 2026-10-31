@@ -25,10 +25,16 @@ jobs:
         run: cargo test --test crash_injection -- --nocapture
       - name: contract vectors (Rust side)
         working-directory: src-tauri
-        run: cargo test --lib rust_executes_every_contract
-      - name: real media matrix (bundled ffmpeg, --ignored)
+        run: cargo test --lib rust_executes_every_contract -- --nocapture
+      - name: real media matrix (--ignored 真实编码，需要真的 FFmpeg 引擎)
         working-directory: src-tauri
-        run: cargo test --lib real -- --ignored
+        # Linux runner 既不随包 resources/video（那是 macOS 的 Mach-O 二进制），
+        # PATH 上也没有 ffmpeg —— 上一轮这一步 0 passed / 2 failed，panic 在
+        # "找不到 ffmpeg"。装一个系统引擎让这条门禁真的跑，而不是把测试挪走。
+        run: |
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -hide_banner -encoders | grep -q libx264
+          cargo test --lib real -- --ignored
 
   # macOS 才成立的行为（ImageIO 系统转换等）以前只被 swift-checks 间接碰到，
   # 没有任何作业真的在 macOS 上跑 cargo test —— 平台分支的断言因此无人守。
@@ -79,7 +85,7 @@ jobs:
         run: cargo test --lib
       - name: contract vectors (Windows side)
         working-directory: src-tauri
-        run: cargo test --lib rust_executes_every_contract
+        run: cargo test --lib rust_executes_every_contract -- --nocapture
 
   appstore-tests:
     runs-on: ubuntu-22.04

@@ -12,7 +12,8 @@ pub fn available_space(path:&Path)->Result<u64,String>{
         if unsafe{libc::statvfs(c.as_ptr(),stats.as_mut_ptr())}!=0{return Err(std::io::Error::last_os_error().to_string());}
         let stats=unsafe{stats.assume_init()};return Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64));
     }
-    #[cfg(not(unix))]{let _=path;Err("Disk-space verification is unavailable on this platform".into())}
+    #[cfg(windows)]{return crate::win32_fs::available_space(path);}
+    #[cfg(not(any(unix,windows)))]{let _=path;Err("Disk-space verification is unavailable on this platform".into())}
 }
 pub fn destination(source:&Path,o:&VideoOptions,roots:&[String])->Result<PathBuf,String>{
     if o.output_mode=="replace"{

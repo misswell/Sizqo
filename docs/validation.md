@@ -1552,9 +1552,10 @@ md5 `bb6f122a…` 一致，三者复跑均为绿。
 - **Windows 运行时**：本轮只做到"CI 里有作业真的跑 `cargo test --lib`"，其结果待推送
   后以 Actions 为准；本机无法交叉编译（见 P0-3 取证限制）。在拿到 `windows-tests` 的
   绿色记录之前，Windows 线的目录 fsync 与隔离改名都按"未验证"处理。
-- **非 unix 平台的 inode 凭证**：`file_identity` 在非 unix 返回 `None`，归属判定的第一
-  依据退化为内容对账；只有 `output_sha256` 也没记上的老日志才会走"一律保留"。
-  宁留孤儿残骸（可能残留 `.tmp`），不删别人的字节。
+- **非 unix 平台的 inode 凭证**：~~`file_identity` 在非 unix 返回 `None`~~ —— Windows
+  已在 0.3.6-rc.5 补上卷号 + 文件号（见下方第四轮）；只剩"其他平台"这一支仍返回
+  `None`，此时归属判定退化为内容对账，只有 `output_sha256` 也没记上的老日志才会走
+  "一律保留"。宁留孤儿残骸（可能残留 `.tmp`），不删别人的字节。
 - **不让硬链接的卷**（部分网络盘 / FAT）：`install_at_free_path` 退化为"查空 + 改名"，
   该窗口非原子；最坏结果是拒绝提交，不是删他人内容。
 - **Swift 无进程级崩溃注入**：以可直接驱动的原语（`TempOwnership` /
@@ -1562,6 +1563,97 @@ md5 `bb6f122a…` 一致，三者复跑均为绿。
   `CreateNew` 的端到端崩溃注入仍未单独补（语义与图片共用 `output_transaction`）。
 - **发布门禁**：签名应用 GUI 点击验收、App Store 沙盒运行时、FFmpeg GPL 对应源码
   义务与 §11 fixture 矩阵其余条目**未完成** → `v0.3.6-rc.4` 依旧只是预发布标签。
+
+## 第四轮：Windows 运行时补齐与 CI 缺口（2026-11-01，0.3.6-rc.5）
+
+上一轮把 `windows-tests` 从"只做 `cargo check`"改成"真的 `cargo test --lib`"，这是它
+第一次带回运行时结论：**241 passed / 7 failed**（run 41229460016）。本轮逐条对着源码
+查这 7 项的根因并修，不做"改断言迁就平台"的动作；同时修掉 CI 暴露出的另外三处
+门禁本身的问题。
+
+### 7 项失败的根因与处置
+
+| CI 报出的位置 | 根因 | 处置 |
+| --- | --- | --- |
+| `contract_vectors.rs:475` `output_retirement.json :: empty_placeholder_deleted_with_credential`（实际 kept，期望 deleted） | `file_identity()` 在 Windows 返回 `None` → 空占位的 `(dev,ino)` 凭证门永远开不了 | 新增 `src-tauri/src/win32_fs.rs`：`GetFileInformationByHandle` 取 `(dwVolumeSerialNumber, nFileIndex)`，与 unix 的 `(dev,ino)` 同语义 |
+| `output_transaction.rs:2016` 空占位凭身份凭证清账 | 同上 | `file_identity` 改 unix / windows / 其他 三分支 |
+| `output_transaction.rs:2137` 临时残骸要清掉 | 同上（临时名认领凭证也取自身份） | `SourceIdentity::read` 与 `fd_identity` 同样补 Windows 分支 |
+| `commands.rs:4543`「测试前提没立住：改动后的 size/mtime/inode 必须和改动前一致」 | `set_times` 是 `#[cfg(not(unix))] → Ok(())` 的桩：Windows 上时间戳根本没钉回去，那条测试测的不是"内容指纹"那一支 | `win32_fs::set_times` 用 `SetFileTime`（创建时间传 `NULL` 不动），`source_identity` 与 `contract_vectors::freeze_mtime` 都换成真实现 |
+| `commands.rs:4042` 左侧 `\` 右侧 `/` | 测试自己写了 `join("nested/photo.png")`，Windows 的 `join` 不折叠这个组件里的分隔符；生产代码是按组件拼的 | 改成 `join("nested").join("photo.png")`，断言的内容（产物落进已选根的子层级）一字未减 |
+| `history.rs:2611` `assert!(output.exists())` | "另一个句柄开着"的现场用的是 `fs::File::open`，而 std 默认共享位含 `FILE_SHARE_DELETE` → 删除照样成功（只是延后到关闭），"删不掉"被测成"删得掉" | 显式 `share_mode(FILE_SHARE_READ \| FILE_SHARE_WRITE)`。`share_mode(0)` 也不行：那会连恢复自己读产物指纹这一步一起打死，走的是"证明不了归属所以不删"，不是"删的时候失败" |
+| `image_capabilities.rs:280` `Direct 缺少 webp 输出` | `resources/bin` 里全是 macOS 的 Mach-O 二进制，Windows 找的是 `cwebp.exe` —— 这台机器上**真的**没有。测试断言的是"随包带了编码器"这条只在 macOS/Linux 成立的事实 | 每个平台断言各自成立的那一半（jpg/png 有进程内兜底，任何平台都必须可用；webp 的 `available` 必须等于 `tool_available("cwebp")`，不可用时必须点名缺哪个编码器且不许进输出目标），另加一条跨平台的"不可用格式必须自证理由"门 |
+
+Windows 的 Direct 轨因此如实报告"这台机器写不出 webp/gif/avif/jxl"：不是回归，是随包
+现状。要翻成"可用"得先补 `*.exe` 的打包，不是改断言。
+
+### 顺带修掉的两个 Windows 真实功能缺口
+
+`video::transaction::available_space` 此前在非 unix 直接 `Err("Disk-space verification
+is unavailable on this platform")`，而它在编码前的第一个检查点就被 `?` 使用 ——
+Windows 的视频轨因此在**还没开始编码时**就整条失败。现在走
+`GetDiskFreeSpaceExW`。同盘的备份空间合并估算（AGENTS 规则 5）原来只有 unix 的
+`dev()` 能判，现在 Windows 比卷号；判不出来时按"同一块盘"处理，多要空间是安全方向。
+
+新模块刻意**不引入 `windows-sys` 依赖**：符号用 `#[link(name = "kernel32")]` 裸声明
+（std 本来就链着它），离线 vendoring 与镜像风险为零。unix 分支一行未动。
+
+### 契约向量门禁不再"只报第一条"
+
+`assert_eq!` 写在循环里，于是一个平台上第一条不一致就中止，后面每一条的该平台表现
+**从未被看过** —— CI 那次只报了 1 条向量不一致，不代表其余 31 条在 Windows 上是对的。
+改成逐条收集、末尾一次性报出，并把成功时的"32 条一致"打进日志（CI 步骤加
+`-- --nocapture`，与崩溃注入同一套自证要求）。
+
+### 发布与 CI 的三处缺口（Release run 41229469102）
+
+- `build-windows` 失败在 `optional pre-release identifier in app version must be
+  numeric-only … for msi target`。工作流里**本来就有**去后缀那一步，但它的正则是
+  `-(pre.*)$`，`0.3.6-rc.4` 的 `rc.4` 不匹配 → 版本串原样进了 MSI 打包。改成匹配
+  任意 `-`，与 Linux 分支（早就按 `*-*` 处理）对齐。
+- `release` 作业写死 `prerelease: false` + `make_latest: true`，且无条件生成
+  `latest.json`。也就是说：**只要 Windows 打包一绿，一个 rc 标签就会成为仓库的
+  "latest"，并把应用内更新源指向门禁未齐的构建**。现在按标签判定 —— 带 `-` 的
+  （`vX.Y.Z-rc.N`）标成 pre-release、不抢 latest、不产 `latest.json`。
+- `real media matrix` 在 Ubuntu 上从没真的跑过：runner 既没有随包 `resources/video`
+  （那是 Mach-O），PATH 上也没有 ffmpeg，`process::command("ffmpeg")` 直接 panic
+  （`ffmpeg_backend.rs:130` 等），报的是 0 passed / 2 failed。现在先装 ffmpeg 并
+  断言 `libx264` 在场，再跑 `--ignored` —— 让门禁真跑，而不是把测试挪走。
+
+### 本轮门禁命令与结果（macOS 本机，2026-11-01）
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib` | 259 passed / 0 failed / 2 ignored（23.58s），EXIT=0 |
+| `cargo test --lib --features inproc-backends` | 261 / 0 / 0（43.01s），EXIT=0 |
+| `cargo test --no-default-features --features inproc-backends` | lib 261 / 0；集成 6 / 0 与 5 / 0；EXIT=0 |
+| `cargo test --test crash_injection -- --nocapture` | 6 阶段逐条打印 + 每阶段二次恢复幂等，EXIT=0 |
+| `cargo test --lib rust_executes_every_contract -- --nocapture` | 「契约向量 32 条与 Swift 期望一致」，EXIT=0 |
+| `cargo test --lib real -- --ignored` | 2 passed（含 `s11_real_media_matrix`，捆绑 FFmpeg 实编实探），EXIT=0 |
+| `npm run test:frontend` | 全绿 EXIT=0；基准 N=1000 scroll×100=48.4ms、N=5000=95.7ms、N=10000=121.3ms（windowRows=20），10k 全量参考 first=245.8ms / clean=10.51ms |
+| `bash scripts/test_swift_history.sh` | 546 项 `ok`、0 项 FAIL，EXIT=0 |
+| `rustc --crate-type lib --target x86_64-pc-windows-msvc src/win32_fs.rs` | EXIT=0（新模块单独通过 Windows 目标类型检查） |
+
+测试数从 258 → 259（default）、260 → 261（inproc / appstore）：新增
+`every_unavailable_format_explains_itself_and_stays_out_of_the_targets` 一条，无删除。
+
+### 本轮负向对照
+
+| 亲手拆的门 | 期望的失败 | 实测 |
+| --- | --- | --- |
+| 契约向量注入 3 条假结果（`same_size_*`、`empty_placeholder_*`） | 一次报全，而不是只报第一条 | `契约向量不一致 3 条（本轮跑了 32 条）` + 逐条列出，EXIT=101 |
+| 把 `tiff` 的不可用理由改成 `None` | 新的"不可用必须自证理由"门必须响 | 该测试 FAILED，其余 5 条仍绿，EXIT≠0 |
+
+两处改完都从 `/tmp` 逐字节还原并核对 md5（`89a15ecb…`、`c98f884f…`），还原后复跑为绿。
+
+### 仍未取证的部分（如实）
+
+- 本机交叉编译依旧不可行（`ring` 的 cc-rs 报 `'assert.h' file not found`），所以
+  Windows 分支里除 `win32_fs.rs` 单独过了目标类型检查外，其余（`source_identity`、
+  `output_transaction`、`history` 的 `share_mode` 现场、`commands` 的路径、
+  `image_capabilities` 的 Windows 半条、`video` 的两个新原语）**只能由 CI 的
+  `windows-tests` 作业取证**。本轮同样不声称 Windows 已通过 —— 依据是推送后的
+  Actions 记录。
+- Windows / Linux 产物仍未签名（无对应签名链），正式版的门禁照旧不通。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 

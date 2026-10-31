@@ -49,7 +49,16 @@ fn freeze_mtime(path: &Path, moment: SystemTime) {
     unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), 0) };
 }
 
-#[cfg(not(unix))]
+/// Windows 上这个桩不能是空的：`fast_gate_ignores_same_size_same_mtime_edit` 这类向量的
+/// 前提就是"时间戳没动"，钉不住 mtime 时快速门会如实报"文件变了"，于是向量结果
+/// 与 Swift 期望不符 —— 而这条不符会掩盖后面所有向量的 Windows 表现。
+#[cfg(windows)]
+fn freeze_mtime(path: &Path, moment: SystemTime) {
+    crate::win32_fs::set_times(path, moment, moment)
+        .unwrap_or_else(|detail| panic!("{}: 钉住 mtime 失败（{detail}）", path.display()));
+}
+
+#[cfg(not(any(unix, windows)))]
 fn freeze_mtime(_path: &Path, _moment: SystemTime) {}
 
 fn store_in(dir: &Path) -> HistoryStore {
@@ -455,6 +464,7 @@ fn run_scenario(scenario: &str, dir: &Path) -> String {
 fn rust_executes_every_contract_vector_and_matches_swift_expectations() {
     let dir = contracts_dir();
     let mut checked = 0;
+    let mut mismatches: Vec<String> = Vec::new();
     let mut files: Vec<PathBuf> = fs::read_dir(&dir)
         .expect("tests/contracts 目录必须存在")
         .filter_map(|entry| entry.ok())
@@ -472,13 +482,22 @@ fn rust_executes_every_contract_vector_and_matches_swift_expectations() {
             let temp = tempfile::tempdir().unwrap();
             let actual = run_scenario(&scenario, temp.path());
             checked += 1;
-            assert_eq!(
-                actual, expected,
-                "契约向量不一致: {} :: {}",
-                file.file_name().unwrap().to_string_lossy(),
-                scenario
-            );
+            // 逐条收集，不在第一条不一致时就中止：某个平台上第一个错位会掩盖后面
+            // 每一条的真实表现，而日志里"只报了 1 条"和"只有 1 条"看着一模一样。
+            if actual != expected {
+                mismatches.push(format!(
+                    "{} :: {scenario}（实际 {actual}，期望 {expected}）",
+                    file.file_name().unwrap().to_string_lossy()
+                ));
+            }
         }
     }
+    assert!(
+        mismatches.is_empty(),
+        "契约向量不一致 {} 条（本轮跑了 {checked} 条）:\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
     assert!(checked >= 20, "契约向量数量不应缩水（实际 {checked}）");
+    println!("契约向量 {checked} 条与 Swift 期望一致");
 }

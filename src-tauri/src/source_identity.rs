@@ -68,7 +68,9 @@ impl SourceIdentity {
             use std::os::unix::fs::MetadataExt;
             Some((meta.dev(), meta.ino()))
         };
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let identity = crate::win32_fs::file_identity(path);
+        #[cfg(not(any(unix, windows)))]
         let identity = None;
         Ok(Self {
             size: meta.len(),
@@ -167,7 +169,12 @@ fn fd_identity(file: &fs::File) -> Result<SourceIdentity, SourceError> {
         use std::os::unix::fs::MetadataExt;
         Some((meta.dev(), meta.ino()))
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let identity = {
+        use std::os::windows::io::AsRawHandle;
+        crate::win32_fs::identity_of_handle(file.as_raw_handle())
+    };
+    #[cfg(not(any(unix, windows)))]
     let identity = None;
     Ok(SourceIdentity {
         size: meta.len(),
@@ -251,7 +258,14 @@ impl SourceIdentity {
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn set_times(path: &Path, accessed: SystemTime, modified: SystemTime) -> Result<(), SourceError> {
+        // 测试前提要靠真原语立住：这里是"钉回原时间戳"，桩实现等于什么都没做，
+        // 于是"同大小同 mtime 的原地改动"那一条在 Windows 上会假通过。
+        crate::win32_fs::set_times(path, accessed, modified).map_err(SourceError::Unreadable)
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn set_times(_: &Path, _: SystemTime, _: SystemTime) -> Result<(), SourceError> {
         Ok(())
     }
