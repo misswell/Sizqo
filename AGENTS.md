@@ -103,6 +103,13 @@ is incomplete. Preserve useful local artifacts and report their absolute paths.
 A local commit is not a GitHub push. Every push/Release must be linked in the reply.
 Never reuse old tags, OctoShrink resources/secrets/endpoints or unsigned assets.
 
+Owner directive (2026-10-31): each completed work round is pushed to `main`
+immediately in the same session — no "local commit only" endings. Tagging
+follows the gate above: while the release gate is incomplete, mark the
+work-complete state with a pre-release tag (`vX.Y.Z-rc.N`, never reusing
+numbers); the final `vX.Y.Z` tag and its formal Release are created only once
+the gate passes, together with the version-bump commit and artifacts.
+
 The MarukoToolbox-Rewrite repository is a fan tribute rewrite, not original
 Maruko source. Only its product/parameter ideas are referenced, without copying
 its code. FFmpeg with GPL encoders requires documented corresponding source and
