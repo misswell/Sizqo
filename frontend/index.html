@@ -111,6 +111,14 @@
     <main class="stage">
       <!-- ─── 本轮：意图条 + 清单 + 详情 ─── -->
       <section class="pane pane-workspace" id="mainView">
+        <!-- §3.4 人工恢复：启动恢复收不了口的现场（外部修改/老日志无凭证/凭证不符）。 -->
+        <div id="recoveryBanner" class="recovery-banner" hidden>
+          <div class="recovery-head">
+            <strong data-i18n-zh="检测到需要人工处理的恢复现场">Detected recovery scenes that need your decision</strong>
+            <span id="recoverySummary"></span>
+          </div>
+          <ul id="recoveryList" class="recovery-list"></ul>
+        </div>
         <div class="intent-bar" id="intentBar">
           <div class="intent-group" id="imageIntentGroup" data-intent-kind="image">
             <div class="intent-head">

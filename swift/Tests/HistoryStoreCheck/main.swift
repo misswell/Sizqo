@@ -2306,6 +2306,8 @@ do {
           "§44 对比窗口的恢复按钮没有被会话拦住")
 }
 
+runContractVectors()
+
 print(failures == 0
       ? "\n✓ Swift 历史 / 备份 / 暂停 / 停止 / 队列进度 / 设置默认折叠 / CPU 上限 / 结果契约 / 临时文件命名 / 输出命名与事务模式自检全部通过"
       : "\n✗ Swift 自检失败 \(failures) 项")

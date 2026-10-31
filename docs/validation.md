@@ -11,12 +11,16 @@ Last updated: 2026-10-31
 
 | Check | Command | Result |
 |-------|---------|--------|
-| Rust tests, Direct features | `cargo test` (in `src-tauri`) | ✅ 236 unit + 11 integration passed (2026-10-31; 2 ignored real-fixture suites run separately) |
+| Rust tests, Direct features | `cargo test` (in `src-tauri`) | ✅ 237 unit + 11 integration passed (2026-10-31, twice for stability) |
+| Rust process-level crash injection (SIGKILL × 6 phases + idempotent re-recovery) | `cargo test --test crash_injection` | ✅ passed (2026-10-31; also green under both inproc feature sets) |
 | Rust real-media matrix (bundled ffmpeg) | `cargo test --lib real -- --ignored` (in `src-tauri`) | ✅ 2 suites passed (2026-10-31) |
-| Rust tests, shared in-process engines | `cargo test --features inproc-backends` | ✅ 238 unit + 11 integration passed (2026-10-31) |
-| Rust tests, App Store feature set | `cargo test --no-default-features --features inproc-backends` | ✅ 238 unit + 11 integration passed (2026-10-31) |
-| Frontend suites | `npm run test:frontend` (27 suites) | ✅ all pass (2026-10-31) |
-| Swift history / backup / pause / queue / settings / result-contract self-checks | `bash scripts/test_swift_history.sh` | ✅ all pass (2026-10-31) |
+| Rust tests, shared in-process engines | `cargo test --features inproc-backends` | ✅ all passed (2026-10-31) |
+| Rust tests, App Store feature set | `cargo test --no-default-features --features inproc-backends` | ✅ all passed (2026-10-31) |
+| Dual-engine contract vectors (`tests/contracts/*.json`, executed by Rust AND Swift) | `cargo test --lib rust_executes_every_contract` + `bash scripts/test_swift_history.sh` [41] | ✅ 29 vectors × 2 engines identical (2026-10-31) |
+| Frontend suites incl. virtualization + perf benchmarks | `npm run test:frontend` (29 suites) | ✅ all pass (2026-10-31) |
+| Queue perf benchmark 1k/5k/10k | `node tests/perf-benchmark.cjs` | ✅ 10k: first=11.7ms, clean path=3.4ms, window rows=20, resort=10.9ms |
+| Swift history / backup / pause / queue / settings / result-contract / contract-vectors self-checks | `bash scripts/test_swift_history.sh` | ✅ all pass (2026-10-31) |
+| Swift full-source typecheck | `xcrun swiftc -typecheck …` all sources except SizqoApp.swift | ✅ EXIT=0 (2026-10-31). SizqoApp.swift carries 4 pre-existing strict-concurrency errors identical at HEAD `3891103`; the AppDelegate `@MainActor` fix added in this round makes the real build pass |
 
 ## 0.3.6 file-safety overhaul (working state, unreleased)
 
@@ -106,19 +110,66 @@ anything not listed as passed is **not** passed.
   panic 时该块文件按"探测失败"入队（带原因），其余块照常回收，整批不再
   静默消失。
 
+### Round 2 completions (2026-10-31, same working state)
+
+- **万级队列虚拟列表 + 排序脏标记**：`applyQueueView` 拆为"排序（脏检查）"与
+  "附着（窗口化）"两段；>200 项且存在真实滚动容器时只附着一屏 ±20 行
+  （垫片撑滚动高度），行 DOM 与业务状态彻底分离；进度事件连 O(N) map 都
+  不跑。专项测试 `tests/queue-virtualization.cjs`（10,000 项 → 窗口 ≤150 行）
+  与 `tests/perf-benchmark.cjs`（1k/5k/10k：10k 干净路径 3.4ms、首次 11.7ms、
+  全量重排 10.9ms；对照旧语义全量渲染 250ms）已进入 `npm run test:frontend`。
+- **tests/contracts/ 双引擎契约向量**：6 个 JSON 文件 29 条场景
+  （file_identity / backup_verification / history_conflict /
+  transaction_recovery / output_retirement / lifecycle_gate），Rust 执行器
+  `src/contract_vectors.rs` 与 Swift 执行器
+  `swift/Tests/HistoryStoreCheck/ContractVectors.swift` 对同一份期望作答。
+  上线即抓到并修复一处真实引擎分歧：Swift `BackupMeta` 合成 Codable 读不了
+  v1 legacy 记录（Rust serde defaults 可以）→ 补 decodeIfPresent 解码 +
+  显式成员构造器。含 manual_restore 两条向量。
+- **进程级崩溃注入**：`src-tauri/tests/crash_injection.rs`
+  （`harness = false`）——真实测试二进制在 6 个阶段
+  （备份后 / 记账后 / 临时产物后 / rename 后 / 历史落盘后 / legacy rename 后）
+  被 SIGKILL，父进程核对终态不变量并**二次恢复**证明幂等；三个特性矩阵全过。
+- **人工恢复 GUI**：Rust `list_pending_recoveries` /
+  `resolve_pending_recovery`（维护租约 + `confirmOverwrite` 确认门），
+  `output_transaction::describe_pending` / `manual_restore`；前端启动拉取、
+  横幅列出"当前文件 vs 原图备份"双方状态，恢复需确认弹窗（凭证不符时警告
+  加倍），i18n 全配；Swift 侧 `pendingRecoveryItems` /
+  `manualRestore` + `ManualRecoveryBanner`（SwiftUI 横幅 + 确认 alert），
+  全源 typecheck（除既有 app 入口问题）0 诊断。
+- **三轨真实构建（2026-10-31，不签名构建 + 开发签名核验）**：
+  - Direct：`scripts/build_all.sh` → `Sizqo_direct.app`（70M，ffmpeg/ffprobe
+    与 CLI 工具/dylib 齐备），Apple Development 身份签名，
+    `codesign --verify --deep --strict` 通过。
+  - App Store：`cargo tauri build --features appstore --config
+    tauri.conf.appstore.json` → `Sizqo.app`；bundle 自检通过（无 bin/lib/video
+    违规夹带）；**Apple Distribution**（U8U443D7ZL）+ app-sandbox entitlements
+    签名，`--verify --deep --strict` 通过，entitlements 含 app-sandbox /
+    user-selected.read-write / bookmarks.app-scope / network.client。
+  - Swift：`scripts/build_swift.sh` → `Sizqo_swift.app`（24M）。
+    修复既有 MainActor 严格并发错误（AppDelegate 标注 `@MainActor`，
+    与 HEAD `3891103` 对比确认是工具链更新暴露的既有问题）。
+  - 构建事故记录：App Store 线两次 E0463 `equator_macro`——既有的
+    Cargo 1.90 panic=abort 规避不完整，真正根因是**指纹与产物错配的陈旧
+    proc-macro 缓存**；定向清除 `target/release/{deps,.fingerprint}/equator*`
+    后重建即通过（脚本注释补充在
+    `docs/validation.md` 本节，供后续参考）。
+- **FFmpeg GPL 复核（0.3.6）**：`THIRD_PARTY_NOTICES.md` 已记录当日实测
+  `ffmpeg -version` 配置行；结论不变（libx264/libx265 → GPL-2.0-or-later，
+  源义务随发布页提供）；本轮代码改动只影响调用方式，不改变捆绑内容。
+
 ### Not done (never report as passed)
 
-- **万级队列虚拟列表 / 1,000–5,000–10,000 性能基准 / 排序脏标记**：未实现，
-  §8 的性能验收不通过。
-- **tests/contracts/ 双引擎 JSON 契约测试向量**：未建立（本轮以 Rust 单测 +
-  Swift 自检分别钉住同一批行为，统一向量仍在清单上）。
-- **人工恢复界面**：legacy/无法证明归属的事务现场保留 + 启动警告 + 日志，
-  专用 GUI（展示当前文件与备份、一键恢复）未建。
-- **FaultInjector 全链路崩溃注入**：Rust 覆盖快照中断/恢复幂等/凭证；
-  "编码中途强制结束进程"级注入未做。
-- **三平台构建/签名/公证、App Store 沙盒运行、FFmpeg GPL 源义务审查、
-  luna_worker 委托**：未执行（本环境无 codex CLI，luna_worker 不可用，
-  已按全局规则在会话报告中说明）。发布门禁未通过，0.3.6 不得发版。
+- **Developer ID 签名与公证**：本机钥匙串没有
+  「Developer ID Application」证书（仅有 Apple Development / Apple
+  Distribution），Direct 分发签名与 notarization 无法执行——凭据级阻塞，
+  需要用户在装有该证书的环境执行 `scripts/notarize.sh`。
+- **GUI 实际运行验收**（三轨界面点击、App Store 沙盒实际运行）：项目规则
+  禁止静默启动 GUI，未执行——留给用户按验收矩阵操作。
+- **真实旧版升级实测、真实大容量视频矩阵在慢卷/外置盘上的运行**：未验证。
+- **Windows / Linux 构建**：未执行（本机为 macOS arm64；两平台的
+  cross-build 需要各自环境）。
+- **发布动作本身**（tag/Release/上传）：门禁未齐前禁止，未执行。
 
 ## Track: Direct (`com.misswell.sizqo`)
 

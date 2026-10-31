@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "description": "双引擎契约向量：Rust 与 Swift 执行同一组场景，期望逐条一致",
+  "vectors": [
+    {
+      "scenario": "create_new_deleted_when_hash_matches",
+      "expected": {
+        "outcome": "deleted"
+      }
+    },
+    {
+      "scenario": "create_new_kept_when_content_differs",
+      "expected": {
+        "outcome": "kept"
+      }
+    },
+    {
+      "scenario": "empty_placeholder_deleted_with_credential",
+      "expected": {
+        "outcome": "deleted"
+      }
+    },
+    {
+      "scenario": "empty_placeholder_kept_without_credential",
+      "expected": {
+        "outcome": "kept"
+      }
+    }
+  ]
+}

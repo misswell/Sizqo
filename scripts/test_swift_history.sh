@@ -57,7 +57,8 @@ xcrun swiftc \
   "$SRC_DIR/Engine/CLIRunner.swift" \
   "$SRC_DIR/Engine/CompressionEngine.swift" \
   "$SRC_DIR/Engine/SystemImageConverter.swift" \
-  "$SWIFT_DIR/Tests/HistoryStoreCheck/main.swift"
+  "$SWIFT_DIR/Tests/HistoryStoreCheck/main.swift" \
+  "$SWIFT_DIR/Tests/HistoryStoreCheck/ContractVectors.swift"
 
 log "运行 Swift 历史自检"
 "$OUT_BIN"

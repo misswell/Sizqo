@@ -108,6 +108,8 @@ final class AppState: ObservableObject {
     @Published var items: [QueueItem] = []
     @Published var options = CompressOptions()
     @Published private(set) var isCompressing = false
+    /// §3.4 人工恢复现场：启动恢复收不了口（外部修改/老日志无凭证/凭证不符）。
+    @Published var manualRecoveries: [OutputTransactionStore.PendingRecoveryItem] = []
     /// 队列进度：**派生值**，不是某一轮的计数器。
     /// 停止之后重新开始一轮时，这一轮的目标变小了（只含 pending），
     /// 但用户看到的总进度不该从 40/100 掉回 0/60 —— 所以它属于队列，不属于批次。
@@ -200,6 +202,7 @@ final class AppState: ObservableObject {
                   recovered.committed, recovered.rolledBack)
         }
         for warning in recovered.warnings { NSLog("Sizqo 启动恢复未完成: %@", warning) }
+        manualRecoveries = transactions.pendingRecoveryItems(history: history)
         // `history.json` 读不出来时：改名留档 + 按备份重建恢复入口 + 本次禁止清理。
         if let report = history.takeStartupReport() {
             if let path = report.quarantinedTo {
@@ -1356,6 +1359,39 @@ final class AppState: ObservableObject {
     /// 历史行里依赖「当前没有压缩会话」的动作：恢复与删除结果都会改写源文件或产物。
     func historyActionBlocked(_ action: HistoryRowAction) -> Bool {
         restoreBlockedBySession && (action == .restore || action == .deleteOutput)
+    }
+
+    // MARK: §3.4 人工恢复现场
+
+    /// 刷新人工恢复现场清单（恢复处置后调用）。
+    func refreshManualRecoveries() {
+        manualRecoveries = transactions.pendingRecoveryItems(history: history)
+    }
+
+    /// 人工恢复处置：restore=false = 暂不处理（现场原样保留）；
+    /// restore=true 必须由界面先展示双方状态并拿到 confirmOverwrite 确认。
+    @discardableResult
+    func resolveManualRecovery(_ item: OutputTransactionStore.PendingRecoveryItem,
+                               restore: Bool, confirmOverwrite: Bool) -> String? {
+        guard let lease = scheduler.beginMaintenance() else {
+            return "压缩进行中，暂不能处理恢复现场"
+        }
+        defer { lease.release() }
+        guard let txn = transactions.list().first(where: { $0.historyId == item.historyId }) else {
+            refreshManualRecoveries()
+            return "这条恢复现场不存在（可能已被处理）"
+        }
+        if !restore {
+            refreshManualRecoveries()
+            return nil
+        }
+        if let error = transactions.manualRestore(txn, confirmOverwrite: confirmOverwrite) {
+            refreshManualRecoveries()
+            return error
+        }
+        transactions.finish(txn.id)
+        refreshManualRecoveries()
+        return nil
     }
 
     /// 恢复一条历史记录。压缩之后又被外部改过时先问用户，坚持才 force 覆盖；

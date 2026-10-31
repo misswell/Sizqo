@@ -67,6 +67,16 @@ FFmpeg n9.0.2 (https://ffmpeg.org/download.html), x264
 listed above. pngquant 3.0.3 and gifsicle are GPL binaries bundled in the same
 installer and are covered by the same source-offer approach.
 
+**Status for v0.3.6 (re-checked 2026-10-31):** the bundled binary is unchanged
+(`ffmpeg version 9.0.2`, Homebrew build, same configuration line captured live
+from `resources/video/bin/ffmpeg`):
+`--enable-shared --enable-pthreads --enable-version3 --enable-gpl --enable-libsvtav1 --enable-libopus --enable-libx264 --enable-libmp3lame --enable-libdav1d --enable-libvmaf --enable-libvpx --enable-libx265 --enable-openssl --enable-videotoolbox --enable-audiotoolbox --enable-neon`.
+GPL encoders (libx264, libx265) remain enabled → the bundled FFmpeg stays
+**GPL-2.0-or-later**; the source-offer list above still covers it and must be
+attached to the 0.3.6 release page before any public distribution. The 0.3.6
+code changes touch how Sizqo *invokes* FFmpeg (strict input decoding, metadata
+scope flags, passthrough) — they do not change what is bundled.
+
 FFmpeg homepage: https://www.ffmpeg.org — licenses: https://www.ffmpeg.org/legal.html
 
 ## Rust dependencies

@@ -3,13 +3,15 @@ pub mod video;
 mod video_commands;
 mod commands;
 pub mod engine;
-mod history;
+#[cfg(test)]
+mod contract_vectors;
+pub mod history;
 pub mod image_capabilities;
 pub mod image_memory;
-mod output_transaction;
+pub mod output_transaction;
 pub mod result_model;
 mod sandbox_access;
-mod source_identity;
+pub mod source_identity;
 mod source_root;
 mod system_info;
 #[cfg(target_os = "macos")]
@@ -546,6 +548,8 @@ pub fn run() {
             video_commands::get_video_capabilities,
             video_commands::validate_video_options,
             video_commands::validate_video_batch,
+            commands::list_pending_recoveries,
+            commands::resolve_pending_recovery,
             video_commands::get_video_presets,
             video_commands::save_video_preset,
             video_commands::start_video_session,

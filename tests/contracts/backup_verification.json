@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "description": "双引擎契约向量：Rust 与 Swift 执行同一组场景，期望逐条一致",
+  "vectors": [
+    {
+      "scenario": "backup_reused_when_current_bytes_match_record",
+      "expected": {
+        "outcome": "reused"
+      }
+    },
+    {
+      "scenario": "backup_new_slot_for_user_edit",
+      "expected": {
+        "outcome": "newSlot"
+      }
+    },
+    {
+      "scenario": "backup_new_slot_when_backup_bytes_tampered",
+      "expected": {
+        "outcome": "newSlot"
+      }
+    },
+    {
+      "scenario": "legacy_backup_without_evidence_not_reused",
+      "expected": {
+        "outcome": "newSlot"
+      }
+    },
+    {
+      "scenario": "legacy_backup_upgraded_with_history_evidence",
+      "expected": {
+        "outcome": "reused"
+      }
+    },
+    {
+      "scenario": "backup_chain_own_product_reuses_first_slot",
+      "expected": {
+        "outcome": "reused"
+      }
+    }
+  ]
+}

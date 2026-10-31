@@ -1885,3 +1885,20 @@ body.compare-page .compare-recompress { flex-shrink: 0; }
 @media (max-width: 560px) {
   .video-compare-dialog { inset: 4vh 3vw; padding: 10px; }
 }
+
+/* §3.4 人工恢复现场横幅：只陈述事实与选项，不替用户做决定。 */
+.recovery-banner {
+  margin: 10px 12px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--warn-border, #b58a2a66);
+  border-radius: 12px;
+  background: var(--warn-soft, #b58a2a14);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.recovery-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.recovery-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.recovery-item { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px; border-radius: 10px; background: var(--bg-content); }
+.recovery-item .recovery-paths { font-size: 12px; color: var(--text-secondary); word-break: break-all; }
+.recovery-item .recovery-actions { display: flex; gap: 8px; }

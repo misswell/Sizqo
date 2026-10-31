@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "description": "双引擎契约向量：Rust 与 Swift 执行同一组场景，期望逐条一致",
+  "vectors": [
+    {
+      "scenario": "same_size_same_mtime_edit_detected",
+      "expected": {
+        "outcome": "changed"
+      }
+    },
+    {
+      "scenario": "fast_gate_ignores_same_size_same_mtime_edit",
+      "expected": {
+        "outcome": "unchanged"
+      }
+    },
+    {
+      "scenario": "size_change_detected_by_fingerprint",
+      "expected": {
+        "outcome": "changed"
+      }
+    },
+    {
+      "scenario": "untouched_file_passes_verify",
+      "expected": {
+        "outcome": "unchanged"
+      }
+    },
+    {
+      "scenario": "missing_file_reported_changed",
+      "expected": {
+        "outcome": "changed"
+      }
+    }
+  ]
+}

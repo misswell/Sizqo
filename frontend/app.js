@@ -1480,6 +1480,12 @@ function getQueueProgress() {
 }
 
 function updateQueueSummary() {
+  // §8.2 完成类事件（starting/completed/failed/cancelled/deferred）只在当前
+  // 排序键真的依赖结果/状态时才重排：import/name 键的取值不随完成变化。
+  // 防御式调用：部分测试切片只装订 updateQueueSummary 本身，没有排序助手。
+  if (typeof markQueueSortDirtyIfResultDependent === 'function') {
+    markQueueSortDirtyIfResultDependent();
+  }
   // 拖放区只在清单为空时占这一块：清单非空时它是队列前面一块永远走不掉的画框，
   // `.dropzone` 又是 flex:1，会把行顶到看不见的那一边。收文件本来就不靠它——Tauri 的
   // 拖放事件是整个 webview 的，清单在的时候随时拖进来照样收（运行条上也有「追加」）。
@@ -1592,6 +1598,42 @@ function toggleQueueSortDirection() {
   applyQueueView();
 }
 
+// §8.2 排序脏标记：进度事件只刷一行，完成事件也只在本轮排序键真的会被
+// 结果/状态改变时（status/compressed/ratio）才重排；import/name/original
+// 三个键的取值不随完成变化，绝不因完成事件全量重排。
+var queueSortDirty = true;
+var queueSortState = { key: null, descending: null };
+/// 最近一次排序的完整序列（模块级持久）：附着阶段（含脏检查早退）都读它。
+var sortedQueueEntries = [];
+// §8.3 虚拟列表：可视窗口 + 上下各 20 行预载；行 DOM 与业务状态彻底分离。
+var queueVirtual = { topSpacer: null, bottomSpacer: null, stride: 62, overscan: 20 };
+function queueScroller(list) {
+  if (typeof list.closest !== 'function') return null;
+  return list.closest('.list-scroll');
+}
+function queueVirtualEnabled(list) {
+  var scroller = queueScroller(list);
+  if (!scroller) return false;
+  // 真实滚动容器才窗口化；测试桩与零高度容器（收起/隐藏页）走全量渲染。
+  var height = scroller.clientHeight || 0;
+  return height > 0 && files.length > 200;
+}
+function measureQueueStride(list) {
+  for (var key in fileRows) {
+    var row = fileRows[key];
+    if (row && typeof row.offsetHeight === 'number' && row.offsetHeight > 0) {
+      queueVirtual.stride = row.offsetHeight + 2;
+      return queueVirtual.stride;
+    }
+  }
+  return queueVirtual.stride;
+}
+function markQueueSortDirty() { queueSortDirty = true; }
+function markQueueSortDirtyIfResultDependent() {
+  var sort = document.getElementById('queueSortKey');
+  var key = sort ? sort.value : 'import';
+  if (key === 'status' || key === 'compressed' || key === 'ratio') queueSortDirty = true;
+}
 function applyQueueView() {
   var list = document.getElementById('fileQueueList');
   if (!list) return;
@@ -1604,6 +1646,13 @@ function applyQueueView() {
   if (direction) {
     direction.innerHTML = iconMarkup(queueSortDescending ? 'sort-desc' : 'sort-asc', true) + (queueSortDescending ? localizeUiText(' 降序') : localizeUiText(' 升序'));
     direction.setAttribute('aria-label', queueSortDescending ? localizeUiText('当前降序，点击切换升序') : localizeUiText('当前升序，点击切换降序'));
+  }
+  // §8.2 脏检查在**构建 entries 之前**：进度事件连 O(N) 的 map 都不做，
+  // 只重跑隐藏旗标与窗口附着。
+  var keyChanged = queueSortState.key !== key || queueSortState.descending !== queueSortDescending;
+  if (!queueSortDirty && !keyChanged) {
+    attachQueueView(list, failedOnly, mediaView, null);
+    return;
   }
   // 排序键也全部从 queueItems 读：DOM class 只负责画，不参与任何判断。
   var states = ['failed', 'running', 'pending', 'done', 'restored', 'removed'];
@@ -1630,8 +1679,23 @@ function applyQueueView() {
       : a.value - b.value;
     return (queueSortDescending ? -compared : compared) || a.index - b.index;
   });
+  queueSortState.key = key;
+  queueSortState.descending = queueSortDescending;
+  queueSortDirty = false;
+  sortedQueueEntries = entries;
+  attachQueueView(list, failedOnly, mediaView, null);
+}
+
+/// §8.2 §8.3 附着阶段：隐藏旗标是 O(N) 纯数据操作；DOM 移动只发生在
+/// 虚拟窗口内（>200 项且有真实滚动容器时），其余情况保持全量语义。
+function attachQueueView(list, failedOnly, mediaView, membersArg) {
   var visible = 0;
-  var members = new Set(files);
+  var members = membersArg || new Set(files);
+  // §8.3 行元素按需创建：fileRows 只是"已创建行"的缓存，不是队列本身；
+  // 业务状态（queueItems）与结果从不依赖行 DOM 是否存在。
+  Object.keys(fileRows).forEach(function(file) {
+    if (fileRows[file] === null) delete fileRows[file];
+  });
   Object.keys(fileRows).forEach(function(file) {
     // 「只看失败」也按 queueItems 判，不按 DOM class：类名只是画出来的结果，
     // 拿它当判据，一旦某处忘了同步 class，筛出来的东西就是错的。
@@ -1642,13 +1706,107 @@ function applyQueueView() {
     var mediaVisible = mediaView === 'all' || !item || !item.mediaKind || item.mediaKind === mediaView;
     fileRows[file].hidden = !members.has(file) || !mediaVisible || (failedOnly && !failedRow);
   });
-  entries.forEach(function(entry, index) {
-    if (!entry.row) return;
-    if (!entry.row.hidden) visible++;
-    if (list.children[index] !== entry.row) list.insertBefore(entry.row, list.children[index] || null);
-  });
+  var orderedEntries = sortedQueueEntries;
+  var windowed = queueVirtualEnabled(list);
+  if (windowed) {
+    var stride = measureQueueStride(list);
+    var scroller = queueScroller(list);
+    var viewport = scroller.clientHeight || 0;
+    var top = Math.max(0, Math.floor((scroller.scrollTop || 0) / stride) - queueVirtual.overscan);
+    var bottom = Math.min(orderedEntries.length,
+      Math.ceil(((scroller.scrollTop || 0) + viewport) / stride) + queueVirtual.overscan);
+    top = Math.min(top, Math.max(0, orderedEntries.length - 1));
+    // 隐藏行不占窗口名额：窗口对**可见序列**切片。未建行的文件按同一份
+    // 数据判据判可见性（queueItems 是唯一事实，行 DOM 只是画）。
+    var visibleEntries = orderedEntries.filter(function(entry) {
+      if (!entry.row) {
+        var failedRow = queueState(entry.file) === 'failed';
+        var item = queueItems.get(entry.file);
+        var mediaVisible = mediaView === 'all' || !item || !item.mediaKind || item.mediaKind === mediaView;
+        return members.has(entry.file) && mediaVisible && (!failedOnly || failedRow);
+      }
+      return !entry.row.hidden;
+    });
+    top = Math.min(top, Math.max(0, visibleEntries.length - 1));
+    bottom = Math.min(bottom, visibleEntries.length);
+    var windowEntries = visibleEntries.slice(top, bottom);
+    queueVirtual.topSpacer = ensureQueueSpacer(list, queueVirtual.topSpacer, 'queue-window-top');
+    queueVirtual.bottomSpacer = ensureQueueSpacer(list, queueVirtual.bottomSpacer, 'queue-window-bottom');
+    var topHeight = top * stride;
+    var bottomHeight = Math.max(0, visibleEntries.length - bottom) * stride;
+    if (typeof queueVirtual.topSpacer.style === 'object' && queueVirtual.topSpacer.style) {
+      queueVirtual.topSpacer.style.height = topHeight + 'px';
+      queueVirtual.bottomSpacer.style.height = bottomHeight + 'px';
+    } else {
+      queueVirtual.topSpacer.height = topHeight;
+      queueVirtual.bottomSpacer.height = bottomHeight;
+    }
+    var wanted = new Set(windowEntries.map(function(entry) { return entry.file; }));
+    Object.keys(fileRows).forEach(function(file) {
+      var row = fileRows[file];
+      if (!wanted.has(file) && row.parentNode === list) {
+        // 窗口外的行从 DOM 摘下但保留元素与 painted 状态：滚回来即见，不重建。
+        if (typeof row.remove === 'function') row.remove();
+        else if (list.removeChild && row.parentNode === list) list.removeChild(row);
+      }
+    });
+    windowEntries.forEach(function(entry) {
+      if (!entry.row) {
+        entry.row = createQueueRow(entry.file);
+        fileRows[entry.file] = entry.row;
+        paintQueueRow(entry.file);
+        var failedRow = queueState(entry.file) === 'failed';
+        var item = queueItems.get(entry.file);
+        var mediaVisible = mediaView === 'all' || !item || !item.mediaKind || item.mediaKind === mediaView;
+        entry.row.hidden = !members.has(entry.file) || !mediaVisible || (failedOnly && !failedRow);
+      }
+      if (entry.row.parentNode !== list) list.appendChild(entry.row);
+      visible++;
+    });
+  } else {
+    orderedEntries.forEach(function(entry, index) {
+      if (!entry.row) {
+        entry.row = createQueueRow(entry.file);
+        fileRows[entry.file] = entry.row;
+        paintQueueRow(entry.file);
+      }
+      if (!entry.row.hidden) visible++;
+      if (list.children[index] !== entry.row) list.insertBefore(entry.row, list.children[index] || null);
+    });
+    queueVirtual.topSpacer = removeQueueSpacer(list, queueVirtual.topSpacer);
+    queueVirtual.bottomSpacer = removeQueueSpacer(list, queueVirtual.bottomSpacer);
+  }
   var empty = document.getElementById('queueFilterEmpty');
   if (empty) empty.hidden = !failedOnly || visible > 0;
+}
+function ensureQueueSpacer(list, existing, id) {
+  if (existing && existing.parentNode === list) return existing;
+  if (existing && typeof existing.remove === 'function') existing.remove();
+  var spacer = typeof document.createElement === 'function'
+    ? document.createElement('div')
+    : { id: id, style: {}, parentNode: null };
+  spacer.id = id;
+  list.appendChild(spacer);
+  return spacer;
+}
+function removeQueueSpacer(list, existing) {
+  if (existing && typeof existing.remove === 'function') existing.remove();
+  return null;
+}
+/// 滚动时只重算窗口：rAF 节流，绝不触发排序或全量重绘。
+function installQueueScrollHandler() {
+  var list = document.getElementById('fileQueueList');
+  var scroller = list && queueScroller(list);
+  if (!scroller || typeof scroller.addEventListener !== 'function') return;
+  if (scroller.__sizqoScrollHooked) return;
+  scroller.__sizqoScrollHooked = true;
+  var scheduled = false;
+  scroller.addEventListener('scroll', function() {
+    if (scheduled) return;
+    scheduled = true;
+    var run = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : function(fn) { fn(); };
+    run(function() { scheduled = false; applyQueueView(); });
+  }, { passive: true });
 }
 
 async function renderFileQueue() {
@@ -1664,16 +1822,12 @@ async function renderFileQueue() {
     }
   });
 
-  var newFiles = [];
-  for (var i = 0; i < files.length; i++) {
-    if (!fileRows[files[i]]) {
-      var row = createQueueRow(files[i]);
-      fileRows[files[i]] = row;
-      newFiles.push(files[i]);
-    }
-    // appendChild also moves an existing row, preserving the queue order.
-    list.appendChild(fileRows[files[i]]);
-  }
+  // §8.3 不再为每个文件同步建行：行元素由 attachQueueView 按需创建，
+  // 万级导入不会一次性建 1 万个 DOM 子树。这里只记录"哪些是新文件"，
+  // 供尺寸回填使用。
+  var newFiles = files.filter(function(filePath) { return !fileRows[filePath]; });
+  markQueueSortDirty();
+  installQueueScrollHandler();
   applyQueueView();
   // Fetch file sizes for newly added rows only (preserve existing row state)
   if (newFiles.length > 0) {
@@ -1689,6 +1843,8 @@ async function renderFileQueue() {
         }
       }
     } catch (e) { /* ignore */ }
+    var sortEl = document.getElementById('queueSortKey');
+    if (sortEl && sortEl.value === 'original') markQueueSortDirty();
     applyQueueView();
   }
 }
@@ -4639,6 +4795,89 @@ function refreshHistoryIfOpen() {
   if (currentView === 'history') refreshHistory();
 }
 
+// ─── §3.4 人工恢复：启动恢复收不了口的现场 ─────────────────────────
+// 自动恢复证明不了归属（外部修改 / 老日志无凭证 / 备份凭证不符）时保留现场；
+// 这里把双方状态摆给用户，恢复原图必须拿到明确确认。
+var pendingRecoveries = [];
+
+async function refreshPendingRecoveries() {
+  try {
+    pendingRecoveries = (await invoke('list_pending_recoveries')) || [];
+  } catch (error) {
+    pendingRecoveries = [];
+    return;
+  }
+  paintRecoveryBanner();
+}
+
+function paintRecoveryBanner() {
+  var banner = document.getElementById('recoveryBanner');
+  if (!banner) return;
+  var list = document.getElementById('recoveryList');
+  var summary = document.getElementById('recoverySummary');
+  banner.hidden = pendingRecoveries.length === 0;
+  if (!list) return;
+  list.innerHTML = '';
+  if (summary) {
+    summary.textContent = pendingRecoveries.length > 0
+      ? localizeUiText('共 ') + pendingRecoveries.length + localizeUiText(' 个现场待处理')
+      : '';
+  }
+  pendingRecoveries.forEach(function(item) {
+    var li = document.createElement('li');
+    li.className = 'recovery-item';
+    var title = document.createElement('div');
+    title.textContent = localizeBackendText(item.detail) || item.status;
+    var paths = document.createElement('div');
+    paths.className = 'recovery-paths';
+    paths.textContent = localizeUiText('当前文件: ') + item.sourcePath
+      + (item.sourceExists ? localizeUiText('（存在，') + item.sourceSize + localizeUiText(' 字节）') : localizeUiText('（不存在）'))
+      + '\n' + localizeUiText('原图备份: ') + item.backupPath
+      + (item.backupExists ? localizeUiText('（存在，') + item.backupSize + localizeUiText(' 字节）') : localizeUiText('（已丢失）'));
+    if (item.voucherMatch === false) {
+      paths.textContent += '\n' + localizeUiText('警告：备份字节与记账时的指纹不符');
+    }
+    var actions = document.createElement('div');
+    actions.className = 'recovery-actions';
+    var restoreBtn = document.createElement('button');
+    restoreBtn.className = 'btn btn-primary';
+    restoreBtn.textContent = localizeUiText('恢复原图');
+    restoreBtn.onclick = function() { resolveRecovery(item, true); };
+    var dismissBtn = document.createElement('button');
+    dismissBtn.className = 'btn';
+    dismissBtn.textContent = localizeUiText('暂不处理');
+    dismissBtn.onclick = function() { resolveRecovery(item, false); };
+    actions.appendChild(restoreBtn);
+    actions.appendChild(dismissBtn);
+    li.appendChild(title);
+    li.appendChild(paths);
+    li.appendChild(actions);
+    list.appendChild(li);
+  });
+}
+
+async function resolveRecovery(item, restore) {
+  if (restore) {
+    var detail = localizeUiText('恢复原图会覆盖当前位置的文件：') + '\n' + item.sourcePath
+      + '\n\n' + localizeUiText('将写回的原图备份：') + '\n' + item.backupPath;
+    if (item.voucherMatch === false) {
+      detail += '\n\n' + localizeUiText('警告：这份备份的字节与记账时的指纹不符，恢复的内容可能不是当初的原图。');
+    }
+    if (!confirm(detail)) return;
+  }
+  try {
+    var outcome = await invoke('resolve_pending_recovery', {
+      historyId: item.historyId,
+      restore: restore,
+      confirmOverwrite: restore,
+    });
+    showToast(localizeBackendText(outcome.message) || localizeUiText('已处理'));
+  } catch (error) {
+    showToast(localizeUiText('处理失败: ') + (error.message || error));
+  }
+  await refreshPendingRecoveries();
+}
+
 async function restoreFromHistory(entry, force, acceptLegacy) {
   if (restoreBlockedBySession()) {
     showToast(restoreBlockedText());
@@ -5234,6 +5473,7 @@ function resetSettings() {
   updateQueueSummary();
   renderDetailPane();
 
+  refreshPendingRecoveries();
   invoke('get_app_version').then(v => {
     window.appVersion = v;
     initUpdatePanel();

@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "description": "双引擎契约向量：Rust 与 Swift 执行同一组场景，期望逐条一致",
+  "vectors": [
+    {
+      "scenario": "maintenance_blocks_batch",
+      "expected": {
+        "outcome": "blocked"
+      }
+    },
+    {
+      "scenario": "batch_blocks_maintenance",
+      "expected": {
+        "outcome": "blocked"
+      }
+    },
+    {
+      "scenario": "released_gate_allows_both",
+      "expected": {
+        "outcome": "allowed"
+      }
+    }
+  ]
+}

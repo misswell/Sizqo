@@ -692,6 +692,101 @@ final class OutputTransactionStore: @unchecked Sendable {
         }
     }
 
+    // MARK: - §3.4 人工恢复：现场分类与处置
+
+    /// 一个未完成事务此刻的归属判定（与 Rust `PendingRecoveryStatus` 同一契约）。
+    enum PendingRecoveryStatus: String {
+        case backupMissing, sourceMissing, foreignModified, legacyUnknown, voucherMismatch, autoResolvable
+    }
+
+    /// 人工恢复列表条目：GUI 据此展示双方状态让用户拍板。
+    struct PendingRecoveryItem {
+        let historyId: String
+        let sourcePath: String
+        let backupPath: String
+        let status: PendingRecoveryStatus
+        let detail: String
+        let sourceExists: Bool
+        let sourceSize: Int64
+        let backupExists: Bool
+        let backupSize: Int64
+        let voucherMatch: Bool?
+    }
+
+    /// 只读分类：启动恢复无法自动收口的现场（与 Rust `describe_pending` 一一对应）。
+    static func describePending(_ txn: ReplaceTransaction) -> (PendingRecoveryStatus, String) {
+        guard txn.mode == .replaceExisting else {
+            return (.autoResolvable, "新建模式事务由启动恢复自动收口")
+        }
+        guard fileExists(at: txn.backupPath) else {
+            return (.backupMissing, "原图备份已不在磁盘上")
+        }
+        guard fileExists(at: txn.sourcePath) else {
+            return (.sourceMissing, "源文件不在原位（启动恢复会自动写回原图）")
+        }
+        guard case .success(let current) = sha256OfFile(txn.sourcePath) else {
+            return (.foreignModified, "当前源文件读不出来")
+        }
+        if let expected = txn.backupSha256,
+           case .success(let actual) = sha256OfFile(txn.backupPath), actual != expected {
+            return (.voucherMismatch, "备份字节与事务凭证不符")
+        }
+        if txn.outputSha256 == current {
+            return (.autoResolvable, "源位置是本次产物，启动恢复会自动回滚")
+        }
+        if txn.originalSha256 == current {
+            return (.autoResolvable, "原图仍在原位，启动恢复只清残骸")
+        }
+        if txn.outputSha256 == nil && txn.originalSha256 == nil {
+            return (.legacyUnknown, "老版本日志没有身份记录，无法证明当前文件的归属")
+        }
+        return (.foreignModified, "源文件在事务结束前被外部修改过")
+    }
+
+    /// 人工恢复的"恢复原图"：GUI 必须已经把双方状态展示给用户并拿到确认 ——
+    /// 这里有意绕过"证明不了归属就拒绝"的自动门；凭证不符只随确认放行。
+    @discardableResult
+    func manualRestore(_ txn: ReplaceTransaction, confirmOverwrite: Bool) -> String? {
+        guard txn.mode == .replaceExisting else {
+            Self.retireGeneratedOutput(txn)
+            return nil
+        }
+        guard fileExists(at: txn.backupPath) else { return "备份已不存在，无法恢复原图" }
+        guard confirmOverwrite else { return "必须由用户确认覆盖当前位置的内容" }
+        if txn.backupSha256 != nil {
+            if let error = OutputTransactionStore.verifyBackupVoucher(txn) { return error }
+        }
+        do {
+            try HistoryStore.writeBackupBack(to: txn.sourcePath, backup: txn.backupPath)
+        } catch let error as RestoreError { return error.detail }
+        catch { return error.localizedDescription }
+        Self.removeGeneratedOutput(txn)
+        return nil
+    }
+
+    /// 启动恢复收不了口的现场清单（给 AppState 的恢复面板用）。
+    func pendingRecoveryItems(history: HistoryStore) -> [PendingRecoveryItem] {
+        list().compactMap { txn in
+            guard !history.containsCommitted(txn.historyId) else { return nil }
+            let (status, detail) = Self.describePending(txn)
+            guard status != .autoResolvable else { return nil }
+            let voucherMatch = txn.backupSha256.map { expected in
+                (try? sha256OfFile(txn.backupPath).get()) == expected
+            }
+            return PendingRecoveryItem(
+                historyId: txn.historyId,
+                sourcePath: txn.sourcePath,
+                backupPath: txn.backupPath,
+                status: status,
+                detail: detail,
+                sourceExists: fileExists(at: txn.sourcePath),
+                sourceSize: fileLength(txn.sourcePath),
+                backupExists: fileExists(at: txn.backupPath),
+                backupSize: fileLength(txn.backupPath),
+                voucherMatch: voucherMatch)
+        }
+    }
+
     /// 文件系统身份 `(dev,ino)`：占位凭证对账用。
     static func fileIdentity(_ path: String) -> (device: Int64, inode: UInt64)? {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),

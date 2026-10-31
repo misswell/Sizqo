@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "description": "双引擎契约向量：Rust 与 Swift 执行同一组场景，期望逐条一致",
+  "vectors": [
+    {
+      "scenario": "rollback_restores_when_source_is_staged_output",
+      "expected": {
+        "outcome": "restored"
+      }
+    },
+    {
+      "scenario": "residue_only_when_source_is_pristine_original",
+      "expected": {
+        "outcome": "residueOnly"
+      }
+    },
+    {
+      "scenario": "scene_preserved_when_source_is_foreign",
+      "expected": {
+        "outcome": "preserved"
+      }
+    },
+    {
+      "scenario": "legacy_unknown_source_preserved",
+      "expected": {
+        "outcome": "preserved"
+      }
+    },
+    {
+      "scenario": "legacy_source_equals_backup_residue_only",
+      "expected": {
+        "outcome": "residueOnly"
+      }
+    },
+    {
+      "scenario": "voucher_mismatch_refuses_restore",
+      "expected": {
+        "outcome": "preserved"
+      }
+    },
+    {
+      "scenario": "manual_restore_with_confirmation_restores",
+      "expected": {
+        "outcome": "restoredByUser"
+      }
+    },
+    {
+      "scenario": "manual_restore_refuses_without_confirmation",
+      "expected": {
+        "outcome": "refused"
+      }
+    }
+  ]
+}

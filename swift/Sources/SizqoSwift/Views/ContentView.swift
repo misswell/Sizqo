@@ -15,6 +15,17 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 TitleBarView(showSystemInfo: $showSystemInfo)
                 HairlineDivider()
+                // §3.4 人工恢复现场：自动恢复证明不了归属时，把双方状态摆给用户拍板。
+                if !appState.manualRecoveries.isEmpty {
+                    ManualRecoveryBanner(items: appState.manualRecoveries) { item, restore in
+                        if let error = appState.resolveManualRecovery(item,
+                                                                      restore: restore,
+                                                                      confirmOverwrite: restore) {
+                            appState.showToast(error)
+                        }
+                    }
+                    HairlineDivider()
+                }
 
                 HStack(spacing: 0) {
                     RailView()
@@ -1568,5 +1579,71 @@ extension Label {
         environment(\.symbolRenderingMode, .monochrome)
             // SwiftUI Label 原生间距约为 4-6，这里通过字体微调保持紧凑
             .font(.system(size: 12, weight: .medium))
+    }
+}
+
+
+// MARK: - §3.4 人工恢复现场横幅
+
+/// 把"当前文件 vs 原图备份"的状态摆出来，恢复必须拿到用户确认；
+/// 暂不处理 = 现场原样保留，随时可以再决定。
+struct ManualRecoveryBanner: View {
+    let items: [OutputTransactionStore.PendingRecoveryItem]
+    let onResolve: (OutputTransactionStore.PendingRecoveryItem, Bool) -> Void
+    @State private var confirming: OutputTransactionStore.PendingRecoveryItem?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("检测到需要人工处理的恢复现场")
+                    .font(.headline)
+                Spacer()
+                Text(String(format: "共 %d 个现场待处理", items.count))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(items, id: \.historyId) { item in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.detail).font(.subheadline)
+                    Text("当前文件: \(item.sourcePath)（\(item.sourceExists ? "存在，\(item.sourceSize) 字节" : "不存在")）")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("原图备份: \(item.backupPath)（\(item.backupExists ? "存在，\(item.backupSize) 字节" : "已丢失")）")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if item.voucherMatch == false {
+                        Text("警告：备份字节与记账时的指纹不符")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    HStack {
+                        Button("恢复原图") { confirming = item }
+                            .buttonStyle(.borderedProminent)
+                        Button("暂不处理") { onResolve(item, false) }
+                        Spacer()
+                    }
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.08)))
+            }
+        }
+        .padding(12)
+        .alert("恢复原图会覆盖当前位置的文件", isPresented: Binding(
+            get: { confirming != nil },
+            set: { if !$0 { confirming = nil } }
+        )) {
+            Button("仍要恢复", role: .destructive) {
+                if let item = confirming { onResolve(item, true) }
+                confirming = nil
+            }
+            Button("取消", role: .cancel) { confirming = nil }
+        } message: {
+            Text(confirming.map { item in
+                "当前文件: \(item.sourcePath)\n将写回的原图备份: \(item.backupPath)"
+                    + (item.voucherMatch == false
+                        ? "\n\n警告：这份备份的字节与记账时的指纹不符，恢复的内容可能不是当初的原图。"
+                        : "")
+            } ?? "")
+        }
     }
 }

@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "description": "双引擎契约向量：Rust 与 Swift 执行同一组场景，期望逐条一致",
+  "vectors": [
+    {
+      "scenario": "conflict_when_output_content_differs",
+      "expected": {
+        "outcome": "conflict"
+      }
+    },
+    {
+      "scenario": "no_conflict_when_output_content_matches",
+      "expected": {
+        "outcome": "noConflict"
+      }
+    },
+    {
+      "scenario": "legacy_entry_conflict_by_mtime_drift",
+      "expected": {
+        "outcome": "conflict"
+      }
+    },
+    {
+      "scenario": "legacy_entry_no_conflict_when_size_mtime_match",
+      "expected": {
+        "outcome": "noConflict"
+      }
+    }
+  ]
+}

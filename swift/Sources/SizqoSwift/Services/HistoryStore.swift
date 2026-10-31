@@ -1345,6 +1345,45 @@ private struct BackupMeta: Codable {
     /// §2.2 v4：快照当时源文件的文件系统身份。恢复与复用多一道"还是那个 inode"的门。
     var sourceDevice: Int64? = nil
     var sourceInode: UInt64? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case version, sourcePath, createdAt, originalSize, originalModifiedAt
+        case originalExtension, sourceSha256, backupSha256, sourceDevice, sourceInode
+    }
+
+    init(version: Int = 2, sourcePath: String, createdAt: Int64,
+         originalSize: Int64 = 0, originalModifiedAt: Int64? = nil,
+         originalExtension: String = "", sourceSha256: String? = nil,
+         backupSha256: String? = nil, sourceDevice: Int64? = nil,
+         sourceInode: UInt64? = nil) {
+        self.version = version
+        self.sourcePath = sourcePath
+        self.createdAt = createdAt
+        self.originalSize = originalSize
+        self.originalModifiedAt = originalModifiedAt
+        self.originalExtension = originalExtension
+        self.sourceSha256 = sourceSha256
+        self.backupSha256 = backupSha256
+        self.sourceDevice = sourceDevice
+        self.sourceInode = sourceInode
+    }
+
+    /// §9.2 老版本来历记录必须解得开（与 Rust serde defaults 同一契约）：
+    /// 合成 Codable 对缺键直接抛错，会把升级用户的 v1/v2 备份当成"没有记录"，
+    /// 复用判定就走不到 legacy/升级分支。缺键按同款默认值补齐。
+    init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        version = try box.decodeIfPresent(Int.self, forKey: .version) ?? 2
+        sourcePath = try box.decode(String.self, forKey: .sourcePath)
+        createdAt = try box.decode(Int64.self, forKey: .createdAt)
+        originalSize = try box.decodeIfPresent(Int64.self, forKey: .originalSize) ?? 0
+        originalModifiedAt = try box.decodeIfPresent(Int64.self, forKey: .originalModifiedAt)
+        originalExtension = try box.decodeIfPresent(String.self, forKey: .originalExtension) ?? ""
+        sourceSha256 = try box.decodeIfPresent(String.self, forKey: .sourceSha256)
+        backupSha256 = try box.decodeIfPresent(String.self, forKey: .backupSha256)
+        sourceDevice = try box.decodeIfPresent(Int64.self, forKey: .sourceDevice)
+        sourceInode = try box.decodeIfPresent(UInt64.self, forKey: .sourceInode)
+    }
 }
 
 /// §2.3 一份既有备份此刻的可信程度（与 Rust `BackupVerification` 同一契约）。

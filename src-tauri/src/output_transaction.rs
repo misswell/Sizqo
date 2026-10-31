@@ -289,6 +289,106 @@ impl TransactionStore {
 /// 归入"需要人工恢复"计数，而不是和普通失败混在一起。
 pub const ROLLBACK_NEEDS_REVIEW: &str = "NEEDS_REVIEW: ";
 
+// MARK: - §3.4 人工恢复：现场分类与处置
+
+/// 一个未完成事务此刻的归属判定（只读，不动任何文件）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingRecoveryStatus {
+    /// 备份已经不在：恢复无从谈起。
+    BackupMissing,
+    /// 源文件不在原位：启动恢复本来就能自动处理，不进人工列表。
+    SourceMissing,
+    /// 源文件既不是承诺产物也不是原图：外部改过，需要用户裁决。
+    ForeignModified,
+    /// 老日志没有指纹，且源位置既非备份字节也证明不了归属。
+    LegacyUnknown,
+    /// 备份字节与事务凭证不符：备份被换过，需要用户裁决。
+    VoucherMismatch,
+    /// 自动恢复就能收口的（源=产物 → 回滚；源=原图 → 只清残骸）。
+    AutoResolvable,
+}
+
+impl PendingRecoveryStatus {
+    pub fn id(&self) -> &'static str {
+        match self {
+            Self::BackupMissing => "backup_missing",
+            Self::SourceMissing => "source_missing",
+            Self::ForeignModified => "foreign_modified",
+            Self::LegacyUnknown => "legacy_unknown",
+            Self::VoucherMismatch => "voucher_mismatch",
+            Self::AutoResolvable => "auto_resolvable",
+        }
+    }
+}
+
+/// 只读分类：启动恢复无法自动收口的现场，人工恢复界面据此展示双方状态。
+pub fn describe_pending(txn: &ReplaceTransaction) -> (PendingRecoveryStatus, String) {
+    if txn.mode != TransactionMode::ReplaceExisting {
+        return (PendingRecoveryStatus::AutoResolvable, "新建模式事务由启动恢复自动收口".into());
+    }
+    let backup = PathBuf::from(&txn.backup_path);
+    let source = PathBuf::from(&txn.source_path);
+    if !backup.exists() {
+        return (PendingRecoveryStatus::BackupMissing, "原图备份已不在磁盘上".into());
+    }
+    if !source.exists() {
+        return (PendingRecoveryStatus::SourceMissing, "源文件不在原位（启动恢复会自动写回原图）".into());
+    }
+    let current = match crate::source_identity::sha256_of(&source) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return (PendingRecoveryStatus::ForeignModified, format!("当前源文件读不出来（{error}）"))
+        }
+    };
+    // 凭证核对（只读）：备份与记账时对不上单独成类。
+    if let Some(expected) = txn.backup_sha256.as_deref() {
+        if let Ok(actual) = crate::source_identity::sha256_of(&backup) {
+            if actual != expected {
+                return (PendingRecoveryStatus::VoucherMismatch, "备份字节与事务凭证不符".into());
+            }
+        }
+    }
+    if txn.output_sha256.as_deref() == Some(current.as_str()) {
+        return (PendingRecoveryStatus::AutoResolvable, "源位置是本次产物，启动恢复会自动回滚".into());
+    }
+    if txn.original_sha256.as_deref() == Some(current.as_str()) {
+        return (PendingRecoveryStatus::AutoResolvable, "原图仍在原位，启动恢复只清残骸".into());
+    }
+    if txn.output_sha256.is_none() && txn.original_sha256.is_none() {
+        return (PendingRecoveryStatus::LegacyUnknown, "老版本日志没有身份记录，无法证明当前文件的归属".into());
+    }
+    (PendingRecoveryStatus::ForeignModified, "源文件在事务结束前被外部修改过".into())
+}
+
+/// 人工恢复的"恢复原图"执行：调用方（GUI）必须已经把当前文件与备份的
+/// 状态展示给用户并拿到明确确认 —— 这里**有意**绕过"证明不了归属就拒绝"
+/// 的自动门：人工恢复的全部意义就是让用户看过之后自己拍板。
+/// 备份凭证核对仍然执行：凭证不符只随 `confirm_voucher_mismatch` 放行。
+pub fn manual_restore(
+    txn: &ReplaceTransaction,
+    confirm_overwrite: bool,
+) -> Result<(), String> {
+    if txn.mode != TransactionMode::ReplaceExisting {
+        retire_generated_output(txn);
+        return Ok(());
+    }
+    let backup = PathBuf::from(&txn.backup_path);
+    let source = PathBuf::from(&txn.source_path);
+    if !backup.exists() {
+        return Err("备份已不存在，无法恢复原图".into());
+    }
+    if !confirm_overwrite {
+        return Err("必须由用户确认覆盖当前位置的内容".into());
+    }
+    if txn.backup_sha256.is_some() {
+        // 凭证在场的照常核对：备份在记账之后被换过这件事，确认弹窗里必须写明。
+        verify_backup_voucher(txn, &backup)?;
+    }
+    HistoryStore::write_backup_back_to_source(&backup, &source)?;
+    remove_generated_output(txn);
+    Ok(())
+}
+
 /// 用备份把真正原图写回源位置，再清掉这次生成的压缩结果。
 ///
 /// 备份本身**不删**：回滚半途失败时它是唯一的原图副本，留给历史页/下次启动处理。

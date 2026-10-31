@@ -24,6 +24,10 @@ struct SizqoApp: App {
     }
 }
 
+/// NSApplicationDelegate 的回调全部落在主线程；标注 @MainActor 让
+/// `AppState.exitCleanupPermitted()` / `AppState.current` 这类主线程状态
+/// 的访问通过新工具链的严格并发检查（语义不变：本就只在主线程调用）。
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)

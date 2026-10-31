@@ -2639,6 +2639,113 @@ fn entry_for_source(state: &AppState, file_path: &str) -> Option<HistoryEntry> {
         .find_latest_for_source(&canonical.to_string_lossy())
 }
 
+/// §3.4 人工恢复列表：启动恢复收不了口的现场（外部修改 / 老日志无凭证 /
+/// 备份凭证不符），GUI 据此展示双方状态让用户拍板。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRecoveryItem {
+    pub history_id: String,
+    pub source_path: String,
+    pub backup_path: String,
+    pub mode: String,
+    pub status: String,
+    pub detail: String,
+    pub source_exists: bool,
+    pub source_size: u64,
+    pub backup_exists: bool,
+    pub backup_size: u64,
+    /// 备份与事务凭证是否相符（老日志无凭证 = None）。
+    pub voucher_match: Option<bool>,
+    pub created_at: i64,
+}
+
+#[tauri::command]
+pub async fn list_pending_recoveries(state: State<'_, AppState>) -> Result<Vec<PendingRecoveryItem>, String> {
+    let mut items = Vec::new();
+    for txn in state.transactions.list() {
+        if state.history_store.contains_committed(&txn.history_id) {
+            continue;
+        }
+        let (status, detail) = output_transaction::describe_pending(&txn);
+        if matches!(status, output_transaction::PendingRecoveryStatus::AutoResolvable) {
+            // 自动恢复能收口的不进人工列表（启动恢复已处理；这里再出现说明
+            // 上次恢复失败，交给下次启动重试即可）。
+            continue;
+        }
+        let source = Path::new(&txn.source_path);
+        let backup = Path::new(&txn.backup_path);
+        let voucher_match = txn.backup_sha256.as_deref().map(|expected| {
+            crate::source_identity::sha256_of(backup)
+                .ok()
+                .as_deref()
+                == Some(expected)
+        });
+        items.push(PendingRecoveryItem {
+            history_id: txn.history_id.clone(),
+            source_path: txn.source_path.clone(),
+            backup_path: txn.backup_path.clone(),
+            mode: match txn.mode {
+                output_transaction::TransactionMode::ReplaceExisting => "replace".into(),
+                output_transaction::TransactionMode::CreateNew => "createNew".into(),
+            },
+            status: status.id().into(),
+            detail,
+            source_exists: source.exists(),
+            source_size: source.metadata().map(|m| m.len()).unwrap_or(0),
+            backup_exists: backup.exists(),
+            backup_size: backup.metadata().map(|m| m.len()).unwrap_or(0),
+            voucher_match,
+            created_at: txn.created_at,
+        });
+    }
+    Ok(items)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRecoveryResolution {
+    pub resolved: bool,
+    pub dismissed: bool,
+    pub message: String,
+}
+
+/// §3.4 人工恢复处置：`restore=false` = 暂不处理（现场原样保留）；
+/// `restore=true` 必须带 `confirmOverwrite` —— GUI 已把当前文件与备份的
+/// 状态展示给用户并拿到确认。维护租约全程在场。
+#[tauri::command]
+pub async fn resolve_pending_recovery(
+    state: State<'_, AppState>,
+    history_id: String,
+    restore: bool,
+    confirm_overwrite: Option<bool>,
+) -> Result<PendingRecoveryResolution, String> {
+    let _lease = match state.compression.begin_maintenance() {
+        Some(lease) => lease,
+        None => return Err("压缩进行中，暂不能处理恢复现场".to_string()),
+    };
+    let txn = state
+        .transactions
+        .list()
+        .into_iter()
+        .find(|txn| txn.history_id == history_id)
+        .ok_or_else(|| "这条恢复现场不存在（可能已被处理）".to_string())?;
+    if !restore {
+        return Ok(PendingRecoveryResolution {
+            resolved: false,
+            dismissed: true,
+            message: "现场已保留：原图备份与事务日志都在原处，随时可以再处理".into(),
+        });
+    }
+    output_transaction::manual_restore(&txn, confirm_overwrite.unwrap_or(false))
+        .map_err(|error| error)?;
+    state.transactions.finish(&history_id);
+    Ok(PendingRecoveryResolution {
+        resolved: true,
+        dismissed: false,
+        message: "原图已恢复，事务已销账".into(),
+    })
+}
+
 #[tauri::command]
 pub async fn restore_original(
     app: AppHandle,
