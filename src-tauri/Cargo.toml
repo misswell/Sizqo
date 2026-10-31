@@ -1,6 +1,6 @@
 [package]
 name = "sizqo"
-version = "0.3.6-rc.4"
+version = "0.3.6-rc.5"
 description = "Sizqo media compression"
 authors = ["Octor Team"]
 license = "MIT"
