@@ -1446,13 +1446,45 @@ fn commit_output(
         }
     }
     staged.settle();
-    // §2.2 覆盖的目录项必须落盘：rename 的持久化以父目录 fsync 为准，
-    // 否则断电后事务日志说覆盖了、目录项却没了。
+    // §2.2 覆盖的目录项必须落盘：rename 的持久化以父目录 fsync 为准。
+    // fsync 失败不能走 withdraw（产物已在目标位置）—— 用备份回滚成原图，
+    // 与"历史落盘失败"同一处置。
     if let Some(parent) = out_path.parent() {
-        crate::history::sync_dir(parent).map_err(OutputWriteError::OutputWriteFailed)?;
+        if let Err(error) = crate::history::sync_dir(parent) {
+            log::error!("提交后目录 fsync 失败，回滚: {error}");
+            if let Err(rollback) = output_transaction::rollback(&txn) {
+                return Err(OutputWriteError::RollbackFailed(format!(
+                    "目录 fsync 失败且回滚失败（{error}）；{rollback}"
+                )));
+            }
+            transactions.finish(&history_id);
+            return Err(OutputWriteError::OutputWriteFailed(format!(
+                "输出目录未能落盘，已用备份恢复原图: {error}"
+            )));
+        }
     }
 
     if cross_format {
+        // §28 审查修复：删除原图前的**最后一道身份门**。此前的 ①⑤ 复核
+        // 与删除之间隔着整个落盘流程，外部完全可能在窗口里改掉原图 ——
+        // 备份保住的是旧字节，用户刚写的新字节只有这次复核看得见。
+        // 改过 → 保留文件（跨格式产物照常成立），警告说清。
+        let identity_stale = match replace.as_ref() {
+            Some(identity) => !matches!(identity.verify(file_path), SourceCheck::Unchanged),
+            // 无基线（理论上不可能：cross_format 必有覆盖依据）时保守拒绝删除。
+            None => true,
+        };
+        if identity_stale {
+            log::warn!("跨格式替换：原图在提交窗口内被外部修改，已保留原文件");
+            result
+                .warnings
+                .get_or_insert_with(Vec::new)
+                .push(format!(
+                    "原文件在提交前被修改，已保留: {}（跨格式产物照常生成）",
+                    file_path.display()
+                ));
+            // 不 return：产物已落盘，历史照常记、事务照常销账 —— 只是原图留着。
+        }
         // 删不掉（权限/被占用）时不许静默：磁盘上会同时留着原图和新格式产物。
         // 产物已提交、历史已记，不能反过来撤销一次成功的压缩 —— 留警告给用户。
         if let Err(error) = fs::remove_file(file_path) {

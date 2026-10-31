@@ -126,6 +126,61 @@ context.applyQueueView();
 const attachedAfter = list.children.filter(node => node.file).map(node => node.file).join(',');
 assert.notEqual(attachedBefore, attachedAfter, '滚动改变窗口：附着集合必须跟着滚');
 assert.equal(context.queueItems.size, TOTAL, '业务状态从不依赖行 DOM');
-assert.ok(Object.keys(context.fileRows).length < TOTAL, '不预建一万行 DOM');
+
+// §8 审查修复回归：可见性是数据事实 —— 筛选开关往返后行必须回到可见序列。
+// 全量模式走一遍（小队列语义），虚拟模式走一遍（visibleFiles 缓存路径）。
+const smallFiles = ['/s1.png', '/s2.png', '/s3.png'];
+const smallList = {
+  children: [],
+  closest() { return null; },
+  appendChild(row) { row.parentNode = this; this.children.push(row); },
+  insertBefore(row, before) {
+    row.parentNode = this;
+    this.children = this.children.filter(x => x !== row);
+    const i = before ? this.children.indexOf(before) : -1;
+    if (i >= 0) this.children.splice(i, 0, row); else this.children.push(row);
+  },
+};
+const smallItems = new Map(smallFiles.map(f => [f, { path: f, state: 'pending' }]));
+const smallCtx = vm.createContext({
+  files: smallFiles, fileRows: {}, queueItems: smallItems,
+  queueSortDescending: false, mediaFilter: 'all',
+  basename: f => f, iconMarkup: n => n, resultHasProduct: () => false,
+  document: { getElementById: id => (id === 'fileQueueList' ? smallList : null) },
+  createQueueRow: file => ({
+    file, hidden: false, parentNode: null, offsetHeight: 60,
+    classList: { toggle() {} },
+    remove() { this.parentNode = null; },
+  }),
+  paintQueueRow: () => {}, localizeUiText: v => v,
+});
+installQueueCore(smallCtx);
+vm.runInContext(slice, smallCtx);
+smallCtx.applyQueueView();
+assert.equal(smallList.children.filter(n => n.file && !n.hidden).length, 3);
+// 标一个失败，开"只看失败"→ 非失败行隐藏；关掉 → 全部回来。
+smallItems.get('/s1.png').state = 'failed';
+smallCtx.applyQueueView();
+// 模拟 UI 打开 failedOnly：直接改控件值不可行（切片读 getElementById），
+// 这里经 applyQueueView 的数据通路验证：把 s2/s3 标为 hidden=true（旧渲染残留），
+// 关闭筛选后再 applyQueueView，必须按数据事实恢复。
+smallList.children.forEach(n => { if (n.file !== '/s1.png') n.hidden = true; });
+smallCtx.applyQueueView();
+assert.equal(smallList.children.filter(n => n.file && !n.hidden).length, 3,
+  '旧渲染残留的 hidden 不得把数据可见的行排挤出可见序列');
+
+// §8 审查修复回归：10k 全表往返滚动后 fileRows 必须有界（LRU 按窗口保护）。
+scroller.scrollTop = 0;
+context.applyQueueView();
+for (let hop = 0; hop <= TOTAL; hop += 500) {
+  scroller.scrollTop = hop * 62;
+  context.applyQueueView();
+}
+for (let hop = TOTAL; hop >= 0; hop -= 500) {
+  scroller.scrollTop = hop * 62;
+  context.applyQueueView();
+}
+assert.ok(Object.keys(context.fileRows).length <= 700,
+  `全表往返滚动后行缓存必须有界（实际 ${Object.keys(context.fileRows).length}，上限 600+窗口余量）`);
 
 console.log('PASS: 10000-item queue virtualizes to a bounded window with dirty-sort semantics');

@@ -1,0 +1,68 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust-tests:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev patchelf libssl-dev libgtk-3-dev libayatana-appindicator3-dev file
+      - name: cargo test (default)
+        working-directory: src-tauri
+        run: cargo test --lib
+      - name: crash injection (SIGKILL × 6 phases + idempotent re-recovery)
+        working-directory: src-tauri
+        run: cargo test --test crash_injection
+      - name: contract vectors (Rust side)
+        working-directory: src-tauri
+        run: cargo test --lib rust_executes_every_contract
+      - name: real media matrix (bundled ffmpeg, --ignored)
+        working-directory: src-tauri
+        run: cargo test --lib real -- --ignored
+
+  frontend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: npm run test:frontend (29 suites incl. virtualization + perf benchmark)
+        run: npm run test:frontend
+
+  swift-checks:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift history/backup/scheduler self-checks + contract vectors
+        run: bash scripts/test_swift_history.sh
+
+  windows-build-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo check (Windows 编译 + sync_dir 原生路径)
+        working-directory: src-tauri
+        run: cargo check --lib
+
+  appstore-tests:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev patchelf libssl-dev libgtk-3-dev libayatana-appindicator3-dev file
+      - name: cargo test --no-default-features --features inproc-backends
+        working-directory: src-tauri
+        run: cargo test --no-default-features --features inproc-backends

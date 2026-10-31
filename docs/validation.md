@@ -205,6 +205,53 @@ anything not listed as passed is **not** passed.
   并行测试间互相注入（真实踩到：25 字节 `user-edited-during-backup` 写进
   邻测试的源文件）→ 改 thread-local，5 连绿确认根除。
 
+### Review round 3 (2026-10-31 深夜, rc.3)：第三轮审查修复
+
+上一轮审查确认 rc.2 的修复大部分落地，但指出五类残留问题，本轮全部修复：
+
+- **P0 交换失败后外部文件保护（双端）**：换回失败 + 冲突迁移失败时，
+  外部内容停在临时路径上——调用方的 discard/remove_temp 会把它删掉。
+  修复：失败路径写 `<temp>.protected` 标记，remove_temp / discard
+  见标记绝不删（Rust `remove_temp` + Swift `StagedWrite.discard` 身份门）。
+- **P0 Windows 目录 fsync**：`sync_dir` 按 `#[cfg]` 分平台——Windows 用
+  `OpenOptionsExt::custom_flags(FILE_FLAG_BACKUP_SEANTICS)` 打开目录句柄；
+  未知平台如实报错，不静默假装成功。
+- **P0 RC.1 事务迁移**：`backupLegacyUnverified` 缺字段 = RC.1 事务，
+  保守按 `true`（未验证）处理，哈希一致也不能自动写回；
+  迁移测试用 RC.1 原始 JSON 形状（schemaVersion=2、三指纹、无 legacy 字段）。
+- **P0 跨格式删除原图前再验证**：落盘流程与删除之间外部可能改掉原图，
+  备份保住的是旧字节——删除前用基线身份再 verify 一次，改过 → 保留文件
+  留警告，产物照常成立（Rust+Swift）。修复中避免了一个次生错误：
+  保留原图时**不能提前 return**——历史照常记、事务照常销账。
+- **P1 describe_pending legacy/unreadable**：LegacyUnverified 标记 +
+  备份读不出来都进人工恢复状态机（不再返回 AutoResolvable 被过滤掉），
+  列表与 rollback 判据同源（Rust+Swift）。
+- **P1 SwiftUI 凭证/legacy 确认透传**：banner 回调扩成三参
+  `(item, restore, confirmVoucherMismatch)`；legacyUnknown 行加橙色提示；
+  确认弹窗对凭证不符写明"继续即接受风险"——与前端/Rust 同一协议。
+- **P1 Swift 同格式原子交换**：`publishWithOwnershipVerification` 三态
+  （published / refused / publishedButNotDurable）；同格式用基线哈希验证
+  被换出字节，占位路径用 inode，fsync 失败按 publishedButNotDurable
+  返回、调用方用备份回滚（Rust 提交后 fsync 失败同走回滚而非 withdraw）。
+- **P1 releaseOutputPlaceholder 真正比较 inode**：签名带
+  placeholderIdentity，只有 (dev,ino) 完全一致的 0 字节文件才删。
+- **P1 可见序列纯数据化 + LRU 按窗口**：computeVisibleFiles 不再读 DOM
+  的 hidden（数据事实与旧渲染分离，筛选往返不再丢行）；LRU 保护集只含
+  当前视口窗口（此前用完整 visibleFiles 当保护集 = 10k 全豁免）；
+  回归测试：筛选往返 + 10k 全表往返滚动后 fileRows ≤ 700。
+- **P1 崩溃注入真正走生产路径（上轮虚报的更正）**：rc.2 的提交信息与
+  validation.md 声称"崩溃注入改走生产路径"，但实际改写因编辑工具链中断
+  **没有落盘**——本轮逐段重写并 grep 验证：备份走 `ensure_backup_verified`
+  （真实快照链），覆盖走 `publish_replace_if_identity_matches`（真实交换），
+  备份真实路径由子进程留档、父进程断言；6 阶段 × 双恢复全过。
+- **P2 Windows/Linux 打包**：CI 失败根因是版本 `0.3.6-rc.2` 的 pre-release
+  后缀（MSI 要求数字、RPM 禁止 '-'）；release.yml 在 Windows/Linux 打包前
+  把 bundle 版本剥成数字（tag 门禁不受影响）。
+- **P2 App Store 配置版本同步**：`tauri.conf.appstore.json` 同步到 rc.2。
+- **P2 测试工作流**：新增 `.github/workflows/tests.yml`（push/PR 都跑）：
+  Rust lib + crash injection + 契约向量 + 真实矩阵、前端 29 套、Swift 自检、
+  Windows cargo check、App Store 特性测试——发布工作流不再代替测试门禁。
+
 ### Not done (never report as passed)
 
 - **Developer ID 签名与公证**：本机钥匙串没有

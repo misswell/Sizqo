@@ -1240,6 +1240,10 @@ final class AppState: ObservableObject {
         } else {
             placeholderIdentity = nil
         }
+        // §3.3 审查修复：同格式覆盖也有身份门 —— 用基线哈希走原子交换，
+        // 验证被换出来的还是编码前钉下的那份字节，不再直接 rename。
+        let baselineSha256: String? = (placement.transactionMode == .replaceExisting && !crossFormat)
+            ? replaceIdentity?.sha256 : nil
 
         // ① 事务 id 必须在动手之前定下来：历史落盘成功与否就靠它和 transaction 对账。
         //    两种模式都要记账 —— 新建模式那份日志负责"证明不了提交就删掉自己生成的文件"（§32）。
@@ -1247,8 +1251,8 @@ final class AppState: ObservableObject {
 
         // ② 临时名先独占、再记账：日志必须在一个字节落盘之前就知道它叫什么。反过来做的话，
         //    崩在"写完临时文件"与"改名"之间时，那个 .tmp 是唯一知道自己在场的记录还没写。
-        guard let staged = StagedWrite.claim(target: target) else {
-            releaseOutputPlaceholder(target, source: path)
+        guard var staged = StagedWrite.claim(target: target) else {
+            releaseOutputPlaceholder(target, source: path, placeholderIdentity: placeholderIdentity)
             return .outputWriteFailed("无法在 \(target) 旁边独占一个临时文件名")
         }
         let txn = ReplaceTransaction(
@@ -1279,7 +1283,7 @@ final class AppState: ObservableObject {
         // ③ 记账先于动手：写不进日志就还不许碰用户文件，占好的名字也得收回去。
         if let detail = placement.journal(transactions, txn) {
             staged.discard()
-            releaseOutputPlaceholder(target, source: path)
+            releaseOutputPlaceholder(target, source: path, placeholderIdentity: placeholderIdentity)
             return .transactionFailed(detail)
         }
 
@@ -1291,12 +1295,12 @@ final class AppState: ObservableObject {
             // 多留一拍 —— 下次启动的恢复按幂等语义收掉，磁盘不会多东西。
             staged.discard()
             transactions.finish(txn.id)
-            releaseOutputPlaceholder(target, source: path)
+            releaseOutputPlaceholder(target, source: path, placeholderIdentity: placeholderIdentity)
             return error
         }
 
         // ④ 候选写满 → flush + fsync。到这一步结束，目标文件依然没被动过一个字节。
-        if !staged.writeSynced(compressed) {
+        if !staged.writeSyncedRecording(compressed) {
             return withdraw(.outputWriteFailed("无法写入 \(target)"))
         }
 
@@ -1315,19 +1319,48 @@ final class AppState: ObservableObject {
             }
         }
 
-        // ⑥ 原子发布。占位凭证在场时走 swap 验证：先交换、再确认被换出来的
-        // 是我们认领的那个 inode —— 外部在提交前一刻放进目标路径的内容绝不被盖。
-        if !staged.publishIfPlaceholderMatches(to: target, placeholderIdentity: placeholderIdentity) {
-            return withdraw(.outputWriteFailed("无法改名到 \(target)（占位所有权验证未通过，目标内容已保留）"))
+        // ⑥ 原子发布。同格式覆盖用基线哈希走原子交换（验证被换出的字节）；
+        // 占位凭证在场时验证认领的 inode。三态：refused = 目标没动（withdraw）；
+        // publishedButNotDurable = 覆盖已发生但目录没落盘（用备份回滚）。
+        switch staged.publishWithOwnershipVerification(
+            to: target,
+            placeholderIdentity: placeholderIdentity,
+            baselineSha256: baselineSha256
+        ) {
+        case .published:
+            break
+        case .refused:
+            return withdraw(.outputWriteFailed("无法改名到 \(target)（所有权/身份验证未通过，目标内容已保留）"))
+        case .publishedButNotDurable:
+            if let backup = backupFile,
+               (try? HistoryStore.writeBackupBack(to: path, backup: backup)) == nil {
+                return .outputWriteFailed("目录 fsync 失败且回滚失败；原图备份已保留")
+            }
+            transactions.finish(txn.id)
+            return .outputWriteFailed("输出目录未能落盘，已用备份恢复原图")
         }
 
         if crossFormat {
-            do { try fm.removeItem(atPath: path) }
+            // §28 审查修复：删除原图前的最后一道身份门 —— 落盘流程里外部
+            // 可能改掉原图，备份保住的是旧字节，用户刚写的新字节只有这次
+            // 复核看得见。改过 → 保留文件，跨格式产物照常成立。
+            var identityStale = true
+            if let identity = replaceIdentity {
+                if case .unchanged = identity.verify(at: path) { identityStale = false }
+            }
+            if identityStale {
+                // 不 return：产物已落盘，历史照常记、事务照常销账 —— 只是原图留着。
+                result.warnings.append(
+                    "原文件在提交前被修改，已保留: \(path)（跨格式产物照常生成）"
+                )
+            } else {
+                do { try fm.removeItem(atPath: path) }
             catch {
                 // 删不掉（权限/被占用）时不许静默：磁盘上会同时留着原图和新格式产物。
                 // 产物已提交、历史已记，不能反过来撤销一次成功的压缩 —— 留警告给用户。
                 NSLog("Sizqo 跨格式替换：原文件删除失败（产物已保留）: %@", error.localizedDescription)
                 result.warnings.append("原格式文件删除失败，已保留: \(path)")
+            }
             }
         }
         result.outputPath = target
@@ -1375,8 +1408,11 @@ final class AppState: ObservableObject {
     /// 人工恢复处置：restore=false = 暂不处理（现场原样保留）；
     /// restore=true 必须由界面先展示双方状态并拿到 confirmOverwrite 确认。
     @discardableResult
-    func resolveManualRecovery(_ item: OutputTransactionStore.PendingRecoveryItem,
-                               restore: Bool, confirmOverwrite: Bool) -> String? {
+    func resolveManualRecovery(
+        _ item: OutputTransactionStore.PendingRecoveryItem,
+        restore: Bool, confirmOverwrite: Bool,
+        confirmVoucherMismatch: Bool = false
+    ) -> String? {
         guard let lease = scheduler.beginMaintenance() else {
             return "压缩进行中，暂不能处理恢复现场"
         }
@@ -1389,7 +1425,10 @@ final class AppState: ObservableObject {
             refreshManualRecoveries()
             return nil
         }
-        if let error = transactions.manualRestore(txn, confirmOverwrite: confirmOverwrite) {
+        if let error = transactions.manualRestore(
+            txn, confirmOverwrite: confirmOverwrite,
+            confirmVoucherMismatch: confirmVoucherMismatch
+        ) {
             refreshManualRecoveries()
             return error
         }
@@ -1577,12 +1616,13 @@ final class AppState: ObservableObject {
             }
             guard let claimed = OutputNameAllocator.claim(in: dir, naming) else { failed += 1; continue }
             var exported = false
-            if let bytes = fm.contents(atPath: outPath), let staged = StagedWrite.claim(target: claimed.path) {
+            if let bytes = fm.contents(atPath: outPath), var staged = StagedWrite.claim(target: claimed.path) {
                 // 导出同样只许顶掉我们自己刚认领的占位（§28 同款所有权门）。
-                exported = staged.writeSynced(bytes) &&
+                exported = staged.writeSyncedRecording(bytes) &&
                     staged.publishIfPlaceholderMatches(
                         to: claimed.path,
-                        placeholderIdentity: OutputTransactionStore.fileIdentity(claimed.path))
+                        placeholderIdentity: OutputTransactionStore.fileIdentity(claimed.path)
+                    ) == .published
                 if !exported { staged.discard() }
             }
             if exported {
@@ -1783,15 +1823,20 @@ final class AppState: ObservableObject {
     ///
     /// 同格式覆盖的目标**就是用户原图**，那种情况下"收回占位"等于删原图 —— 所以界线
     /// 就是 `target == path` 这一条：只有我们新建出来的空占位才归自己删。
-    nonisolated private static func releaseOutputPlaceholder(_ target: String, source path: String) {
+    nonisolated private static func releaseOutputPlaceholder(
+        _ target: String, source path: String,
+        placeholderIdentity: (device: Int64, inode: UInt64)? = nil
+    ) {
         guard target != path else { return }
         // §28 审查修复：占位可能已被外部删掉、又换成别人的文件 ——
-        // 删除前必须证明这个 0 字节文件还是我们认领的那个 inode。
-        if let attributes = try? FileManager.default.attributesOfItem(atPath: target),
-           let size = attributes[.size] as? NSNumber, size.int64Value == 0,
-           let identity = OutputTransactionStore.fileIdentity(target) {
+        // 删除前必须证明这个 0 字节文件还是我们认领的那个 (dev,ino)；
+        // 没有凭证或身份对不上的一律保留。
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: target),
+              let size = attributes[.size] as? NSNumber, size.int64Value == 0 else { return }
+        if let expected = placeholderIdentity,
+           let actual = OutputTransactionStore.fileIdentity(target),
+           actual.device == expected.device && actual.inode == expected.inode {
             try? FileManager.default.removeItem(atPath: target)
-            _ = identity  // 大小为零 + 路径仍在申请记录内才走到这里；非空文件绝不删
         }
     }
 

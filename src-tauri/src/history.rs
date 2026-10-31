@@ -1612,10 +1612,34 @@ fn canonical_path(path: &Path) -> String {
 /// 目录 fsync：rename / 新建目录项只有落了**父目录**才扛得住断电。
 /// 文件内容的 fsync 不能代替它 —— "事务日志在、备份目录项没了"正是
 /// 进程被杀与机器断电的差别所在。
+///
+/// Windows 上普通 `File::open` 打不开目录句柄，必须带
+/// `FILE_FLAG_BACKUP_SEMANTICS`（`OpenOptionsExt::custom_flags`）；
+/// 同步失败按真错误返回，绝不静默假装成功 —— 提交链路上的失败
+/// 由调用方走回滚。
 pub(crate) fn sync_dir(path: &Path) -> Result<(), String> {
-    fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| format!("{}: {error}", path.display()))
+    #[cfg(unix)]
+    {
+        fs::File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("{}: {error}", path.display()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("{}: {error}", path.display()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // 未知平台：没有可信的目录同步原语，宁可如实失败也不假装成功。
+        Err(format!("{}: directory sync unsupported on this platform", path.display()))
+    }
 }
 
 pub(crate) fn same_file(a: &Path, b: &Path) -> bool {

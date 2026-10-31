@@ -2015,9 +2015,10 @@ do {
           "编码前没备覆盖依据：§24 要求备份先于压缩，晚来的就不是原图")
     check(appState.contains("identity.verify(at: path)"),
           "覆盖前不再完整复核源文件（含内容指纹）：§26 的最终确认丢了")
-    check(appState.contains("staged.writeSynced(compressed)") &&
-          appState.contains("staged.publishIfPlaceholderMatches(to: target, placeholderIdentity: placeholderIdentity)"),
-          "候选落盘与改名又合成一步：改名前那道复核/占位所有权验证没有插进去的位置")
+    check(appState.contains("staged.writeSyncedRecording(compressed)") &&
+          appState.contains("staged.publishWithOwnershipVerification(") &&
+          appState.contains("baselineSha256: baselineSha256"),
+          "候选落盘与改名又合成一步：改名前那道复核/所有权验证没有插进去的位置")
     check(appState.contains("history.backupIsFaithful(backup)"), "改名前不再确认快照字节：§27 的复核丢了")
     check(!appState.contains("ensureBackup(for:"),
           "Commit 里又现取了一次快照：§24 的提前备份被绕开，备到的可能是改动后的内容")
@@ -2327,7 +2328,7 @@ do {
     }
     check(staged.writeSynced(Data([9, 9])), "候选该写满落盘")
     // 凭证在手但换出来的是外部内容 → 拒绝，外部文件原样保留。
-    check(!staged.publishIfPlaceholderMatches(to: claimedPath, placeholderIdentity: expected),
+    check(staged.publishIfPlaceholderMatches(to: claimedPath, placeholderIdentity: expected) != .published,
           "外部顶掉的占位绝不允许被盖")
     check(readBytes(claimedPath) == [1, 2, 3, 4], "外部内容一个字节都不许动")
     // 无凭证（nil）路径退回普通 publish：直接提交（外部内容会被盖，调用方语义自担）。
@@ -2335,7 +2336,7 @@ do {
         check(false, "无凭证路径的临时名该认领成功"); exit(1)
     }
     check(stagedPlain.writeSynced(Data([7, 7])), "无凭证路径的候选该写满落盘")
-    check(stagedPlain.publishIfPlaceholderMatches(to: claimedPath, placeholderIdentity: nil),
+    check(stagedPlain.publishIfPlaceholderMatches(to: claimedPath, placeholderIdentity: nil) == .published,
           "无凭证路径按普通发布处理")
     check(readBytes(claimedPath) == [7, 7], "无凭证发布落位")
 }

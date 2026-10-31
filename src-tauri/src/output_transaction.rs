@@ -79,8 +79,17 @@ pub struct ReplaceTransaction {
     /// 留下、没有内容指纹可验）。它的 `backupSha256` 只证明"记账以来没变过"，
     /// **不能**证明它是正确的原图 —— 自动回滚不得借现场哈希把它洗成可信，
     /// 一律转人工恢复；GUI 在用户看过双方状态后凭确认放行。
-    #[serde(default)]
+    ///
+    /// 缺字段 = RC.1 的事务（有 schemaVersion=2 但还没这个字段）：**保守按
+    /// true 处理** —— RC.1 的覆盖事务从未核实过备份可信度，升级不能让
+    /// 旧问题借默认值复活。RC.2 起写入方总是显式落这个字段。
+    #[serde(default = "default_backup_legacy_unverified")]
     pub backup_legacy_unverified: bool,
+}
+
+/// RC.1 迁移默认值：缺字段按"未验证"处理（保守）。
+fn default_backup_legacy_unverified() -> bool {
+    true
 }
 
 fn default_mode() -> TransactionMode {
@@ -368,9 +377,17 @@ pub fn describe_pending(txn: &ReplaceTransaction) -> (PendingRecoveryStatus, Str
         }
     }
     if txn.output_sha256.as_deref() == Some(current.as_str()) {
+        if txn.backup_legacy_unverified {
+            return (PendingRecoveryStatus::LegacyUnknown,
+                "备份未经真实性验证（老版本记录）：自动回滚会拒绝写回，请人工确认".into());
+        }
         return (PendingRecoveryStatus::AutoResolvable, "源位置是本次产物，启动恢复会自动回滚".into());
     }
     if txn.original_sha256.as_deref() == Some(current.as_str()) {
+        if txn.backup_legacy_unverified {
+            return (PendingRecoveryStatus::LegacyUnknown,
+                "备份未经真实性验证：原图虽仍在原位，处置前请人工确认备份来历".into());
+        }
         return (PendingRecoveryStatus::AutoResolvable, "原图仍在原位，启动恢复只清残骸".into());
     }
     if txn.output_sha256.is_none() && txn.original_sha256.is_none() {
@@ -600,10 +617,26 @@ fn retire_generated_output(txn: &ReplaceTransaction) {
     remove_temp(txn);
 }
 
+/// 删事务的临时文件。**保护标记门**：原子交换成功 → 验证失败 → 换回也失败
+/// → 冲突迁移也失败时，外部内容恰好停在临时路径上；publish 在那条路径旁
+/// 写下 `.protected` 标记，这里见到标记绝不删（宁可留孤儿，不删用户内容）。
+/// 没有标记的临时路径是我们独占认领的（O_EXCL），候选半成品照常清。
 fn remove_temp(txn: &ReplaceTransaction) {
     if let Some(temp) = txn.temp_output_path.as_deref() {
+        let marker = format!("{}.protected", temp);
+        if Path::new(&marker).exists() {
+            log::warn!(
+                "事务临时路径带保护标记（交换失败的外部内容），已原样保留: {temp}"
+            );
+            return;
+        }
         let _ = fs::remove_file(temp);
+        let _ = fs::remove_file(marker);
     }
+}
+
+fn now_marker() -> String {
+    crate::history::now_millis().to_string()
 }
 
 // MARK: - §3.3 原子交换提交：先交换，再验证被换出来的那份字节
@@ -679,7 +712,15 @@ pub fn publish_replace_if_identity_matches(
                 let conflict = conflict_sibling(target);
                 let relocated = match fs::rename(staged, &conflict) {
                     Ok(()) => conflict,
-                    Err(_) => staged.to_path_buf(),
+                    // 迁移也失败：外部内容停在临时路径上。写保护标记 ——
+                    // 事务清理（remove_temp）见到标记绝不删这条路径。
+                    Err(_) => {
+                        let _ = fs::write(
+                            format!("{}.protected", staged.display()),
+                            now_marker(),
+                        );
+                        staged.to_path_buf()
+                    }
                 };
                 return Err(SwapPublishError {
                     swapped: true,
@@ -1313,6 +1354,49 @@ mod tests {
         assert!(detail.contains("备份读不出来"), "{detail}");
         // 回滚本身也必须拒绝（凭证读不出来 = 无法证明要写回什么）。
         assert!(rollback(&record).is_err());
+    }
+
+    /// §2.3 审查修复回归：RC.1 事务（schemaVersion=2、带三指纹、**没有**
+    /// backupLegacyUnverified 字段）升级到 RC.2 后，缺失字段保守按未验证
+    /// 处理 —— 备份哈希一致也不能自动写回。
+    #[test]
+    fn an_rc1_transaction_without_the_legacy_field_is_treated_as_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let (history, store) = stores(dir.path());
+        let source = dir.path().join("a.png");
+        let backup = dir.path().join("original.png");
+        fs::write(&backup, b"true-original").unwrap();
+        fs::write(&source, b"compressed").unwrap();
+        // RC.1 原始形状：schemaVersion=2、三指纹齐全、无 legacy 字段。
+        let original_hash = crate::source_identity::sha256_of(&backup).unwrap();
+        let output_hash = crate::source_identity::sha256_of(&source).unwrap();
+        let rc1_json = serde_json::json!({
+            "id": "t-rc1", "historyId": "rc1",
+            "sourcePath": source.to_string_lossy(),
+            "outputPath": source.to_string_lossy(),
+            "backupPath": backup.to_string_lossy(),
+            "originalSize": 13, "expectedOutputSize": 11,
+            "originalSha256": original_hash,
+            "outputSha256": output_hash,
+            "backupSha256": original_hash,
+            "createdAt": now_millis(),
+            "crossFormat": false,
+            "mode": "replace_existing",
+            "schemaVersion": 2,
+        });
+        fs::create_dir_all(&store.root).unwrap();
+        fs::write(
+            store.root.join("t-rc1.json"),
+            serde_json::to_vec(&rc1_json).unwrap(),
+        )
+        .unwrap();
+        let loaded = store.list();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].backup_legacy_unverified, "缺字段必须保守按未验证");
+        let report = store.recover(&history);
+        assert_eq!(report.rolled_back, 0, "RC.1 事务不得自动写回");
+        assert!(report.needs_review >= 1);
+        assert_eq!(fs::read(&source).unwrap(), b"compressed");
     }
 
     /// §3.3 原子交换：验证通过 = 提交同时成立，被换出的旧文件随后清掉。

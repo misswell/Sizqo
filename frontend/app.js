@@ -1709,11 +1709,11 @@ function computeVisibleFiles(failedOnly, mediaView, members) {
     var file = entry.file;
     var failedRow = queueState(file) === 'failed';
     var item = queueItems.get(file);
+    // 可见性是**数据事实**（成员集合 + 筛选条件），不读 DOM 的 hidden ——
+    // 上一次渲染留下的 hidden 属于旧筛选，拿它当判据会让"关闭筛选"后
+    // 行回不到可见序列。
     var mediaVisible = mediaView === 'all' || !item || !item.mediaKind || item.mediaKind === mediaView;
-    var row = entry.row || fileRows[file];
-    var rowHidden = row ? row.hidden
-      : !(members.has(file) && mediaVisible && (!failedOnly || failedRow));
-    if (!rowHidden) visible.push(file);
+    if (members.has(file) && mediaVisible && (!failedOnly || failedRow)) visible.push(file);
   }
   return visible;
 }
@@ -1739,10 +1739,8 @@ function attachQueueView(list, failedOnly, mediaView, membersArg) {
     queueViewCache.mediaView = mediaView;
   }
   Object.keys(fileRows).forEach(function(file) {
-    // 「只看失败」也按 queueItems 判，不按 DOM class：类名只是画出来的结果，
-    // 拿它当判据，一旦某处忘了同步 class，筛出来的东西就是错的。
-    // §6.1：成员判断用 Set —— 行循环里对每行做 `files.includes` 是 O(N²)，
-    // 大队列的每个任务事件都会被它拖慢。
+    // 「只看失败」也按 queueItems 判，不按 DOM class：类名只是画出来的结果。
+    // §6.1：成员判断走 members（调用方构建的 Set），O(N) 单遍。
     var failedRow = queueState(file) === 'failed';
     var item = queueItems.get(file);
     var mediaVisible = mediaView === 'all' || !item || !item.mediaKind || item.mediaKind === mediaView;
@@ -1801,6 +1799,7 @@ function attachQueueView(list, failedOnly, mediaView, membersArg) {
       queueVirtual.topSpacer.height = topHeight;
       queueVirtual.bottomSpacer.height = bottomHeight;
     }
+    pruneFileRowCache(list, windowEntries.map(function(entry) { return entry.file; }));
   } else {
     orderedEntries.forEach(function(entry, index) {
       if (!entry.row) {
@@ -1814,8 +1813,8 @@ function attachQueueView(list, failedOnly, mediaView, membersArg) {
     });
     queueVirtual.topSpacer = removeQueueSpacer(list, queueVirtual.topSpacer);
     queueVirtual.bottomSpacer = removeQueueSpacer(list, queueVirtual.bottomSpacer);
+    pruneFileRowCache(list, null);
   }
-  pruneFileRowCache(list);
   var empty = document.getElementById('queueFilterEmpty');
   if (empty) empty.hidden = !failedOnly || visible > 0;
 }
@@ -1839,19 +1838,33 @@ function removeQueueSpacer(list, existing) {
   if (existing && typeof existing.remove === 'function') existing.remove();
   return null;
 }
-/// §8 审查修复：行缓存 LRU —— detached 行超出上限就逐出（元素交 GC），
+/// §8 审查修复（第二轮）：LRU 保护集只含**当前视口窗口**的行 ——
+/// 用完整 visibleFiles 当保护集会让逐滚全表的 10k 行全部豁免，上限失效。
+/// 非保护行（不在窗口 / 已从队列删除）超出上限即逐出：元素交 GC，
 /// 滚回来由窗口循环按需重建；queueItems 里的业务状态从不依赖行存在。
-function pruneFileRowCache(list) {
-  if (fileRowOrder.length <= FILE_ROW_CACHE_LIMIT) return;
-  var windowSet = new Set(queueViewCache.visibleFiles);
+function pruneFileRowCache(list, windowFiles) {
+  var windowSet = new Set(windowFiles);
   var kept = [];
-  for (var i = 0; i < fileRowOrder.length && fileRowOrder.length - kept.length > FILE_ROW_CACHE_LIMIT; i++) {
+  var evicted = 0;
+  for (var i = 0; i < fileRowOrder.length; i++) {
     var file = fileRowOrder[i];
     var row = fileRows[file];
-    if (!row || windowSet.has(file) || row.parentNode === list) { kept.push(file); continue; }
+    if (!row) { continue; } // 已删队列文件：从顺序表剔除，绝不复活
+    if (windowSet.has(file) && row.parentNode === list) { kept.push(file); continue; }
+    if (fileRowOrder.length - kept.length + (fileRowOrder.length - i - 1) <= FILE_ROW_CACHE_LIMIT) {
+      // 剩余总数不超限：全部保留（含未检查的尾部）。
+      kept.push(file);
+      continue;
+    }
+    if (kept.length + (fileRowOrder.length - i) <= FILE_ROW_CACHE_LIMIT) {
+      kept.push(file);
+      continue;
+    }
     delete fileRows[file];
+    evicted++;
   }
-  fileRowOrder = kept.concat(fileRowOrder.slice(Math.max(0, i)));
+  fileRowOrder = kept;
+  return evicted;
 }
 /// 滚动时只重算窗口：rAF 节流，绝不触发排序或全量重绘。
 function installQueueScrollHandler() {

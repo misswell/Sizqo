@@ -223,7 +223,9 @@ struct ReplaceTransaction: Codable {
         // 认成 createNew 的话，恢复逻辑会当成"没动过原图"而不再写回备份，原图就回不来了。
         mode = try container.decodeIfPresent(TransactionMode.self, forKey: .mode) ?? .replaceExisting
         schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 0
-        backupLegacyUnverified = try container.decodeIfPresent(Bool.self, forKey: .backupLegacyUnverified) ?? false
+        // RC.1 迁移：缺字段 = RC.1 的事务，保守按"未验证"处理 ——
+        // 升级不能让旧问题借默认值复活。RC.2 起写入方总是显式落这个字段。
+        backupLegacyUnverified = try container.decodeIfPresent(Bool.self, forKey: .backupLegacyUnverified) ?? true
     }
 
     func encode(to encoder: Encoder) throws {
@@ -375,6 +377,14 @@ enum StagedTemp {
 /// 临时文件必须和目标同目录，否则 rename 跨挂载点就不是原子操作了。
 struct StagedWrite {
     let temp: String
+    /// §28 审查修复：写满后记录候选指纹。discard 的身份门据此判断
+    /// "这条临时路径上是谁" —— 原子交换换回失败时，外部内容恰好停在这里，
+    /// 无凭证的 discard 会把用户的文件当半成品删掉。
+    private(set) var writtenSha256: String?
+
+    fileprivate mutating func recordWritten() {
+        writtenSha256 = try? sha256OfFile(temp).get()
+    }
 
     /// §31 只独占临时名，一个字节都不写。Commit 用这条：先把名字记进事务日志，
     /// 再让数据落盘。反过来做的话，崩在"写完临时文件"与"改名"之间的那个 `.tmp`
@@ -411,6 +421,30 @@ struct StagedWrite {
         return true
     }
 
+    /// 写满 + fsync + 记录候选指纹（discard 身份门用）。
+    mutating func writeSyncedRecording(_ bytes: Data) -> Bool {
+        guard writeSynced(bytes) else { return false }
+        recordWritten()
+        return true
+    }
+
+    /// §28 身份门：只有能证明"这条路径上是我们的字节"（哈希对上我们写的
+    /// 候选，或还是空占位）才允许删；证明不了就原样保留并告警。
+    func discard() {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: temp)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? -1
+        if size == 0 {
+            try? FileManager.default.removeItem(atPath: temp)
+            return
+        }
+        if let written = writtenSha256,
+           case .success(let actual) = sha256OfFile(temp), actual == written {
+            try? FileManager.default.removeItem(atPath: temp)
+            return
+        }
+        NSLog("Sizqo: 临时路径上的内容无法证明归属（%lld 字节），已原样保留: %@", size, temp)
+    }
+
     /// 把已经 fsync 的临时文件原子改名到目标。改名之前该核的都必须已经核过。
     /// false = 没改成；目标保持原样，半成品已清掉。
     func publish(to target: String) -> Bool {
@@ -418,9 +452,66 @@ struct StagedWrite {
             discard()
             return false
         }
-        // §2.2 publish 的目录项也要落盘（与 Rust 提交链同款）。
-        _ = syncDirectory(at: (target as NSString).deletingLastPathComponent)
-        return true
+        // §2.2 目录 fsync 失败 = 目录项没落盘，按发布失败处理（调用方回滚）。
+        return syncDirectory(at: (target as NSString).deletingLastPathComponent)
+    }
+
+    /// 发布结果三态：调用方据此决定 withdraw（目标没动）/ 回滚（覆盖已发生）。
+    enum PublishOutcome {
+        /// 发布完整成立（含目录 fsync）。
+        case published
+        /// 目标没被动过（交换被换回 / 验证失败 / rename 失败）。
+        case refused
+        /// 覆盖已发生但目录 fsync 失败：调用方必须回滚。
+        case publishedButNotDurable
+    }
+
+    /// §3.3 审查修复：统一发布入口 —— 占位凭证（新建/跨格式）用 inode 验证，
+    /// 同格式覆盖用**基线哈希**验证被换出的字节；目录 fsync 失败按
+    /// publishedButNotDurable 返回（调用方回滚，绝不带没落盘的目录项销账）。
+    mutating func publishWithOwnershipVerification(
+        to target: String,
+        placeholderIdentity: (device: Int64, inode: UInt64)?,
+        baselineSha256: String?
+    ) -> PublishOutcome {
+        if let baseline = baselineSha256 {
+            return publishReplaceIfIdentityMatches(to: target, baselineSha256: baseline)
+        }
+        return publishIfPlaceholderMatches(to: target, placeholderIdentity: placeholderIdentity)
+    }
+
+    /// 同格式覆盖的原子交换：先交换、再验证被换出的字节哈希 == 编码前基线。
+    /// 验证失败换回原状；换回失败写 `.protected` 标记保留现场。
+    mutating func publishReplaceIfIdentityMatches(
+        to target: String, baselineSha256: String
+    ) -> PublishOutcome {
+        // 非逃逸捕获：mutating self 不能进 @escaping 闭包，先用局部拷贝。
+        let tempPath = self.temp
+        let swap = { OutputTransactionStore.atomicSwap(tempPath, target) }
+        guard swap() else {
+            // 交换不可用：退回"先验身份再 rename"（与旧门同级）。
+            guard case .success(let current) = sha256OfFile(target),
+                  current == baselineSha256 else {
+                discard()
+                return .refused
+            }
+            return publish(to: target) ? .published : .refused
+        }
+        // 交换成功：temp 现在持有被换出来的目标旧内容。
+        guard case .success(let swappedOut) = sha256OfFile(self.temp),
+              swappedOut == baselineSha256 else {
+            if swap() {
+                discard()
+                return .refused
+            }
+            let _ = try? Data("protected".utf8).write(
+                to: URL(fileURLWithPath: self.temp + ".protected"))
+            NSLog("Sizqo: 交换回滚失败，外部内容已加保护标记: %@", self.temp)
+            return .refused
+        }
+        try? FileManager.default.removeItem(atPath: self.temp)
+        return syncDirectory(at: (target as NSString).deletingLastPathComponent)
+            ? .published : .publishedButNotDurable
     }
 
     /// §28 审查修复：占位 inode 的**原子所有权验证**。
@@ -434,9 +525,11 @@ struct StagedWrite {
     /// - Parameters:
     ///   - placeholderIdentity: 记账时占位文件的 `(dev,ino)`；nil = 无凭证
     ///     （replace 同格式覆盖没有占位），此时退回普通 publish。
-    func publishIfPlaceholderMatches(to target: String, placeholderIdentity: (device: Int64, inode: UInt64)?) -> Bool {
+    func publishIfPlaceholderMatches(
+        to target: String, placeholderIdentity: (device: Int64, inode: UInt64)?
+    ) -> PublishOutcome {
         guard let expected = placeholderIdentity else {
-            return publish(to: target)
+            return publish(to: target) ? .published : .refused
         }
         // 候选必须已经写满并 fsync（writeSynced），这里只负责原子顶替。
         let swap = { () -> Bool in
@@ -448,25 +541,26 @@ struct StagedWrite {
                actual.device == expected.device && actual.inode == expected.inode {
                 // 换出来的正是我们的占位：提交成立，占位清掉。
                 try? FileManager.default.removeItem(atPath: self.temp)
-                _ = syncDirectory(at: (target as NSString).deletingLastPathComponent)
-                return true
+                // §2.2 目录 fsync 失败 = 目录项没落盘，按 publishedButNotDurable。
+                return syncDirectory(at: (target as NSString).deletingLastPathComponent)
+                    ? .published : .publishedButNotDurable
             }
             // 被换出来的不是我们的占位：换回原状，外部内容原样保留。
             if swap() {
                 discard()
-                return false
+                return .refused
             }
             // 换回失败：绝对保留现场 —— 候选与外部内容都不删，交人工。
             NSLog("Sizqo: 占位交换验证失败且换回失败，现场保留（%@" , target)
-            return false
+            return .refused
         }
         // 不支持原子交换：退回"先验身份再 rename"（与旧门同级）。
         guard let actual = OutputTransactionStore.fileIdentity(target),
               actual.device == expected.device && actual.inode == expected.inode else {
             discard()
-            return false
+            return .refused
         }
-        return publish(to: target)
+        return publish(to: target) ? .published : .refused
     }
 
     /// 独占 + 写入 + 改名一条龙：调用方不需要在中途记任何东西时使用。
@@ -476,10 +570,6 @@ struct StagedWrite {
         return staged.writeAndPublish(bytes, to: target) ? staged : nil
     }
 
-    /// 事后清理临时文件（正常情况下 rename 已经把它变成目标了）。
-    func discard() {
-        try? FileManager.default.removeItem(atPath: temp)
-    }
 }
 
 // MARK: - 事务存储
@@ -796,9 +886,17 @@ final class OutputTransactionStore: @unchecked Sendable {
             return (.voucherMismatch, "备份字节与事务凭证不符")
         }
         if txn.outputSha256 == current {
+            if txn.backupLegacyUnverified {
+                return (.legacyUnknown,
+                    "备份未经真实性验证（RC.1/老版本记录）：自动回滚会拒绝写回，请人工确认")
+            }
             return (.autoResolvable, "源位置是本次产物，启动恢复会自动回滚")
         }
         if txn.originalSha256 == current {
+            if txn.backupLegacyUnverified {
+                return (.legacyUnknown,
+                    "备份未经真实性验证：原图虽仍在原位，处置前请人工确认备份来历")
+            }
             return (.autoResolvable, "原图仍在原位，启动恢复只清残骸")
         }
         if txn.outputSha256 == nil && txn.originalSha256 == nil {

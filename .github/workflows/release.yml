@@ -269,6 +269,17 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Strip pre-release suffix from bundle version (MSI requires numeric-only)
+        shell: pwsh
+        run: |
+          $conf = Get-Content src-tauri	auri.conf.json -Raw | ConvertFrom-Json
+          if ($conf.version -match '-(pre.*)$') {
+            $numeric = ($conf.version -split '-')[0]
+            $conf.version = $numeric
+            $conf | ConvertTo-Json -Depth 32 | Set-Content src-tauri	auri.conf.json -Encoding UTF8
+            Write-Host "MSI 版本只能是数字：bundle 版本改为 $numeric（tag 仍是 $env:RELEASE_TAG）"
+          }
+
       - name: Download CLI tools
         shell: pwsh
         run: |
@@ -346,6 +357,18 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Strip pre-release suffix from bundle version (RPM forbids dashes)
+        run: |
+          VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
+          case "$VERSION" in
+            *-*)
+              NUMERIC="${VERSION%%-*}"
+              jq --arg v "$NUMERIC" '.version = $v' src-tauri/tauri.conf.json > /tmp/conf.json
+              mv /tmp/conf.json src-tauri/tauri.conf.json
+              echo "RPM 版本不允许 '-'：bundle 版本改为 $NUMERIC（tag 仍是 $RELEASE_TAG）"
+              ;;
+          esac
 
       - name: Install system dependencies
         run: |

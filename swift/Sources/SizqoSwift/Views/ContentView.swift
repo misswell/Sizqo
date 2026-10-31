@@ -17,10 +17,13 @@ struct ContentView: View {
                 HairlineDivider()
                 // §3.4 人工恢复现场：自动恢复证明不了归属时，把双方状态摆给用户拍板。
                 if !appState.manualRecoveries.isEmpty {
-                    ManualRecoveryBanner(items: appState.manualRecoveries) { item, restore in
-                        if let error = appState.resolveManualRecovery(item,
-                                                                      restore: restore,
-                                                                      confirmOverwrite: restore) {
+                    ManualRecoveryBanner(items: appState.manualRecoveries) { item, restore, confirmVoucherMismatch in
+                        if let error = appState.resolveManualRecovery(
+                            item,
+                            restore: restore,
+                            confirmOverwrite: restore,
+                            confirmVoucherMismatch: confirmVoucherMismatch
+                        ) {
                             appState.showToast(error)
                         }
                     }
@@ -1589,7 +1592,7 @@ extension Label {
 /// 暂不处理 = 现场原样保留，随时可以再决定。
 struct ManualRecoveryBanner: View {
     let items: [OutputTransactionStore.PendingRecoveryItem]
-    let onResolve: (OutputTransactionStore.PendingRecoveryItem, Bool) -> Void
+    let onResolve: (OutputTransactionStore.PendingRecoveryItem, Bool, Bool) -> Void
     @State private var confirming: OutputTransactionStore.PendingRecoveryItem?
 
     var body: some View {
@@ -1616,10 +1619,15 @@ struct ManualRecoveryBanner: View {
                             .font(.caption)
                             .foregroundStyle(.orange)
                     }
+                    if item.status == .legacyUnknown {
+                        Text("备份未经真实性验证：请确认来历后再决定是否写回")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
                     HStack {
                         Button("恢复原图") { confirming = item }
                             .buttonStyle(.borderedProminent)
-                        Button("暂不处理") { onResolve(item, false) }
+                        Button("暂不处理") { onResolve(item, false, false) }
                         Spacer()
                     }
                 }
@@ -1633,7 +1641,10 @@ struct ManualRecoveryBanner: View {
             set: { if !$0 { confirming = nil } }
         )) {
             Button("仍要恢复", role: .destructive) {
-                if let item = confirming { onResolve(item, true) }
+                if let item = confirming {
+                    // 凭证不符 = 用户看过警告后明确放行（与 Rust/前端同一协议）。
+                    onResolve(item, true, item.voucherMatch == false)
+                }
                 confirming = nil
             }
             Button("取消", role: .cancel) { confirming = nil }
@@ -1641,7 +1652,7 @@ struct ManualRecoveryBanner: View {
             Text(confirming.map { item in
                 "当前文件: \(item.sourcePath)\n将写回的原图备份: \(item.backupPath)"
                     + (item.voucherMatch == false
-                        ? "\n\n警告：这份备份的字节与记账时的指纹不符，恢复的内容可能不是当初的原图。"
+                        ? "\n\n警告：这份备份的字节与记账时的指纹不符，恢复的内容可能不是当初的原图。继续即表示你了解并接受这一风险。"
                         : "")
             } ?? "")
         }

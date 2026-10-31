@@ -63,74 +63,92 @@ fn run_crash_child(phase: &str, workdir: &Path) -> ! {
         backup_legacy_unverified: false,
     };
 
-    match phase {
-        // 备份落盘、事务还没记：现场只有备份与原图。
-        "after_backup" => {
-            fs::write(&source, ORIGINAL).unwrap();
+    // §9.1 审查修复（本轮真正落地）：现场改由**生产代码**铺陈 ——
+    // 备份走 ensure_backup_verified（fd 采集 → 复制 → 副本校验 → 复制后
+    // 复核 → 目录 fsync），覆盖走 publish_replace_if_identity_matches
+    // （真实原子交换），legacy 现场保持手搓老日志（那正是旧版本的样子）。
+    fs::write(&source, ORIGINAL).unwrap();
+    let real_backup = if phase == "legacy_after_rename" {
+        fs::write(&source, COMPRESSED).unwrap();
+        txn.original_sha256 = None;
+        txn.output_sha256 = None;
+        txn.backup_sha256 = None;
+        txn.schema_version = 0;
+        transactions.prepare_durable(&txn).unwrap();
+        backup.clone()
+    } else {
+        let identity = sizqo_lib::source_identity::SourceIdentity::read_with_hash(&source).unwrap();
+        let real = history
+            .ensure_backup_verified(&source, identity.sha256.as_deref())
+            .expect("生产快照链必须成功");
+        fs::write(workdir.join("backup-path.txt"), real.to_string_lossy().as_bytes()).unwrap();
+        txn.backup_path = real.to_string_lossy().into();
+        match phase {
+            // 备份落盘、事务还没记：现场只有真实备份与原图。
+            "after_backup" => {}
+            // 记账完成、源文件还是原图（发布之前）。
+            "after_journal" => {
+                txn.original_sha256 = Some(original_hash.clone());
+                transactions.prepare_durable(&txn).unwrap();
+            }
+            // 候选写满 fsync、还没发布。
+            "after_partial" => {
+                txn.original_sha256 = Some(original_hash.clone());
+                transactions.prepare_durable(&txn).unwrap();
+                fs::write(&partial, COMPRESSED).unwrap();
+            }
+            // **真实原子交换已发生**：源位置是压缩结果，历史还没写 —— 最危险的窗口。
+            "after_rename" | "after_publish" => {
+                txn.original_sha256 = Some(original_hash.clone());
+                transactions.prepare_durable(&txn).unwrap();
+                fs::write(&partial, COMPRESSED).unwrap();
+                let settled = sizqo_lib::output_transaction::publish_replace_if_identity_matches(
+                    &partial, &source, &identity,
+                );
+                assert!(settled.is_ok(), "生产交换必须成功: {settled:?}");
+            }
+            // 历史已经落盘：这次覆盖有据可查，恢复只该销账。
+            "after_history" => {
+                txn.original_sha256 = Some(original_hash.clone());
+                transactions.prepare_durable(&txn).unwrap();
+                fs::write(&partial, COMPRESSED).unwrap();
+                let settled = sizqo_lib::output_transaction::publish_replace_if_identity_matches(
+                    &partial, &source, &identity,
+                );
+                assert!(settled.is_ok(), "生产交换必须成功: {settled:?}");
+                let entry = HistoryEntry {
+                    media_kind: "image".into(),
+                    video_metadata: None,
+                    id: "crash-1".into(),
+                    created_at: sizqo_lib::history::now_millis(),
+                    expires_at: sizqo_lib::history::now_millis() + 86_400_000,
+                    source_path: source.to_string_lossy().into(),
+                    output_path: Some(source.to_string_lossy().into()),
+                    file_name: "photo.png".into(),
+                    output_mode: "replace".into(),
+                    original_size: ORIGINAL.len() as u64,
+                    compressed_size: COMPRESSED.len() as u64,
+                    savings: 50.0,
+                    out_type: "png".into(),
+                    algorithm: "test".into(),
+                    backup_path: Some(real.to_string_lossy().into()),
+                    status: HistoryStatus::Compressed,
+                    restored_at: None,
+                    output_modified_at: sizqo_lib::history::file_mtime_millis(&source),
+                    source_sha256: Some(hex(ORIGINAL)),
+                    output_sha256: Some(compressed_hash),
+                    backup_sha256: Some(hex(ORIGINAL)),
+                    source_exists: true,
+                    backup_exists: true,
+                    output_exists: true,
+                };
+                history.add(entry).unwrap();
+            }
+            other => panic!("unknown crash phase: {other}"),
         }
-        // 记账完成、源文件还是原图（rename 之前）。
-        "after_journal" => {
-            fs::write(&source, ORIGINAL).unwrap();
-            txn.original_sha256 = Some(original_hash);
-            transactions.prepare_durable(&txn).unwrap();
-        }
-        // 临时产物写满、还没 rename。
-        "after_partial" => {
-            fs::write(&source, ORIGINAL).unwrap();
-            fs::write(&partial, COMPRESSED).unwrap();
-            txn.original_sha256 = Some(original_hash);
-            transactions.prepare_durable(&txn).unwrap();
-        }
-        // rename 已发生：源位置是压缩结果，历史还没写 —— 最危险的窗口。
-        "after_rename" => {
-            fs::write(&source, COMPRESSED).unwrap();
-            txn.original_sha256 = Some(original_hash);
-            transactions.prepare_durable(&txn).unwrap();
-        }
-        // 历史已经落盘：这次覆盖有据可查，恢复只该销账。
-        "after_history" => {
-            fs::write(&source, COMPRESSED).unwrap();
-            txn.original_sha256 = Some(original_hash);
-            transactions.prepare_durable(&txn).unwrap();
-            let entry = HistoryEntry {
-                media_kind: "image".into(),
-                video_metadata: None,
-                id: "crash-1".into(),
-                created_at: sizqo_lib::history::now_millis(),
-                expires_at: sizqo_lib::history::now_millis() + 86_400_000,
-                source_path: source.to_string_lossy().into(),
-                output_path: Some(source.to_string_lossy().into()),
-                file_name: "photo.png".into(),
-                output_mode: "replace".into(),
-                original_size: ORIGINAL.len() as u64,
-                compressed_size: COMPRESSED.len() as u64,
-                savings: 50.0,
-                out_type: "png".into(),
-                algorithm: "test".into(),
-                backup_path: Some(backup.to_string_lossy().into()),
-                status: HistoryStatus::Compressed,
-                restored_at: None,
-                output_modified_at: sizqo_lib::history::file_mtime_millis(&source),
-                source_sha256: Some(hex(ORIGINAL)),
-                output_sha256: Some(compressed_hash),
-                backup_sha256: Some(hex(ORIGINAL)),
-                source_exists: true,
-                backup_exists: true,
-                output_exists: true,
-            };
-            history.add(entry).unwrap();
-        }
-        // 老版本日志（无指纹）+ 覆盖已发生：新契约必须保留现场交人工。
-        "legacy_after_rename" => {
-            fs::write(&source, COMPRESSED).unwrap();
-            txn.original_sha256 = None;
-            txn.output_sha256 = None;
-            txn.backup_sha256 = None;
-            txn.schema_version = 0;
-            transactions.prepare_durable(&txn).unwrap();
-        }
-        other => panic!("unknown crash phase: {other}"),
-    }
+        real
+    };
+    let _ = real_backup;
     // 模拟进程被强杀/断电：不做任何清理，直接 SIGKILL。
     unsafe {
         libc::raise(libc::SIGKILL);
@@ -159,6 +177,12 @@ fn main() {
     }
 
     let parent = tempfile::tempdir().unwrap();
+    // 阶段期望：真实生产链的每个窗口各有各的终态。
+    // after_backup：真实快照在 history/backups/<key>/ 里，事务还没记。
+    // after_journal / after_partial：源还是原图，恢复只清残骸。
+    // after_rename（真实原子交换后）：覆盖已发生，必须回滚成原图。
+    // after_history：历史已落盘，恢复只补删日志。
+    // legacy_after_rename：老日志 + 覆盖已发生，保留现场交人工。
     let phases = [
         ("after_backup", "backup_only"),
         ("after_journal", "residue_only"),
@@ -187,7 +211,7 @@ fn main() {
             "backup_only" => {
                 assert_eq!(report.rolled_back, 0, "{phase}: 无事务就无回滚");
                 assert_eq!(fs::read(&source).unwrap(), ORIGINAL, "{phase}: 原图原样");
-                assert_eq!(fs::read(&backup).unwrap(), ORIGINAL, "{phase}: 备份原样");
+                assert_eq!(fs::read(&backup).unwrap(), ORIGINAL, "{phase}: 真实备份原样");
                 assert!(!transactions.has_pending(), "{phase}: 无未完成事务");
             }
             "residue_only" => {
@@ -198,12 +222,8 @@ fn main() {
                 assert_eq!(fs::read(&backup).unwrap(), ORIGINAL, "{phase}: 备份保留");
             }
             "restored" => {
-                assert_eq!(report.rolled_back, 1, "{phase}: 覆盖已发生，必须回滚");
-                assert_eq!(
-                    fs::read(&source).unwrap(),
-                    ORIGINAL,
-                    "{phase}: 强杀后原图必须被恢复"
-                );
+                assert_eq!(report.rolled_back, 1, "{phase}: 真实交换后崩溃，必须回滚");
+                assert_eq!(fs::read(&source).unwrap(), ORIGINAL, "{phase}: 强杀后原图必须被恢复");
                 assert!(!transactions.has_pending(), "{phase}: 回滚完成即销账");
                 assert_eq!(fs::read(&backup).unwrap(), ORIGINAL, "{phase}: 备份不许顺手删");
             }
