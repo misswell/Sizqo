@@ -75,6 +75,12 @@ pub struct ReplaceTransaction {
     /// 凭证要求对它不生效；2 = 本版本：覆盖事务必须带着完整的三份指纹落账。
     #[serde(default)]
     pub schema_version: u32,
+    /// §2.3 可信度随事务走：这份备份在记账时是 LegacyUnverified（老版本
+    /// 留下、没有内容指纹可验）。它的 `backupSha256` 只证明"记账以来没变过"，
+    /// **不能**证明它是正确的原图 —— 自动回滚不得借现场哈希把它洗成可信，
+    /// 一律转人工恢复；GUI 在用户看过双方状态后凭确认放行。
+    #[serde(default)]
+    pub backup_legacy_unverified: bool,
 }
 
 fn default_mode() -> TransactionMode {
@@ -162,7 +168,11 @@ impl TransactionStore {
         txn.validate_for_prepare()?;
         fs::create_dir_all(&self.root).map_err(|e| e.to_string())?;
         let json = serde_json::to_string(txn).map_err(|e| e.to_string())?;
-        write_atomic(&self.path_of(&txn.id), json.as_bytes())
+        write_atomic(&self.path_of(&txn.id), json.as_bytes())?;
+        // §2.2 目录项落盘：CreateNew 的日志虽是尽力而为，但写就得写到底。
+        fs::File::open(&self.root)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| e.to_string())
     }
 
     /// 记账凭证必须**先于覆盖落到目录里**：只写进内核缓存的日志，断电后和没写一样，
@@ -340,12 +350,21 @@ pub fn describe_pending(txn: &ReplaceTransaction) -> (PendingRecoveryStatus, Str
             return (PendingRecoveryStatus::ForeignModified, format!("当前源文件读不出来（{error}）"))
         }
     };
-    // 凭证核对（只读）：备份与记账时对不上单独成类。
+    // 凭证核对（只读）：备份与记账时对不上、或**读不出来**都单独成类 ——
+    // 忽略读取失败会把"回滚会失败"的现场错标成 AutoResolvable，
+    // 人工恢复列表又过滤 AutoResolvable，这条现场就永远到不了 GUI。
     if let Some(expected) = txn.backup_sha256.as_deref() {
-        if let Ok(actual) = crate::source_identity::sha256_of(&backup) {
-            if actual != expected {
+        match crate::source_identity::sha256_of(&backup) {
+            Ok(actual) if actual != expected => {
                 return (PendingRecoveryStatus::VoucherMismatch, "备份字节与事务凭证不符".into());
             }
+            Err(error) => {
+                return (
+                    PendingRecoveryStatus::VoucherMismatch,
+                    format!("备份读不出来（{error}），无法核对事务凭证"),
+                );
+            }
+            Ok(_) => {}
         }
     }
     if txn.output_sha256.as_deref() == Some(current.as_str()) {
@@ -367,6 +386,7 @@ pub fn describe_pending(txn: &ReplaceTransaction) -> (PendingRecoveryStatus, Str
 pub fn manual_restore(
     txn: &ReplaceTransaction,
     confirm_overwrite: bool,
+    confirm_voucher_mismatch: bool,
 ) -> Result<(), String> {
     if txn.mode != TransactionMode::ReplaceExisting {
         retire_generated_output(txn);
@@ -381,8 +401,17 @@ pub fn manual_restore(
         return Err("必须由用户确认覆盖当前位置的内容".into());
     }
     if txn.backup_sha256.is_some() {
-        // 凭证在场的照常核对：备份在记账之后被换过这件事，确认弹窗里必须写明。
-        verify_backup_voucher(txn, &backup)?;
+        // 凭证核对分层：**不匹配** = 用户在弹窗里看到了警告、明确选择继续 →
+        // 凭确认放行；**读不出来** = 连内容是什么都不知道，永远拒绝。
+        let actual = crate::source_identity::sha256_of(&backup)
+            .map_err(|error| format!("备份读不出来（{error}），无法恢复原图"))?;
+        if actual != txn.backup_sha256.as_deref().unwrap_or_default() {
+            if !confirm_voucher_mismatch {
+                return Err(
+                    "备份内容与事务凭证不符，需要用户在了解风险后明确确认".into(),
+                );
+            }
+        }
     }
     HistoryStore::write_backup_back_to_source(&backup, &source)?;
     remove_generated_output(txn);
@@ -414,6 +443,11 @@ pub fn rollback(txn: &ReplaceTransaction) -> Result<(), String> {
                 return Err("备份已不存在，无法自动恢复原图".into());
             }
             if !source.exists() {
+                if txn.backup_legacy_unverified {
+                    // 未经真实性验证的备份也不该在无人看过的情况下写回：
+                    // 源文件不在原位可能是用户自己移走的，现场交人工裁决。
+                    return Err(format!("{ROLLBACK_NEEDS_REVIEW}备份未经真实性验证（老版本记录），源文件又不在原位；不自动写回，请在人工恢复界面确认"));
+                }
                 // 源文件已经不在原位：按"提交没完成"对待，把原图写回去。
                 verify_backup_voucher(txn, &backup)?;
                 HistoryStore::write_backup_back_to_source(&backup, &source)?;
@@ -429,6 +463,11 @@ pub fn rollback(txn: &ReplaceTransaction) -> Result<(), String> {
                 }
             };
             if txn.output_sha256.as_deref() == Some(current.as_str()) {
+                if txn.backup_legacy_unverified {
+                    // 能证明源位置是本次产物，但备份本身证明不了是原图：
+                    // 自动回滚等于把未经确认的内容当原图写回 —— 转人工。
+                    return Err(format!("{ROLLBACK_NEEDS_REVIEW}备份未经真实性验证（老版本记录），不自动写回；原图备份与事务日志都保留在原处，请在人工恢复界面确认"));
+                }
                 // 源位置上就是这次写出的字节：安全回滚。
                 verify_backup_voucher(txn, &backup)?;
                 HistoryStore::write_backup_back_to_source(&backup, &source)?;
@@ -1065,6 +1104,7 @@ mod tests {
             cross_format: false,
             mode: TransactionMode::ReplaceExisting,
             schema_version: 0,
+            backup_legacy_unverified: false,
         }
     }
 
@@ -1232,6 +1272,49 @@ mod tests {
         assert!(store.has_pending(), "现场保留：备份与日志都留在原处");
     }
 
+    /// §9.1 审查补充场景：legacy 日志 + 源文件已不在原位。
+    /// 老契约仍然自动恢复 —— 源位置没有可被覆盖的用户内容，写回原图是
+    /// 唯一说得通的动作；这也正是"升级用户崩溃后还能拿回原图"的通路。
+    #[test]
+    fn a_legacy_journal_with_a_missing_source_still_restores_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let (history, store) = stores(dir.path());
+        let source = dir.path().join("gone.png");
+        let backup = dir.path().join("original.png");
+        fs::write(&backup, b"true-original").unwrap();
+        // 源文件整个不在了（用户移走 / 外部删除），日志还是老版本的无指纹格式。
+        let record = txn(&source, &backup, "legacy-gone");
+        store.prepare(&record).unwrap();
+        let report = store.recover(&history);
+        assert_eq!(report.rolled_back, 1, "源不在原位 = 没有可被覆盖的内容，写回原图");
+        assert_eq!(fs::read(&source).unwrap(), b"true-original");
+        assert!(!store.has_pending());
+    }
+
+    /// §9.1 审查补充场景：备份字节读不出来时，现场必须被归为"需要人工"，
+    /// 绝不 AutoResolvable（否则人工恢复列表过滤掉它，用户永远看不到）。
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_backup_is_never_classified_auto_resolvable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("a.png");
+        let backup = dir.path().join("original.png");
+        fs::write(&backup, b"true-original").unwrap();
+        fs::write(&source, b"compressed").unwrap();
+        let mut record = v2_txn(&source, &backup, "unreadable-voucher");
+        // 记账后备份变得读不出来（权限剥离）。
+        let mut mode = fs::metadata(&backup).unwrap().permissions();
+        mode.set_mode(0o000);
+        fs::set_permissions(&backup, mode).unwrap();
+        let (status, detail) = describe_pending(&record);
+        let _ = fs::remove_file(&backup);
+        assert_eq!(status, PendingRecoveryStatus::VoucherMismatch, "{detail}");
+        assert!(detail.contains("备份读不出来"), "{detail}");
+        // 回滚本身也必须拒绝（凭证读不出来 = 无法证明要写回什么）。
+        assert!(rollback(&record).is_err());
+    }
+
     /// §3.3 原子交换：验证通过 = 提交同时成立，被换出的旧文件随后清掉。
     #[test]
     fn publish_replace_swaps_and_verifies_the_swapped_out_bytes() {
@@ -1377,6 +1460,7 @@ mod tests {
             cross_format: false,
             mode: TransactionMode::CreateNew,
             schema_version: 0,
+            backup_legacy_unverified: false,
         }
     }
 

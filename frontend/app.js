@@ -1486,6 +1486,8 @@ function updateQueueSummary() {
   if (typeof markQueueSortDirtyIfResultDependent === 'function') {
     markQueueSortDirtyIfResultDependent();
   }
+  // 行的 hidden 旗标可能随状态变化：可见列表缓存必须失效。
+  if (typeof markQueueViewCacheDirty === 'function') markQueueViewCacheDirty();
   // 拖放区只在清单为空时占这一块：清单非空时它是队列前面一块永远走不掉的画框，
   // `.dropzone` 又是 flex:1，会把行顶到看不见的那一边。收文件本来就不靠它——Tauri 的
   // 拖放事件是整个 webview 的，清单在的时候随时拖进来照样收（运行条上也有「追加」）。
@@ -1628,7 +1630,7 @@ function measureQueueStride(list) {
   }
   return queueVirtual.stride;
 }
-function markQueueSortDirty() { queueSortDirty = true; }
+function markQueueSortDirty() { queueSortDirty = true; markQueueViewCacheDirty(); }
 function markQueueSortDirtyIfResultDependent() {
   var sort = document.getElementById('queueSortKey');
   var key = sort ? sort.value : 'import';
@@ -1683,11 +1685,39 @@ function applyQueueView() {
   queueSortState.descending = queueSortDescending;
   queueSortDirty = false;
   sortedQueueEntries = entries;
+  // 排序换了，可见序列（窗口切片的基底）必须重算。
+  markQueueViewCacheDirty();
   attachQueueView(list, failedOnly, mediaView, null);
 }
 
 /// §8.2 §8.3 附着阶段：隐藏旗标是 O(N) 纯数据操作；DOM 移动只发生在
 /// 虚拟窗口内（>200 项且有真实滚动容器时），其余情况保持全量语义。
+// §8 审查修复：滚动重附的缓存与行 DOM 上限。
+// visibleList 只在排序/筛选/成员变化时重算；滚动事件只做窗口切片。
+// fileRows 是有上限的 LRU —— 一万行滚一遍不会在内存里攒一万个 detached 节点，
+// 业务状态始终在 queueItems，被逐出的行滚回来时按需重建。
+var queueViewCache = { visibleFiles: [], dirty: true, membersRef: null };
+var fileRowOrder = [];
+var FILE_ROW_CACHE_LIMIT = 600;
+function markQueueViewCacheDirty() { queueViewCache.dirty = true; }
+
+/// 可见序列 = **排序后**的序列过滤掉隐藏行（窗口切片必须跟排序方向一致）。
+function computeVisibleFiles(failedOnly, mediaView, members) {
+  var visible = [];
+  for (var i = 0; i < sortedQueueEntries.length; i++) {
+    var entry = sortedQueueEntries[i];
+    var file = entry.file;
+    var failedRow = queueState(file) === 'failed';
+    var item = queueItems.get(file);
+    var mediaVisible = mediaView === 'all' || !item || !item.mediaKind || item.mediaKind === mediaView;
+    var row = entry.row || fileRows[file];
+    var rowHidden = row ? row.hidden
+      : !(members.has(file) && mediaVisible && (!failedOnly || failedRow));
+    if (!rowHidden) visible.push(file);
+  }
+  return visible;
+}
+
 function attachQueueView(list, failedOnly, mediaView, membersArg) {
   var visible = 0;
   var members = membersArg || new Set(files);
@@ -1696,6 +1726,18 @@ function attachQueueView(list, failedOnly, mediaView, membersArg) {
   Object.keys(fileRows).forEach(function(file) {
     if (fileRows[file] === null) delete fileRows[file];
   });
+  var cacheUsable = membersArg === null && !queueViewCache.dirty
+    && queueViewCache.failedOnly === failedOnly && queueViewCache.mediaView === mediaView;
+  var visibleFiles;
+  if (cacheUsable) {
+    visibleFiles = queueViewCache.visibleFiles;
+  } else {
+    visibleFiles = computeVisibleFiles(failedOnly, mediaView, members);
+    queueViewCache.visibleFiles = visibleFiles;
+    queueViewCache.dirty = false;
+    queueViewCache.failedOnly = failedOnly;
+    queueViewCache.mediaView = mediaView;
+  }
   Object.keys(fileRows).forEach(function(file) {
     // 「只看失败」也按 queueItems 判，不按 DOM class：类名只是画出来的结果，
     // 拿它当判据，一旦某处忘了同步 class，筛出来的东西就是错的。
@@ -1718,42 +1760,30 @@ function attachQueueView(list, failedOnly, mediaView, membersArg) {
     top = Math.min(top, Math.max(0, orderedEntries.length - 1));
     // 隐藏行不占窗口名额：窗口对**可见序列**切片。未建行的文件按同一份
     // 数据判据判可见性（queueItems 是唯一事实，行 DOM 只是画）。
-    var visibleEntries = orderedEntries.filter(function(entry) {
-      if (!entry.row) {
-        var failedRow = queueState(entry.file) === 'failed';
-        var item = queueItems.get(entry.file);
-        var mediaVisible = mediaView === 'all' || !item || !item.mediaKind || item.mediaKind === mediaView;
-        return members.has(entry.file) && mediaVisible && (!failedOnly || failedRow);
-      }
-      return !entry.row.hidden;
+    top = Math.min(top, Math.max(0, visibleFiles.length - 1));
+    bottom = Math.min(bottom, visibleFiles.length);
+    var windowEntries = visibleFiles.slice(top, bottom).map(function(file) {
+      return { file: file, row: fileRows[file] };
     });
-    top = Math.min(top, Math.max(0, visibleEntries.length - 1));
-    bottom = Math.min(bottom, visibleEntries.length);
-    var windowEntries = visibleEntries.slice(top, bottom);
-    queueVirtual.topSpacer = ensureQueueSpacer(list, queueVirtual.topSpacer, 'queue-window-top');
-    queueVirtual.bottomSpacer = ensureQueueSpacer(list, queueVirtual.bottomSpacer, 'queue-window-bottom');
     var topHeight = top * stride;
-    var bottomHeight = Math.max(0, visibleEntries.length - bottom) * stride;
-    if (typeof queueVirtual.topSpacer.style === 'object' && queueVirtual.topSpacer.style) {
-      queueVirtual.topSpacer.style.height = topHeight + 'px';
-      queueVirtual.bottomSpacer.style.height = bottomHeight + 'px';
-    } else {
-      queueVirtual.topSpacer.height = topHeight;
-      queueVirtual.bottomSpacer.height = bottomHeight;
-    }
+    var bottomHeight = Math.max(0, visibleFiles.length - bottom) * stride;
     var wanted = new Set(windowEntries.map(function(entry) { return entry.file; }));
+    // §8.3 窗口外行先摘除（保留元素与 painted 状态，滚回来即见），再按
+    // 「topSpacer → 窗口行 → bottomSpacer」的顺序重新落位 —— appendChild
+    // 是移动语义，这个顺序每次滚动都成立，底部垫片永远在最后一行之后。
     Object.keys(fileRows).forEach(function(file) {
       var row = fileRows[file];
       if (!wanted.has(file) && row.parentNode === list) {
-        // 窗口外的行从 DOM 摘下但保留元素与 painted 状态：滚回来即见，不重建。
         if (typeof row.remove === 'function') row.remove();
         else if (list.removeChild && row.parentNode === list) list.removeChild(row);
       }
     });
+    queueVirtual.topSpacer = ensureQueueSpacer(list, queueVirtual.topSpacer, 'queue-window-top');
     windowEntries.forEach(function(entry) {
       if (!entry.row) {
         entry.row = createQueueRow(entry.file);
         fileRows[entry.file] = entry.row;
+        fileRowOrder.push(entry.file);
         paintQueueRow(entry.file);
         var failedRow = queueState(entry.file) === 'failed';
         var item = queueItems.get(entry.file);
@@ -1763,11 +1793,20 @@ function attachQueueView(list, failedOnly, mediaView, membersArg) {
       if (entry.row.parentNode !== list) list.appendChild(entry.row);
       visible++;
     });
+    queueVirtual.bottomSpacer = ensureQueueSpacer(list, queueVirtual.bottomSpacer, 'queue-window-bottom');
+    if (typeof queueVirtual.topSpacer.style === 'object' && queueVirtual.topSpacer.style) {
+      queueVirtual.topSpacer.style.height = topHeight + 'px';
+      queueVirtual.bottomSpacer.style.height = bottomHeight + 'px';
+    } else {
+      queueVirtual.topSpacer.height = topHeight;
+      queueVirtual.bottomSpacer.height = bottomHeight;
+    }
   } else {
     orderedEntries.forEach(function(entry, index) {
       if (!entry.row) {
         entry.row = createQueueRow(entry.file);
         fileRows[entry.file] = entry.row;
+        fileRowOrder.push(entry.file);
         paintQueueRow(entry.file);
       }
       if (!entry.row.hidden) visible++;
@@ -1776,11 +1815,18 @@ function attachQueueView(list, failedOnly, mediaView, membersArg) {
     queueVirtual.topSpacer = removeQueueSpacer(list, queueVirtual.topSpacer);
     queueVirtual.bottomSpacer = removeQueueSpacer(list, queueVirtual.bottomSpacer);
   }
+  pruneFileRowCache(list);
   var empty = document.getElementById('queueFilterEmpty');
   if (empty) empty.hidden = !failedOnly || visible > 0;
 }
 function ensureQueueSpacer(list, existing, id) {
-  if (existing && existing.parentNode === list) return existing;
+  // appendChild 是移动语义：已存在的垫片也要重新落位 —— 调用方按
+  // 「topSpacer → 窗口行 → bottomSpacer」的次序调用，这里的移动保证
+  // 每次滚动后垫片都分别在第一行之前 / 最后一行之后。
+  if (existing && existing.parentNode === list) {
+    list.appendChild(existing);
+    return existing;
+  }
   if (existing && typeof existing.remove === 'function') existing.remove();
   var spacer = typeof document.createElement === 'function'
     ? document.createElement('div')
@@ -1792,6 +1838,20 @@ function ensureQueueSpacer(list, existing, id) {
 function removeQueueSpacer(list, existing) {
   if (existing && typeof existing.remove === 'function') existing.remove();
   return null;
+}
+/// §8 审查修复：行缓存 LRU —— detached 行超出上限就逐出（元素交 GC），
+/// 滚回来由窗口循环按需重建；queueItems 里的业务状态从不依赖行存在。
+function pruneFileRowCache(list) {
+  if (fileRowOrder.length <= FILE_ROW_CACHE_LIMIT) return;
+  var windowSet = new Set(queueViewCache.visibleFiles);
+  var kept = [];
+  for (var i = 0; i < fileRowOrder.length && fileRowOrder.length - kept.length > FILE_ROW_CACHE_LIMIT; i++) {
+    var file = fileRowOrder[i];
+    var row = fileRows[file];
+    if (!row || windowSet.has(file) || row.parentNode === list) { kept.push(file); continue; }
+    delete fileRows[file];
+  }
+  fileRowOrder = kept.concat(fileRowOrder.slice(Math.max(0, i)));
 }
 /// 滚动时只重算窗口：rAF 节流，绝不触发排序或全量重绘。
 function installQueueScrollHandler() {
@@ -4860,18 +4920,33 @@ async function resolveRecovery(item, restore) {
   if (restore) {
     var detail = localizeUiText('恢复原图会覆盖当前位置的文件：') + '\n' + item.sourcePath
       + '\n\n' + localizeUiText('将写回的原图备份：') + '\n' + item.backupPath;
+    var confirmVoucherMismatch = false;
     if (item.voucherMatch === false) {
-      detail += '\n\n' + localizeUiText('警告：这份备份的字节与记账时的指纹不符，恢复的内容可能不是当初的原图。');
+      // §3.4 分层确认：备份与记账指纹不符 = 用户看过警告后明确选择继续，
+      // 后端凭这个确认放行；警告不展示就确认等于骗用户。
+      detail += '\n\n' + localizeUiText('警告：这份备份的字节与记账时的指纹不符，恢复的内容可能不是当初的原图。继续即表示你了解并接受这一风险。');
+      confirmVoucherMismatch = true;
     }
     if (!confirm(detail)) return;
+    try {
+      var outcome = await invoke('resolve_pending_recovery', {
+        historyId: item.historyId,
+        restore: restore,
+        confirmOverwrite: true,
+        confirmVoucherMismatch: confirmVoucherMismatch,
+      });
+      showToast(localizeBackendText(outcome.message) || localizeUiText('已处理'));
+    } catch (error) {
+      showToast(localizeUiText('处理失败: ') + (error.message || error));
+    }
+    await refreshPendingRecoveries();
+    return;
   }
   try {
-    var outcome = await invoke('resolve_pending_recovery', {
-      historyId: item.historyId,
-      restore: restore,
-      confirmOverwrite: restore,
+    var dismissed = await invoke('resolve_pending_recovery', {
+      historyId: item.historyId, restore: false,
     });
-    showToast(localizeBackendText(outcome.message) || localizeUiText('已处理'));
+    showToast(localizeBackendText(dismissed.message) || localizeUiText('已处理'));
   } catch (error) {
     showToast(localizeUiText('处理失败: ') + (error.message || error));
   }

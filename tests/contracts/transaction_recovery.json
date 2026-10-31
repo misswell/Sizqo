@@ -49,6 +49,12 @@
       "expected": {
         "outcome": "refused"
       }
+    },
+    {
+      "scenario": "legacy_backup_voucher_not_auto_trusted",
+      "expected": {
+        "outcome": "preserved"
+      }
     }
   ]
 }

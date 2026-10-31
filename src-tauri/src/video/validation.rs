@@ -73,30 +73,34 @@ pub fn validate(source: &VideoProbe, output: &VideoProbe, plan: &EncodePlan) -> 
             ));
         }
     }
-    // §5.4 色彩元数据：源里明确写了的传递函数 / 原色，输出不许悄悄丢掉 ——
-    // "删掉色彩信息后按普通 BT.709 输出"就是静默重上色。
+    // §5.4 色彩元数据：源里明确写了的传递函数 / 原色 / 色彩矩阵，输出必须
+    // **保持同一个值** —— 只检查"存在"拦得住"丢了"，拦不住"换了"：
+    // bt709 的源被贴上 smpte2084 的标签就是静默重上色，比丢掉更隐蔽。
+    // 管线没有任何显式色彩转换路径，因此值不一致一律判失败。
+    fn color_specified(value: &str) -> bool {
+        !value.is_empty()
+            && !value.eq_ignore_ascii_case("unknown")
+            && !value.eq_ignore_ascii_case("unspecified")
+            && !value.eq_ignore_ascii_case("reserved")
+    }
     let source_video = source.video();
     if let Some(source_video) = source_video {
-        for (name, recorded) in [
-            ("transfer", source_video.color_transfer.as_str()),
-            ("primaries", source_video.color_primaries.as_str()),
+        for (name, recorded, carried) in [
+            ("transfer", source_video.color_transfer.as_str(), v.color_transfer.as_str()),
+            ("primaries", source_video.color_primaries.as_str(), v.color_primaries.as_str()),
+            ("space", source_video.color_space.as_str(), v.color_space.as_str()),
         ] {
-            let specified = !recorded.is_empty()
-                && !recorded.eq_ignore_ascii_case("unknown")
-                && !recorded.eq_ignore_ascii_case("unspecified");
-            if !specified {
+            if !color_specified(recorded) {
                 continue;
             }
-            let carried_out = match name {
-                "transfer" => v.color_transfer.as_str(),
-                _ => v.color_primaries.as_str(),
-            };
-            if carried_out.is_empty()
-                || carried_out.eq_ignore_ascii_case("unknown")
-                || carried_out.eq_ignore_ascii_case("unspecified")
-            {
+            if !color_specified(carried) {
                 return Err(format!(
                     "Encoded output dropped the source color {name} ({recorded})"
+                ));
+            }
+            if !recorded.eq_ignore_ascii_case(carried) {
+                return Err(format!(
+                    "Encoded output changed the source color {name} from {recorded} to {carried}"
                 ));
             }
         }
@@ -445,6 +449,28 @@ mod tests {
         assert!(validate(&source, &output, &plan(MetadataPolicy::KeepAll))
             .expect_err("多余的视频流必须失败")
             .contains("exactly one video stream"));
+    }
+
+    /// §5.4 审查修复回归：源 bt709 的 transfer 被贴上 smpte2084 标签
+    /// —— 只查"存在"会放行，静默重上色比丢标签更隐蔽。
+    #[test]
+    fn a_changed_color_value_is_a_failure_not_just_a_dropped_one() {
+        let mut root = serde_json::json!({
+            "streams": [
+                {"index": 0, "codec_type": "video", "width": 160, "height": 120,
+                 "pix_fmt": "yuv420p", "codec_name": "h264", "avg_frame_rate": "10/1",
+                 "color_transfer": "bt709", "color_primaries": "bt709", "color_space": "bt709"},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac",
+                 "channels": 2, "sample_rate": "48000"}
+            ],
+            "format": {"duration": "1", "format_name": "mp4", "tags": {}}
+        });
+        let source = VideoProbe::parse(root.clone(), 1000).unwrap();
+        root["streams"][0]["color_transfer"] = serde_json::json!("smpte2084");
+        let relabeled = VideoProbe::parse(root, 1000).unwrap();
+        let error = validate(&source, &relabeled, &plan(MetadataPolicy::KeepAll))
+            .expect_err("换了色彩标签必须失败");
+        assert!(error.contains("changed the source color transfer"), "{error}");
     }
 
     /// §5.4 源里明确写了的色彩信息，输出不许悄悄丢掉。

@@ -60,6 +60,7 @@ fn run_crash_child(phase: &str, workdir: &Path) -> ! {
         cross_format: false,
         mode: TransactionMode::ReplaceExisting,
         schema_version: SCHEMA_VERSION,
+        backup_legacy_unverified: false,
     };
 
     match phase {
@@ -171,7 +172,12 @@ fn main() {
         fs::create_dir_all(&workdir).unwrap();
         spawn_and_wait_for_crash(phase, &workdir);
 
-        let (source, backup, history_root, partial) = child_dirs(&workdir);
+        let (source, fallback_backup, history_root, partial) = child_dirs(&workdir);
+        // 真实快照链产出的备份在 history/backups/<key>/ 里；路径由子进程留档。
+        let backup = match fs::read_to_string(workdir.join("backup-path.txt")) {
+            Ok(path) => PathBuf::from(path.trim()),
+            Err(_) => fallback_backup,
+        };
         let history = HistoryStore::new(history_root.clone()).unwrap();
         let transactions = TransactionStore::new(history_root.join("transactions"));
 

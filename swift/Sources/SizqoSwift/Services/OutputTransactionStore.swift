@@ -157,6 +157,10 @@ struct ReplaceTransaction: Codable {
     /// §3.1 记录版本。0 = 老版本日志（无此字段）：走独立的兼容恢复逻辑；
     /// 2 = 本版本：覆盖事务必须带着完整的三份指纹落账。
     var schemaVersion: Int
+    /// §2.3 可信度随事务走：记账时这份备份是 LegacyUnverified。它的
+    /// backupSha256 只证明"记账以来没变"，不证明它是原图 —— 自动回滚
+    /// 不得借现场哈希洗白，一律转人工。
+    var backupLegacyUnverified: Bool
 
     init(id: String, historyId: String, sourcePath: String, outputPath: String,
          backupPath: String, tempOutputPath: String? = nil, originalSize: Int64,
@@ -165,7 +169,8 @@ struct ReplaceTransaction: Codable {
          placeholderIdentity: (device: Int64, inode: UInt64)? = nil,
          createdAt: Int64, crossFormat: Bool,
          mode: TransactionMode = .replaceExisting,
-         schemaVersion: Int = transactionSchemaVersion) {
+         schemaVersion: Int = transactionSchemaVersion,
+         backupLegacyUnverified: Bool = false) {
         self.id = id
         self.historyId = historyId
         self.sourcePath = sourcePath
@@ -182,13 +187,14 @@ struct ReplaceTransaction: Codable {
         self.crossFormat = crossFormat
         self.mode = mode
         self.schemaVersion = schemaVersion
+        self.backupLegacyUnverified = backupLegacyUnverified
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, historyId, sourcePath, outputPath, backupPath, tempOutputPath
         case originalSize, expectedOutputSize, originalSha256, outputSha256, backupSha256
         case placeholderDevice, placeholderInode
-        case createdAt, crossFormat, mode, schemaVersion
+        case createdAt, crossFormat, mode, schemaVersion, backupLegacyUnverified
     }
 
     init(from decoder: Decoder) throws {
@@ -217,6 +223,7 @@ struct ReplaceTransaction: Codable {
         // 认成 createNew 的话，恢复逻辑会当成"没动过原图"而不再写回备份，原图就回不来了。
         mode = try container.decodeIfPresent(TransactionMode.self, forKey: .mode) ?? .replaceExisting
         schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 0
+        backupLegacyUnverified = try container.decodeIfPresent(Bool.self, forKey: .backupLegacyUnverified) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -238,6 +245,7 @@ struct ReplaceTransaction: Codable {
         try container.encode(crossFormat, forKey: .crossFormat)
         try container.encode(mode, forKey: .mode)
         try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(backupLegacyUnverified, forKey: .backupLegacyUnverified)
     }
 
     /// §3.1 凭证完整性门：新版本事务缺少必要身份信息时拒绝落账。
@@ -410,7 +418,55 @@ struct StagedWrite {
             discard()
             return false
         }
+        // §2.2 publish 的目录项也要落盘（与 Rust 提交链同款）。
+        _ = syncDirectory(at: (target as NSString).deletingLastPathComponent)
         return true
+    }
+
+    /// §28 审查修复：占位 inode 的**原子所有权验证**。
+    ///
+    /// 申请的 0 字节占位可能被外部删掉、又在同一路径放进自己的文件 ——
+    /// 直接 rename 就把别人的内容盖掉了。这里用 `renameatx_np(RENAME_SWAP)`
+    /// 先交换、再验证**被换出来**的字节是不是我们那个占位 inode：
+    /// 一致 → 占位已被我们的候选顶掉，提交成立；不一致 → 换回原状并拒绝，
+    /// 外部文件一个字节都不动。不支持原子交换的文件系统退回"先验身份再
+    /// rename"（与旧门同级，绝不倒退到无条件覆盖）。
+    /// - Parameters:
+    ///   - placeholderIdentity: 记账时占位文件的 `(dev,ino)`；nil = 无凭证
+    ///     （replace 同格式覆盖没有占位），此时退回普通 publish。
+    func publishIfPlaceholderMatches(to target: String, placeholderIdentity: (device: Int64, inode: UInt64)?) -> Bool {
+        guard let expected = placeholderIdentity else {
+            return publish(to: target)
+        }
+        // 候选必须已经写满并 fsync（writeSynced），这里只负责原子顶替。
+        let swap = { () -> Bool in
+            OutputTransactionStore.atomicSwap(self.temp, target)
+        }
+        if swap() {
+            // 交换成功：temp 现在持有被换出来的"占位或外部内容"。
+            if let actual = OutputTransactionStore.fileIdentity(self.temp),
+               actual.device == expected.device && actual.inode == expected.inode {
+                // 换出来的正是我们的占位：提交成立，占位清掉。
+                try? FileManager.default.removeItem(atPath: self.temp)
+                _ = syncDirectory(at: (target as NSString).deletingLastPathComponent)
+                return true
+            }
+            // 被换出来的不是我们的占位：换回原状，外部内容原样保留。
+            if swap() {
+                discard()
+                return false
+            }
+            // 换回失败：绝对保留现场 —— 候选与外部内容都不删，交人工。
+            NSLog("Sizqo: 占位交换验证失败且换回失败，现场保留（%@" , target)
+            return false
+        }
+        // 不支持原子交换：退回"先验身份再 rename"（与旧门同级）。
+        guard let actual = OutputTransactionStore.fileIdentity(target),
+              actual.device == expected.device && actual.inode == expected.inode else {
+            discard()
+            return false
+        }
+        return publish(to: target)
     }
 
     /// 独占 + 写入 + 改名一条龙：调用方不需要在中途记任何东西时使用。
@@ -607,6 +663,10 @@ final class OutputTransactionStore: @unchecked Sendable {
                 return nil
             }
             if !fileExists(at: txn.sourcePath) {
+                if txn.backupLegacyUnverified {
+                    return Self.rollbackNeedsReview +
+                        "备份未经真实性验证（老版本记录），源文件又不在原位；不自动写回，请在人工恢复界面确认"
+                }
                 // 源文件已经不在原位：按"提交没完成"对待，把原图写回去。
                 return restore()
             }
@@ -614,6 +674,10 @@ final class OutputTransactionStore: @unchecked Sendable {
                 return "当前源文件读不出来，无法确认它是不是本次事务的产物；备份与日志原样保留"
             }
             if txn.outputSha256 == current {
+                if txn.backupLegacyUnverified {
+                    return Self.rollbackNeedsReview +
+                        "备份未经真实性验证（老版本记录），不自动写回；原图备份与事务日志都保留在原处，请在人工恢复界面确认"
+                }
                 // 源位置上就是这次写出的字节：安全回滚。
                 return restore()
             }
@@ -745,16 +809,25 @@ final class OutputTransactionStore: @unchecked Sendable {
 
     /// 人工恢复的"恢复原图"：GUI 必须已经把双方状态展示给用户并拿到确认 ——
     /// 这里有意绕过"证明不了归属就拒绝"的自动门；凭证不符只随确认放行。
+    /// - `confirmVoucherMismatch`: 备份与记账指纹**不符**时，用户看过警告后的
+    ///   明确放行；读不出来（无法核对）时永远拒绝 —— 与 Rust `manual_restore`
+    ///   的分层同一契约。
     @discardableResult
-    func manualRestore(_ txn: ReplaceTransaction, confirmOverwrite: Bool) -> String? {
+    func manualRestore(_ txn: ReplaceTransaction, confirmOverwrite: Bool,
+                       confirmVoucherMismatch: Bool = false) -> String? {
         guard txn.mode == .replaceExisting else {
             Self.retireGeneratedOutput(txn)
             return nil
         }
         guard fileExists(at: txn.backupPath) else { return "备份已不存在，无法恢复原图" }
         guard confirmOverwrite else { return "必须由用户确认覆盖当前位置的内容" }
-        if txn.backupSha256 != nil {
-            if let error = OutputTransactionStore.verifyBackupVoucher(txn) { return error }
+        if let expected = txn.backupSha256 {
+            guard case .success(let actual) = sha256OfFile(txn.backupPath) else {
+                return "备份读不出来，无法核对事务凭证；不能恢复来历不明的内容"
+            }
+            if actual != expected && !confirmVoucherMismatch {
+                return "备份内容与事务凭证不符，需要用户在了解风险后明确确认"
+            }
         }
         do {
             try HistoryStore.writeBackupBack(to: txn.sourcePath, backup: txn.backupPath)
@@ -784,6 +857,15 @@ final class OutputTransactionStore: @unchecked Sendable {
                 backupExists: fileExists(at: txn.backupPath),
                 backupSize: fileLength(txn.backupPath),
                 voucherMatch: voucherMatch)
+        }
+    }
+
+    /// §28 原子交换：macOS 10.13+ `renameatx_np(RENAME_SWAP)`。
+    static func atomicSwap(_ a: String, _ b: String) -> Bool {
+        a.withCString { pa in
+            b.withCString { pb in
+                renameatx_np(AT_FDCWD, pa, AT_FDCWD, pb, UInt32(RENAME_SWAP)) == 0
+            }
         }
     }
 

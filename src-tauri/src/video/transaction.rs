@@ -59,7 +59,8 @@ pub fn commit(source:&Path,partial:&Path,target:&Path,o:&VideoOptions,probe:&Vid
     let output_sha256=Some(crate::source_identity::sha256_of(partial).map_err(|e|e.to_string())?);
     // §3.1 备份凭证：来历记录里有就抄，老备份没有记录就现场算一份。
     let backup_sha256=backup.and_then(|b|history.recorded_backup_sha256(b));
-    let txn=Some(ReplaceTransaction{id:id.clone(),history_id:id.clone(),source_path:source.to_string_lossy().into(),output_path:target.to_string_lossy().into(),backup_path:backup.map(|p|p.to_string_lossy().into()).unwrap_or_default(),temp_output_path:Some(partial.to_string_lossy().into()),original_size:probe.size_bytes,expected_output_size:size,original_sha256:identity.sha256.clone(),output_sha256,backup_sha256,placeholder_identity:None,created_at:now_millis(),cross_format:false,mode:if replace{TransactionMode::ReplaceExisting}else{TransactionMode::CreateNew},schema_version:crate::output_transaction::SCHEMA_VERSION});
+    let backup_legacy_unverified=backup.is_some_and(|b|matches!(history.backup_verification(b),Ok(crate::history::BackupVerification::LegacyUnverified)));
+    let txn=Some(ReplaceTransaction{id:id.clone(),history_id:id.clone(),source_path:source.to_string_lossy().into(),output_path:target.to_string_lossy().into(),backup_path:backup.map(|p|p.to_string_lossy().into()).unwrap_or_default(),temp_output_path:Some(partial.to_string_lossy().into()),original_size:probe.size_bytes,expected_output_size:size,original_sha256:identity.sha256.clone(),output_sha256,backup_sha256,placeholder_identity:None,created_at:now_millis(),cross_format:false,mode:if replace{TransactionMode::ReplaceExisting}else{TransactionMode::CreateNew},schema_version:crate::output_transaction::SCHEMA_VERSION,backup_legacy_unverified});
     if replace{transactions.prepare_durable(txn.as_ref().unwrap())?;}else{transactions.prepare(txn.as_ref().unwrap())?;}
     let mut claimed=false;
     let install=(||->Result<(),(String,bool)>{

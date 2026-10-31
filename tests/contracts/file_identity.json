@@ -31,6 +31,12 @@
       "expected": {
         "outcome": "changed"
       }
+    },
+    {
+      "scenario": "snapshot_refuses_when_baseline_differs_from_current_bytes",
+      "expected": {
+        "outcome": "refused"
+      }
     }
   ]
 }

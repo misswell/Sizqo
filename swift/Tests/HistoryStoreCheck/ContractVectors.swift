@@ -89,6 +89,13 @@ func contractRunScenario(_ scenario: String, _ dir: String) -> String {
         guard case .success(let identity) = SourceIdentity.readWithHash(original) else { return "error" }
         if case .unchanged = identity.verify(at: original) { return "unchanged" }
         return "changed"
+    case "snapshot_refuses_when_baseline_differs_from_current_bytes":
+        // §2.2 P0 修复回归：基线 A 在手、磁盘上是 B → 快照必须拒绝。
+        let baselineStore = HistoryStore(root: dir + "/history")
+        makeFile(original, [99, 104, 97, 110])                      // 磁盘上是 B
+        let baselineHash = sha256OfData(Data([98, 97, 115, 101]))   // 基线是 A
+        let refused = baselineStore.ensureBackupVerified(for: original, currentSha256: baselineHash)
+        return refused == nil ? "refused" : "snapshotWritten"
     case "missing_file_reported_changed":
         makeFile(original, [103, 111, 110, 101])
         guard case .success(let identity) = SourceIdentity.readWithHash(original) else { return "error" }
@@ -208,6 +215,30 @@ func contractRunScenario(_ scenario: String, _ dir: String) -> String {
             return (report.rolledBack == 0 && journal.hasPending() && sourceBytes == expected)
                 ? "preserved" : "restored"
         }
+    case "legacy_backup_voucher_not_auto_trusted":
+        // §2.3 P1 修复回归：legacy 标记的备份即使现场哈希"没变过"，
+        // 自动回滚也必须转人工，而不是把备份洗成可信原图。
+        let store = HistoryStore(root: dir + "/history")
+        let journal = OutputTransactionStore(root: (dir as NSString).appendingPathComponent("history/transactions"))
+        makeFile(backup, [116, 114, 117, 101])
+        makeFile(original, [99, 111, 109, 112])
+        var txn = contractReplaceTxn(source: original, backup: backup,
+                                     outputSha256: sha256OfData(Data([99, 111, 109, 112])),
+                                     id: "launder", schemaVersion: 2)
+        txn = ReplaceTransaction(
+            id: txn.id, historyId: txn.historyId, sourcePath: txn.sourcePath,
+            outputPath: txn.outputPath, backupPath: txn.backupPath,
+            tempOutputPath: nil, originalSize: txn.originalSize,
+            expectedOutputSize: txn.expectedOutputSize,
+            originalSha256: txn.originalSha256, outputSha256: txn.outputSha256,
+            backupSha256: txn.backupSha256, placeholderIdentity: nil,
+            createdAt: txn.createdAt, crossFormat: false,
+            mode: .replaceExisting, schemaVersion: 2,
+            backupLegacyUnverified: true)
+        check(journal.prepare(txn) == nil, "凭证落账")
+        let report = journal.recover(store)
+        return (report.needsReview >= 1 && report.rolledBack == 0 && journal.hasPending()
+                && readBytes(original) == [99, 111, 109, 112]) ? "preserved" : "restored"
     case "manual_restore_with_confirmation_restores", "manual_restore_refuses_without_confirmation":
         // §3.4 人工恢复：确认在场才允许覆盖"证明不了归属"的现场。
         let store = HistoryStore(root: dir + "/history")

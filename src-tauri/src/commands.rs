@@ -1362,6 +1362,14 @@ fn commit_output(
         cross_format,
         mode: placement.transaction_mode(),
         schema_version: output_transaction::SCHEMA_VERSION,
+        // §2.3 可信度随事务走：LegacyUnverified 的备份在现场哈希下也绝不能
+        // 被自动回滚当成可信原图 —— 标记进日志，恢复侧据此转人工。
+        backup_legacy_unverified: backup_file.as_ref().is_some_and(|backup| {
+            matches!(
+                history.backup_verification(backup),
+                Ok(crate::history::BackupVerification::LegacyUnverified)
+            )
+        }),
     };
     // ③记账先于动手：写不进日志就还不许碰用户文件，占好的名字也得收回去。
     if let Err(detail) = placement.journal(transactions, &txn) {
@@ -1438,6 +1446,11 @@ fn commit_output(
         }
     }
     staged.settle();
+    // §2.2 覆盖的目录项必须落盘：rename 的持久化以父目录 fsync 为准，
+    // 否则断电后事务日志说覆盖了、目录项却没了。
+    if let Some(parent) = out_path.parent() {
+        crate::history::sync_dir(parent).map_err(OutputWriteError::OutputWriteFailed)?;
+    }
 
     if cross_format {
         // 删不掉（权限/被占用）时不许静默：磁盘上会同时留着原图和新格式产物。
@@ -2711,13 +2724,17 @@ pub struct PendingRecoveryResolution {
 
 /// §3.4 人工恢复处置：`restore=false` = 暂不处理（现场原样保留）；
 /// `restore=true` 必须带 `confirmOverwrite` —— GUI 已把当前文件与备份的
-/// 状态展示给用户并拿到确认。维护租约全程在场。
+/// 状态展示给用户并拿到确认；`confirmVoucherMismatch` 只在用户看过
+/// "备份与记账指纹不符"的警告后为真。维护租约全程在场；
+/// 沙盒下写回外部目录与普通恢复走同一道 FileAccess 授权。
 #[tauri::command]
 pub async fn resolve_pending_recovery(
+    app: AppHandle,
     state: State<'_, AppState>,
     history_id: String,
     restore: bool,
     confirm_overwrite: Option<bool>,
+    confirm_voucher_mismatch: Option<bool>,
 ) -> Result<PendingRecoveryResolution, String> {
     let _lease = match state.compression.begin_maintenance() {
         Some(lease) => lease,
@@ -2736,9 +2753,24 @@ pub async fn resolve_pending_recovery(
             message: "现场已保留：原图备份与事务日志都在原处，随时可以再处理".into(),
         });
     }
-    output_transaction::manual_restore(&txn, confirm_overwrite.unwrap_or(false))
+    // §44 同款沙盒授权：写回源位置前必须拿到该目录的访问权（Direct 直通）。
+    {
+        let target = Path::new(&txn.source_path);
+        let mut reauth = || request_folder_access(&app, state.inner(), target);
+        let _guard = state
+            .access
+            .acquire(target.parent().unwrap_or(target), &mut reauth)
+            .ok_or_else(|| "没有该文件夹的访问权限，请重新授权".to_string())?;
+        output_transaction::manual_restore(
+            &txn,
+            confirm_overwrite.unwrap_or(false),
+            confirm_voucher_mismatch.unwrap_or(false),
+        )
         .map_err(|error| error)?;
-    state.transactions.finish(&history_id);
+    }
+    // 销账按日志的**真实文件名**（txn.id）——history_id 与它当前恰好相同，
+    // 但接口不许依赖这个巧合。
+    state.transactions.finish(&txn.id);
     Ok(PendingRecoveryResolution {
         resolved: true,
         dismissed: false,

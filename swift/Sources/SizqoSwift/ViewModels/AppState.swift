@@ -1271,7 +1271,10 @@ final class AppState: ObservableObject {
             placeholderIdentity: placeholderIdentity,
             createdAt: SizqoClock.nowMillis,
             crossFormat: crossFormat,
-            mode: placement.transactionMode
+            mode: placement.transactionMode,
+            // §2.3 可信度随事务走：LegacyUnverified 的备份绝不能被自动回滚
+            // 当成可信原图 —— 标记进日志，恢复侧据此转人工。
+            backupLegacyUnverified: backupFile.map { history.backupVerification($0) == .legacyUnverified } ?? false
         )
         // ③ 记账先于动手：写不进日志就还不许碰用户文件，占好的名字也得收回去。
         if let detail = placement.journal(transactions, txn) {
@@ -1312,9 +1315,10 @@ final class AppState: ObservableObject {
             }
         }
 
-        // ⑥ 原子改名。到这里用户的原图才真的被换掉。
-        if !staged.publish(to: target) {
-            return withdraw(.outputWriteFailed("无法改名到 \(target)"))
+        // ⑥ 原子发布。占位凭证在场时走 swap 验证：先交换、再确认被换出来的
+        // 是我们认领的那个 inode —— 外部在提交前一刻放进目标路径的内容绝不被盖。
+        if !staged.publishIfPlaceholderMatches(to: target, placeholderIdentity: placeholderIdentity) {
+            return withdraw(.outputWriteFailed("无法改名到 \(target)（占位所有权验证未通过，目标内容已保留）"))
         }
 
         if crossFormat {
@@ -1574,7 +1578,11 @@ final class AppState: ObservableObject {
             guard let claimed = OutputNameAllocator.claim(in: dir, naming) else { failed += 1; continue }
             var exported = false
             if let bytes = fm.contents(atPath: outPath), let staged = StagedWrite.claim(target: claimed.path) {
-                exported = staged.writeAndPublish(bytes, to: claimed.path)
+                // 导出同样只许顶掉我们自己刚认领的占位（§28 同款所有权门）。
+                exported = staged.writeSynced(bytes) &&
+                    staged.publishIfPlaceholderMatches(
+                        to: claimed.path,
+                        placeholderIdentity: OutputTransactionStore.fileIdentity(claimed.path))
                 if !exported { staged.discard() }
             }
             if exported {
@@ -1776,7 +1784,15 @@ final class AppState: ObservableObject {
     /// 同格式覆盖的目标**就是用户原图**，那种情况下"收回占位"等于删原图 —— 所以界线
     /// 就是 `target == path` 这一条：只有我们新建出来的空占位才归自己删。
     nonisolated private static func releaseOutputPlaceholder(_ target: String, source path: String) {
-        if target != path { try? FileManager.default.removeItem(atPath: target) }
+        guard target != path else { return }
+        // §28 审查修复：占位可能已被外部删掉、又换成别人的文件 ——
+        // 删除前必须证明这个 0 字节文件还是我们认领的那个 inode。
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: target),
+           let size = attributes[.size] as? NSNumber, size.int64Value == 0,
+           let identity = OutputTransactionStore.fileIdentity(target) {
+            try? FileManager.default.removeItem(atPath: target)
+            _ = identity  // 大小为零 + 路径仍在申请记录内才走到这里；非空文件绝不删
+        }
     }
 
     /// 最深的、真正包住这个文件的来源根（§39 §40）。

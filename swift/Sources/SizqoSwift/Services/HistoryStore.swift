@@ -756,7 +756,8 @@ final class HistoryStore: @unchecked Sendable {
                 atPath: dir, withIntermediateDirectories: true)) != nil else { return nil }
             let backupPath = (dir as NSString).appendingPathComponent("original.\(extensionName)")
             return writeVerifiedSnapshot(
-                key: key, canonical: canonical, backupPath: backupPath, extensionName: extensionName
+                key: key, canonical: canonical, backupPath: backupPath,
+                extensionName: extensionName, baselineSha256: currentSha256
             )
         }
         return nil
@@ -765,12 +766,17 @@ final class HistoryStore: @unchecked Sendable {
     /// 在一个空槽位上写出"验证过的快照"：采集源身份 → 复制 → 验副本 →
     /// 复制后复核源 → 落 v4 来历记录。任何一步失败都不留下冒充备份的目录。
     private func writeVerifiedSnapshot(
-        key: String, canonical: String, backupPath: String, extensionName: String
+        key: String, canonical: String, backupPath: String,
+        extensionName: String, baselineSha256: String?
     ) -> String? {
         let dir = backupDir(key)
-        // §27 §2.2 源身份先取（fd 基采集自带双 fstat 保护），副本的后取，
-        // 中间夹着一次复制；复制完成后再把源文件整个复核一遍。
+        // §2.2 基线核对在采集之前：压缩流程捕获基线指纹之后才走到这里，
+        // 中间被改过的话快照留住的就不是"这次压缩所依据的原图"。
         guard case .success(let sourceSha256) = sha256OfFile(canonical) else {
+            _ = removeDirectory(dir)
+            return nil
+        }
+        if let baseline = baselineSha256, baseline != sourceSha256 {
             _ = removeDirectory(dir)
             return nil
         }
@@ -786,6 +792,11 @@ final class HistoryStore: @unchecked Sendable {
             return nil
         }
         guard Darwin.rename(staged, backupPath) == 0 else {
+            _ = removeDirectory(dir)
+            return nil
+        }
+        // 备份目录项先于 meta 落盘。
+        guard syncDirectory(at: dir) else {
             _ = removeDirectory(dir)
             return nil
         }
@@ -826,7 +837,8 @@ final class HistoryStore: @unchecked Sendable {
               writeAtomic(
                 path: (dir as NSString).appendingPathComponent(Self.metaFileName),
                 data: data
-              )
+              ),
+              syncDirectory(at: dir)
         else {
             _ = removeDirectory(dir)
             return nil
@@ -1205,6 +1217,10 @@ final class HistoryStore: @unchecked Sendable {
             try? FileManager.default.removeItem(atPath: tmp)
             throw RestoreError.io("无法把原图写回目标位置")
         }
+        // §2.2 恢复的目录项也要落盘，断电后不许出现"历史已恢复、源还是产物"。
+        if !syncDirectory(at: parent) {
+            throw RestoreError.io("恢复目标目录未能落盘")
+        }
     }
 
     /// 跨格式 replace（PNG → JPG）时压缩结果是个新文件，恢复后不该留下孤儿。
@@ -1384,6 +1400,16 @@ private struct BackupMeta: Codable {
         sourceDevice = try box.decodeIfPresent(Int64.self, forKey: .sourceDevice)
         sourceInode = try box.decodeIfPresent(UInt64.self, forKey: .sourceInode)
     }
+}
+
+/// §2.2 目录 fsync：rename 的持久化以父目录为准，文件内容 sync 不能代替。
+/// swift 线此前完全没有目录同步 —— 断电后"事务日志在、备份目录项没了"
+/// 与进程被杀是两种不同的故障。
+func syncDirectory(at path: String) -> Bool {
+    let fd = Darwin.open(path, O_RDONLY | O_DIRECTORY)
+    guard fd >= 0 else { return false }
+    defer { Darwin.close(fd) }
+    return Darwin.fsync(fd) == 0
 }
 
 /// §2.3 一份既有备份此刻的可信程度（与 Rust `BackupVerification` 同一契约）。

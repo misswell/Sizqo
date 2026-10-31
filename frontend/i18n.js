@@ -271,7 +271,7 @@
     '暂不处理': 'Keep the scene',
     '恢复原图会覆盖当前位置的文件：': 'Restoring the original will overwrite the file at:\n',
     '\n\n将写回的原图备份：': '\n\nOriginal backup to be written back:',
-    '\n\n警告：这份备份的字节与记账时的指纹不符，恢复的内容可能不是当初的原图。': '\n\nWarning: this backup no longer matches the recorded fingerprint; what gets restored may not be the original.',
+    '\n\n警告：这份备份的字节与记账时的指纹不符，恢复的内容可能不是当初的原图。继续即表示你了解并接受这一风险。': '\n\nWarning: this backup no longer matches the recorded fingerprint; what gets restored may not be the original. Continuing means you understand and accept this risk.',
     '已处理': 'Done',
     '处理失败: ': 'Failed: ',
     '现场已保留：原图备份与事务日志都在原处，随时可以再处理': 'Scene kept: the original backup and the journal stay where they are; you can handle it any time',

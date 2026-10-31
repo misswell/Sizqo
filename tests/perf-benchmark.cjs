@@ -117,5 +117,8 @@ assert.ok(big.resortMs < 2000, `N=10000 全量重排必须 <2s（实际 ${big.re
 // 干净路径不随 N 显著增长：10k 与 1k 同量级（3× 以内）。
 assert.ok(results[2].cleanPathMs < Math.max(results[0].cleanPathMs * 3, 5),
   `干净路径不得随 N 线性恶化（1k=${results[0].cleanPathMs.toFixed(2)}ms, 10k=${results[2].cleanPathMs.toFixed(2)}ms）`);
+// §8 审查修复回归：滚动重附也必须与 N 无关（缓存可见序列 + LRU 行缓存）。
+assert.ok(results[2].scrollAvgMs < Math.max(results[0].scrollAvgMs * 3, 8),
+  `滚动重附不得随 N 线性恶化（1k=${results[0].scrollAvgMs.toFixed(2)}ms, 10k=${results[2].scrollAvgMs.toFixed(2)}ms）`);
 
 console.log('PASS: 1k/5k/10k queue performance benchmarks (bounded window, event-path flat)');

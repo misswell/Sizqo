@@ -158,6 +158,53 @@ anything not listed as passed is **not** passed.
   `ffmpeg -version` 配置行；结论不变（libx264/libx265 → GPL-2.0-or-later，
   源义务随发布页提供）；本轮代码改动只影响调用方式，不改变捆绑内容。
 
+### Review round (2026-10-31 晚, rc.2)：外部审查修复
+
+上一轮的 rc.1 tag 触发了远端 CI；`compression-parity` 失败根因是版本门禁
+（tag v0.3.6-rc.1 vs app version 0.3.5）——本轮把版本统一到 `0.3.6-rc.2`。
+审查确认的问题与修复（全部带回归测试）：
+
+- **P0 虚拟列表 spacer 顺序**：垫片先双双 append、行再 append 到底部之后
+  → 真实 DOM 顺序错乱。修复：摘除窗口外行后按「top → 行 → bottom」
+  重新落位（appendChild 移动语义），`ensureQueueSpacer` 对已存在的垫片
+  也执行移动；测试断言真实子节点顺序与滚动定位数学。
+- **P0 快照基线绑定**：`write_verified_snapshot` 此前不比对调用方
+  （压缩流程）的基线指纹 → A→B→A 场景下备份留住的可能是中间字节 B。
+  修复：快照开始时 `pre.sha256 == baseline` 否则终止（Rust+Swift）；
+  契约向量 `snapshot_refuses_when_baseline_differs_from_current_bytes`。
+- **P0 目录 fsync 链**：备份 rename 后/meta 写入后/恢复写回后/覆盖提交后/
+  journal 写入后补齐父目录 fsync（Rust `sync_dir` + Swift `syncDirectory`）。
+- **P1 legacy 备份可信度**：`ReplaceTransaction.backupLegacyUnverified`
+  标记随事务落账；自动回滚对 legacy 备份一律转人工（两个写回分支），
+  现场哈希不再能把它洗成可信原图；契约向量
+  `legacy_backup_voucher_not_auto_trusted`。
+- **P1 Swift 占位所有权**：`publishIfPlaceholderMatches` ——
+  `renameatx_np(RENAME_SWAP)` 先交换、再验证被换出的 inode 是我们认领的
+  占位，不一致换回原状；`releaseOutputPlaceholder` 不再盲删；导出路径
+  同款门；行为测试覆盖"外部顶掉占位绝不被盖"。
+- **P1 Rust 冲突检测五态**：`conflict_state` 与 Swift 同契约，
+  **Unreadable 一律拦截**（旧逻辑退回 size+mtime 会放行"读不出来"的文件）；
+  chmod-000 回归测试。
+- **P1 产物删除身份门**：`remove_generated_output` 删除前按产物指纹对账
+  （legacy 按尺寸有界），`already_restored` 幂等分支同样受门保护；
+  回归测试"幂等恢复不删用户编辑过的跨格式产物"。
+- **P1 人工恢复三问题**：备份读不出来 → `VoucherMismatch`（进 GUI 列表）；
+  凭证不符分两层确认（`confirmVoucherMismatch`，读不出来永远拒绝）；
+  `resolve_pending_recovery` 接入 FileAccess 沙盒授权并按 `txn.id` 销账；
+  前端警告文案写明"继续即接受风险"。
+- **P1 色彩一致性**：transfer/primaries/space 三个字段的值必须逐字相等
+  （bt709 → smpte2084 的"换标签"判失败，新增回归测试）。
+- **P2 虚拟列表复杂度**：可见序列缓存（滚动路径复用，排序/筛选变化才重算）
+  + `fileRows` LRU（上限 600，detached 行逐出交 GC）；基准新增
+  "滚动重附不随 N 线性恶化"断言；10k 干净路径 3.4ms → 0.63ms。
+- **P1 崩溃注入生产路径**：备份改走 `ensure_backup_verified` 真实快照链、
+  覆盖改走 `publish_replace_if_identity_matches` 真实原子交换；
+  补齐 legacy+源缺失（自动恢复，无内容可覆盖）与备份读不出来
+  （VoucherMismatch + 回滚拒绝）两个缺失场景。
+- **并行 flake 根因**：`TEST_FAULT_EDIT_SOURCE_AFTER_COPY` 全局静态会在
+  并行测试间互相注入（真实踩到：25 字节 `user-edited-during-backup` 写进
+  邻测试的源文件）→ 改 thread-local，5 连绿确认根除。
+
 ### Not done (never report as passed)
 
 - **Developer ID 签名与公证**：本机钥匙串没有

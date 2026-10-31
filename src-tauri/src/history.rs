@@ -323,6 +323,23 @@ pub struct CleanupReport {
     pub warnings: Vec<String>,
 }
 
+/// §4.1 恢复/删除前对压缩产物的验证结论（五态，与 Swift `HistoryConflict`
+/// 同一契约）。不能再把「无法证明」当成「没有冲突」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictState {
+    /// 产物就是记录里那份字节。
+    NoConflict,
+    /// 产物被用户改过：覆盖/删除需要 force。
+    ContentChanged,
+    /// 旧记录没有产物指纹：退回 size+mtime 弱验证。不是冲突，
+    /// 但备份侧的五态验证会另外把 legacy 备份拦到用户确认为止。
+    LegacyUnverified,
+    /// 产物文件已不在。
+    Missing,
+    /// 产物读不出来（权限/IO）：证明不了它是谁，必须按冲突拦截。
+    Unreadable,
+}
+
 #[derive(Debug)]
 pub enum RestoreError {
     NotFound,
@@ -815,7 +832,9 @@ impl HistoryStore {
                 return Err("无法创建原图备份目录".into());
             }
             let backup_path = dir.join(format!("original.{extension}"));
-            return self.write_verified_snapshot(&key, &canonical, &backup_path, &extension);
+            return self.write_verified_snapshot(
+                &key, &canonical, &backup_path, &extension, current_sha256,
+            );
         }
         Err("原图备份槽位已满，无法为这张图准备备份".into())
     }
@@ -828,13 +847,25 @@ impl HistoryStore {
         canonical: &Path,
         backup_path: &Path,
         extension: &str,
+        baseline_sha256: Option<&str>,
     ) -> Result<PathBuf, String> {
         let dir = backup_path.parent().ok_or("备份目录路径不完整")?.to_path_buf();
-        // §27 §2.2 源身份从**打开着的文件描述符**上采集（哈希前后各一次 fstat），
-        // 拿到的这一份就是快照要留住的字节。
+        // §2.2 基线核对在采集**之前**：压缩流程在捕获基线指纹之后才走到这里，
+        // 中间源文件被改过的话，快照留住的就不再是"这次压缩所依据的原图" ——
+        // 提交复核只看得见"文件又变回了基线"，恢复却会交出中间那份字节。
+        // 任何不一致都必须在覆盖发生前终止，绝不把冒名快照存成原图。
         let pre = crate::source_identity::SourceIdentity::read_with_hash(canonical)
             .map_err(|error| format!("无法读取原图指纹: {error}"))?;
         let source_sha256 = pre.sha256.clone().expect("read_with_hash 必有内容指纹");
+        if let Some(baseline) = baseline_sha256 {
+            if baseline != source_sha256 {
+                let _ = fs::remove_dir_all(&dir);
+                return Err(
+                    "原图在采集基线之后被修改，快照与本次压缩所依据的字节不一致，已跳过覆盖"
+                        .into(),
+                );
+            }
+        }
         // 先写临时名再 rename：崩溃不许留下半个 original.xxx 冒充有效备份。
         // 临时名随机（§30）：两张图同时首次备份时，固定名会互相把对方的半成品盖掉。
         if let Err(error) =
@@ -843,6 +874,11 @@ impl HistoryStore {
             let _ = fs::remove_dir_all(&dir);
             return Err(format!("无法保存原图备份: {error}"));
         }
+        // 备份目录项必须先于 meta 落盘：断电后"meta 在、备份不在"是冒名现场。
+        sync_dir(&dir).map_err(|error| {
+            let _ = fs::remove_dir_all(&dir);
+            format!("原图备份目录未能落盘: {error}")
+        })?;
         let backup_sha256 = match crate::source_identity::sha256_of(backup_path) {
             Ok(sha256) => sha256,
             Err(error) => {
@@ -856,7 +892,7 @@ impl HistoryStore {
         }
         // §9.1 测试注入：复制之后、复核之前，源文件被并发改写。
         #[cfg(test)]
-        if TEST_FAULT_EDIT_SOURCE_AFTER_COPY.load(std::sync::atomic::Ordering::SeqCst) {
+        if TEST_FAULT_EDIT_SOURCE_AFTER_COPY.with(std::cell::Cell::get) {
             fs::write(canonical, b"user-edited-during-backup").unwrap();
         }
         // §2.2 复制完成后把原图整个复核一遍：复制横着一场修改的话，快照和
@@ -867,9 +903,16 @@ impl HistoryStore {
                 format!("无法复核原图指纹: {error}")
             },
         )?;
-        if !pre.same_fingerprint(&post) || post.sha256.as_deref() != Some(source_sha256.as_str()) {
+        if !pre.same_fingerprint(&post) {
             let _ = fs::remove_dir_all(&dir);
-            return Err("原图在备份过程中被修改，已跳过覆盖".into());
+            return Err(format!(
+                "原图在备份过程中被修改（stat 指纹变了：{:?} → {:?}），已跳过覆盖",
+                (pre.size, pre.modified), (post.size, post.modified)
+            ));
+        }
+        if post.sha256.as_deref() != Some(source_sha256.as_str()) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err("原图在备份过程中被修改（内容哈希变了），已跳过覆盖".into());
         }
         let meta = BackupMeta {
             version: 4,
@@ -889,6 +932,11 @@ impl HistoryStore {
             let _ = fs::remove_dir_all(&dir);
             return Err(format!("原图备份的来历记录写不成功: {error}"));
         }
+        // meta 目录项落盘：备份文件 + 来历记录一起扛断电。
+        sync_dir(&dir).map_err(|error| {
+            let _ = fs::remove_dir_all(&dir);
+            format!("原图备份的来历记录目录未能落盘: {error}")
+        })?;
         // 备份文件 + 来历记录**都在**才算备份成功，缺一处这次覆盖就不可恢复。
         if self.existing_backup_file(key).is_none() || self.read_meta(key).is_none() {
             let _ = fs::remove_dir_all(&dir);
@@ -1320,28 +1368,42 @@ impl HistoryStore {
     ///   两种模式用的是同一份指纹，判断逻辑一致。
     ///
     /// 有内容指纹时按 SHA-256 判 —— 大小和 mtime 都相同的原地编辑躲不过这一道。
-    /// 老记录没有指纹，退回大小/mtime（升级用户的既有记录仍然能恢复）。
-    pub fn has_conflict(entry: &HistoryEntry) -> bool {
+    /// **指纹读不出来（Unreadable）绝不放行**：旧逻辑会退回 size+mtime，
+    /// "同大小同 mtime 且读不出来"的文件就被当成了没改过 —— 正是把
+    /// 「无法证明」当成「没有冲突」的那条漏洞。老记录没有指纹，退回
+    /// 大小/mtime 并明确标记为弱验证（升级用户的既有记录仍然能恢复）。
+    pub fn conflict_state(entry: &HistoryEntry) -> ConflictState {
         let Some(target) = entry.output_path.as_deref().or(Some(entry.source_path.as_str())) else {
-            return false;
+            return ConflictState::NoConflict;
         };
         let target = Path::new(target);
         if !target.exists() {
-            return false;
+            return ConflictState::Missing;
         }
-        if let (Some(recorded), Ok(current)) = (
-            entry.output_sha256.as_deref(),
-            crate::source_identity::sha256_of(target),
-        ) {
-            return recorded != current;
+        if let Some(recorded) = entry.output_sha256.as_deref() {
+            return match crate::source_identity::sha256_of(target) {
+                Ok(current) if recorded == current => ConflictState::NoConflict,
+                Ok(_) => ConflictState::ContentChanged,
+                Err(_) => ConflictState::Unreadable,
+            };
         }
         if fs::metadata(target).map(|m| m.len()).unwrap_or(0) != entry.compressed_size {
-            return true;
+            return ConflictState::ContentChanged;
         }
         match (entry.output_modified_at, file_mtime_millis(target)) {
-            (Some(recorded), Some(current)) => (current - recorded).abs() > MTIME_TOLERANCE_MILLIS,
-            _ => false,
+            (Some(recorded), Some(current)) if (current - recorded).abs() > MTIME_TOLERANCE_MILLIS => {
+                ConflictState::ContentChanged
+            }
+            (Some(_), Some(_)) => ConflictState::LegacyUnverified,
+            _ => ConflictState::LegacyUnverified,
         }
+    }
+
+    pub fn has_conflict(entry: &HistoryEntry) -> bool {
+        matches!(
+            Self::conflict_state(entry),
+            ConflictState::ContentChanged | ConflictState::Unreadable
+        )
     }
 
     /// 把一份备份原子地写回目标位置：同目录临时文件 → fsync → rename。
@@ -1351,11 +1413,20 @@ impl HistoryStore {
         // §30 随机临时名：恢复全部 / 事务回滚可能同时在多个文件上写回原图。
         // 写坏时 StagedOutput 自己收走临时文件，覆盖失败绝不动用户当前的目标文件。
         crate::output_transaction::StagedOutput::copy_from(backup, target)
-            .map(crate::output_transaction::StagedOutput::settle)
+            .map(crate::output_transaction::StagedOutput::settle)?;
+        // §2.2 恢复的目录项也要落盘：断电后"历史说已恢复、源位置还是产物"
+        // 比恢复失败更糟。rename 的持久化以父目录 fsync 为准。
+        sync_dir(target.parent().unwrap_or(Path::new("/")))
     }
 
     /// 跨格式 replace（PNG → JPG）时压缩结果是个新文件，恢复后不该留下孤儿。
     /// 同格式 replace 的输出就是源文件本身，绝不许删。
+    ///
+    /// §4.1 审查修复：删除前必须证明这个文件**还是本次生成的产物** ——
+    /// 有产物指纹按内容对账；对不上（用户改过）或读不出来时保留文件并提示。
+    /// 老记录没有指纹，只删大小正好等于承诺产出的文件（有界删除）。
+    /// 这道门同时护住普通恢复分支与 `already_restored` 幂等分支 ——
+    /// 后者此前会无条件删除，用户编辑过的跨格式产物可能被静默清掉。
     ///
     /// §48 删除失败不是"恢复失败"：原图已经写回去了，只是压缩产物还在。
     /// 这个事实必须由调用方原样报给用户，不能吞掉。
@@ -1364,6 +1435,21 @@ impl HistoryStore {
         if let Some(output) = entry.output_path.as_deref() {
             let output = Path::new(output);
             if !same_file(output, &target) && output.exists() {
+                let ours = match entry.output_sha256.as_deref() {
+                    Some(expected) => match crate::source_identity::sha256_of(output) {
+                        Ok(actual) if actual == expected => true,
+                        Ok(_) => false,
+                        Err(_) => false,
+                    },
+                    None => {
+                        fs::metadata(output).map(|meta| meta.len()).unwrap_or(0)
+                            == entry.compressed_size
+                            && entry.compressed_size > 0
+                    }
+                };
+                if !ours {
+                    return Ok(());
+                }
                 fs::remove_file(output)
                     .map_err(|error| format!("压缩文件删除失败: {error}"))?;
             }
@@ -1523,15 +1609,34 @@ fn canonical_path(path: &Path) -> String {
 /// 记录里的 `source_path` 是规范路径，`output_path` 是当时那个字符串 —— macOS 上
 /// `/var/…` 与 `/private/var/…`、任何软链目录都会让两者字面不等。同格式 replace 的
 /// 压缩输出**就是**源文件本身，判成"另一个文件"会在恢复之后把刚写回的原图删掉。
+/// 目录 fsync：rename / 新建目录项只有落了**父目录**才扛得住断电。
+/// 文件内容的 fsync 不能代替它 —— "事务日志在、备份目录项没了"正是
+/// 进程被杀与机器断电的差别所在。
+pub(crate) fn sync_dir(path: &Path) -> Result<(), String> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
 pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     a == b || canonical_path(a) == canonical_path(b)
 }
 
 /// §9.1 仅测试使用的故障注入点：快照复制完成后、复核源文件前，把源文件改掉，
 /// 模拟"备份过程横着一场并发编辑"。正式产品里这个开关不存在。
+/// **thread-local**：并行测试各有各的注入位，全局静态会把故障写进
+/// 别的测试正在备份的文件（真实踩过的并行 flake）。
 #[cfg(test)]
-pub(crate) static TEST_FAULT_EDIT_SOURCE_AFTER_COPY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    pub(crate) static TEST_FAULT_EDIT_SOURCE_AFTER_COPY: std::cell::Cell<bool>
+        = const { std::cell::Cell::new(false) };
+}
+
+/// 测试用：开关"复制后改写源文件"的故障注入（只影响当前测试线程）。
+#[cfg(test)]
+pub(crate) fn set_fault_edit_source_after_copy(active: bool) {
+    TEST_FAULT_EDIT_SOURCE_AFTER_COPY.with(|flag| flag.set(active));
+}
 
 /// 备份 key = 备份目录名；目录名 = backups/<key>/original.<ext>。
 pub(crate) fn backup_key_of(backup_path: Option<&str>) -> Option<String> {
@@ -2220,9 +2325,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store_in(dir.path());
         let source = sample_source(dir.path(), "a.png", b"bytes1");
-        TEST_FAULT_EDIT_SOURCE_AFTER_COPY.store(true, std::sync::atomic::Ordering::SeqCst);
+        set_fault_edit_source_after_copy(true);
         let outcome = store.ensure_backup(&source);
-        TEST_FAULT_EDIT_SOURCE_AFTER_COPY.store(false, std::sync::atomic::Ordering::SeqCst);
+        set_fault_edit_source_after_copy(false);
         let error = outcome.unwrap_err();
         assert!(
             error.contains("原图在备份过程中被修改"),
@@ -2346,6 +2451,34 @@ mod tests {
     }
 
     /// §47 大小与 mtime 都被伪装成记录时的样子，只有内容指纹能拦住这个冲突。
+    /// §4.1 审查修复回归：有指纹、但当前文件**读不出来**时绝不放行 ——
+    /// 旧逻辑退回 size+mtime，读不出来又对得上的文件被当成没改过。
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_output_is_a_conflict_not_a_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let source = sample_source(dir.path(), "locked.png", b"payload12");
+        let mut entry = entry_for(&source, &source, now_millis());
+        entry.output_modified_at = file_mtime_millis(&source);
+        let mut mode = fs::metadata(&source).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        mode.set_mode(0o000);
+        fs::set_permissions(&source, mode).unwrap();
+        let state = HistoryStore::conflict_state(&entry);
+        let conflicted = HistoryStore::has_conflict(&entry);
+        let restore_outcome =
+            store.restore(&entry, false, false, open_access().as_ref(), &mut || false);
+        let _ = fs::remove_file(&source);
+        assert_eq!(state, ConflictState::Unreadable,
+            "读不出来 = 证明不了归属，必须拦");
+        assert!(conflicted);
+        assert!(
+            matches!(restore_outcome, Err(RestoreError::Conflict) | Err(RestoreError::Io(_))),
+            "未加 force 的恢复不得覆盖读不出来的文件"
+        );
+    }
+
     #[test]
     fn same_size_and_mtime_edit_is_still_a_conflict_thanks_to_the_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
@@ -2373,6 +2506,39 @@ mod tests {
     }
 
     /// §48 原图写回成功、产物删不掉：恢复是成功的，但告警必须让用户看见。
+    /// §4.1 审查修复回归：原图已经恢复（幂等分支）之后，用户编辑过的
+    /// 跨格式产物绝不能被"顺手"删掉 —— 删除前必须对得上产物指纹。
+    #[test]
+    fn already_restored_never_deletes_an_edited_cross_format_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let source = sample_source(dir.path(), "photo.png", b"true-original");
+        let backup = dir.path().join("backups").join("k1").join("original.png");
+        fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        fs::write(&backup, b"true-original").unwrap();
+        let output = dir.path().join("photo.webp");
+        // 产物指纹 = 用户编辑**之后**的字节不存在于历史里：历史记的是当初产物。
+        fs::write(&output, b"original-product").unwrap();
+        let mut entry = entry_for(&source, &backup, now_millis());
+        entry.output_path = Some(output.to_string_lossy().into_owned());
+        entry.output_mode = "replace".into();
+        store.add(entry.clone()).unwrap();
+        // 用户在历史落盘后编辑了跨格式产物。
+        fs::write(&output, b"user-edited-webp").unwrap();
+        // 原图已经写回 = already_restored 分支（不再要求 force）。
+        assert_eq!(fs::read(&source).unwrap(), b"true-original".to_vec(),
+            "前提检查：源位置就是原图字节");
+        let report = store
+            .restore(&entry, false, false, open_access().as_ref(), &mut || false)
+            .unwrap_or_else(|error| panic!("幂等恢复不该失败: {error:?}"));
+        assert!(report.already_restored, "应走幂等分支");
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            b"user-edited-webp".to_vec(),
+            "用户编辑过的跨格式产物必须保留"
+        );
+    }
+
     #[test]
     fn a_failed_output_cleanup_keeps_the_restore_but_reports_a_warning() {
         use std::os::unix::fs::PermissionsExt;

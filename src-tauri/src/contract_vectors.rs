@@ -102,6 +102,7 @@ fn v2_replace_txn_with_output(
         cross_format: false,
         mode: TransactionMode::ReplaceExisting,
         schema_version: SCHEMA_VERSION,
+        backup_legacy_unverified: false,
     }
 }
 
@@ -123,6 +124,7 @@ fn legacy_txn(source: &Path, backup: &Path, history_id: &str) -> ReplaceTransact
         cross_format: false,
         mode: TransactionMode::ReplaceExisting,
         schema_version: 0,
+        backup_legacy_unverified: false,
     }
 }
 
@@ -163,6 +165,20 @@ fn run_scenario(scenario: &str, dir: &Path) -> String {
             match identity.verify(&original) {
                 crate::source_identity::SourceCheck::Unchanged => "unchanged".into(),
                 crate::source_identity::SourceCheck::Changed(_) => "changed".into(),
+            }
+        }
+        "snapshot_refuses_when_baseline_differs_from_current_bytes" => {
+            // §2.2 P0 修复回归：基线捕获 A → 文件被改成 B → 快照必须拒绝，
+            // 绝不把 B 存成"这次压缩的原图"（否则 A→B→A 场景下恢复交出 B）。
+            let store = store_in(dir);
+            write_bytes(&original, b"baseline-A");
+            // 调用方（压缩流程）手里握着基线 A 的指纹，磁盘上已经是 B。
+            write_bytes(&original, b"changed-B!!");
+            let outcome = store.ensure_backup_verified(&original, Some(&hex(b"baseline-A")));
+            match outcome {
+                Err(error) if error.contains("采集基线之后被修改") => "refused".into(),
+                Ok(_) => "snapshotWritten".into(),
+                Err(_) => "refused-other".into(),
             }
         }
         "missing_file_reported_changed" => {
@@ -313,6 +329,29 @@ fn run_scenario(scenario: &str, dir: &Path) -> String {
                 }
             }
         }
+        "legacy_backup_voucher_not_auto_trusted" => {
+            // §2.3 P1 修复回归：LegacyUnverified 备份的现场哈希只证明
+            // "记账以来没变"，不证明它是原图 —— 带标记的事务即使源位置
+            // 是本次产物，自动回滚也必须转人工，而不是把备份洗成可信原图。
+            let store = store_in(dir);
+            let journal = journal_in(dir);
+            write_bytes(&backup, b"true-original");
+            write_bytes(&original, b"compressed!");
+            let mut txn = v2_replace_txn_with_output(
+                &original, &backup, &hex(b"compressed!"), "launder");
+            txn.backup_legacy_unverified = true;
+            journal.prepare(&txn).unwrap();
+            let report = journal.recover(&store);
+            if report.needs_review >= 1
+                && report.rolled_back == 0
+                && journal.has_pending()
+                && fs::read(&original).unwrap() == b"compressed!"
+            {
+                "preserved".into()
+            } else {
+                "restored".into()
+            }
+        }
         "manual_restore_with_confirmation_restores" | "manual_restore_refuses_without_confirmation" => {
             // §3.4 人工恢复：GUI 已展示双方状态后用户拍板 —— 确认在场才允许
             // 覆盖"证明不了归属"的现场；没有确认时一个字节都不许动。
@@ -326,7 +365,8 @@ fn run_scenario(scenario: &str, dir: &Path) -> String {
                 &original, &backup, &hex(b"compressed!"), "manual");
             journal.prepare(&txn).unwrap();
             let confirm = scenario.starts_with("manual_restore_with");
-            let outcome = crate::output_transaction::manual_restore(&txn, confirm);
+            // 凭证一致的现场：确认位即放行凭证层。
+            let outcome = crate::output_transaction::manual_restore(&txn, confirm, confirm);
             if outcome.is_err() { return "refused".into(); }
             journal.finish(&txn.id);
             if fs::read(&original).unwrap() == b"true-original" { "restoredByUser".into() } else { "preserved".into() }
