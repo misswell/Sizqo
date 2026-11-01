@@ -2194,6 +2194,38 @@ cargo test --lib real -- --ignored
   包内 `lipo -archs` 读数 —— 它现在有了两条更强的间接依据（两腿的输入都被逐个量过），
   但间接依据不改成"已实测"。
 
+### 同一 run 的发布侧读数：预发布处理、三枚公证、以及一个按文件名配对留下的洞
+
+`release` 作业 success，8 个作业全绿（`compression-parity` / 两条 `build-macos` /
+`build-macos-universal` / `build-windows` / `build-linux` / `verify-appstore` / `release`）。
+发布对象的实际状态用 `gh release view` 查回，不是从步骤文本推的：
+
+| 项 | 读数 |
+| --- | --- |
+| 预发布标记 | `prerelease=true`、`draft=false`、`targetCommitish=main` |
+| `latest.json` | **没有这个资产**；`release` 作业打出「预发布 v0.3.6-rc.7：不产出 latest.json，应用内更新源保持指向上一个正式版」 |
+| `latest` 指针 | 仍指 `v0.3.5`（`prerelease=false`）—— 在线更新源没有被这个门禁未齐的构建抢走 |
+| 资产 | 9 个：`Sizqo_v0.3.6-rc.7_macos_{arm64,x86_64,universal}.dmg`、`…_macos_universal.app.tar.gz` + `.sig`、`Sizqo_0.3.6_x64-setup.exe`、`…_x64_en-US.msi`、`…_amd64.deb`、`…_amd64.AppImage` |
+| 签名/公证/装订 | `build-macos-universal` 里 3 次 `Current status: Accepted` + 3 次 `The staple and validate action worked!`（随后各一次 `The validate action worked!`），证书链 `Developer ID Application: Guofeng Liu … → Developer ID Certification Authority → Apple Root CA`；`Create signed DMGs from the ticketed apps` 在这之后 |
+
+两条要如实记下的观察：
+
+1. **Windows/Linux 资产名里的 `0.3.6` 是有意剥掉的**，不是漂移：`build-windows` 与
+   `build-linux` 各有一步名为 `Strip pre-release suffix from bundle version`
+   （括注分别是 MSI requires numeric-only / RPM forbids dashes）。代价留在这里记着：
+   `Sizqo_0.3.6_x64-setup.exe` 与将来正式版的同名产物**在文件名上无法区分**，
+   能区分的只有它挂在哪个 Release 下。验收时按标签页取件，不要按文件名取件。
+2. **两条 mac 腿的引擎不是同一支**：arm64 腿 `Pouring ffmpeg--9.0.2_1.arm64_tahoe.bottle.tar.gz`，
+   x86_64 腿 `Pouring ffmpeg--9.0.1.sonoma.bottle.tar.gz`。合并脚本按**文件名**配对，
+   于是主号相同的库（`libavcodec.63.dylib` 等）合成一个双切片文件，而主号不同的
+   只能各留一半 —— 日志里 `Keeping arm64-only resource` 有 `video/lib/libcrypto.4.dylib`、
+   `libssl.4.dylib`、`libx265.217.dylib`，`Keeping x86_64-only resource` 有
+   `libcrypto.3.dylib`、`libssl.3.dylib`、`libx265.216.dylib`（图片侧同理：
+   `libopenjph.0.32/0.31`、`libOpenEXR-3_5/3_4`）。**这条没有任何闸门会报红**，因为它
+   两边都"合法"，但结论要说清：已分发 universal 包里"引擎版本"不是一个数，而是
+   按切片各自的数；`-vsync` 那类跨小版本行为差异（两支都是 FFmpeg 9，`-vsync` 都已删）
+   要复现时必须先问跑的是哪一片。上一轮"引擎版本随 runner 而变"那条由此从"apt vs brew"
+   扩到了**同一次发布的两片之间**。
 
 ### 仍未取证的部分（如实）
 
