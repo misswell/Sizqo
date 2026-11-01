@@ -1969,7 +1969,43 @@ Intel、Linux、Windows 上都不空判。`cargo test --lib` 271 passed / 0 fail
 `v0.3.6-rc.5` 资产 9 个（3 个 macOS dmg + universal 更新包及其 `.sig` + Windows msi/setup.exe +
 Linux AppImage/deb）。
 
-### 标签：`v0.3.6-rc.5` 已发布，架构门走 `v0.3.6-rc.6`
+### 同一 run 的 rust-tests 里第一次同时拿到两条真实引擎读数
+
+时间轴开关的取证矩阵现在补齐了三格，第四格仍然是空的：
+
+| 引擎 | 开关 | 结论 | 来源 |
+| --- | --- | --- | --- |
+| macOS 本机（homebrew） | 已删 `-vsync` → 只有 `-fps_mode` | 探测选 `-fps_mode`，argv 里无裸 `fps_mode` | 本机 `cargo test --lib real -- --ignored` |
+| Intel runner（apt/brew `ffmpeg 9.0.1`） | 同上 | 已部署的 universal 包（`lipo -archs` 两切片齐全）用的正是这支，`-vsync` 在其中不存在 | run 41268093305 的 `build-macos (x86_64)` 日志 `Pouring ffmpeg--9.0.1.sonoma.bottle.tar.gz` |
+| Ubuntu 22.04（apt `7:4.4.2-0ubuntu0.22.04.1`） | 只有 `-vsync` | 探测回退到 `-vsync passthrough` 并真编码通过 | run 41269122796：`Setting up ffmpeg (7:4.4.2-0ubuntu0.22.04.1)` + `real media matrix` **2 passed / 0 failed** |
+| Windows | **无任何真实编码取证**（Direct 轨缺 PE 引擎） | 仍未取证 | — |
+
+这里要撤回我自己上一轮写的一句话。我写过"`file` 校验与 `libx264` 断言在同一 step、
+同一份日志里"，并把 `ffmpeg -hide_banner -encoders | grep -q libx264` 当作某个
+`Install system dependencies` 步骤里的**日志读数**。实际情况：这两条断言在
+`.github/workflows/tests.yml:37` 与 `:38`，属于 `rust-tests` 作业的
+**`real media matrix` 那一步**，而且 `windows-tests` 作业根本没有这一步（它只有
+`cargo check --lib` / `cargo test --lib` / 契约向量三步）。把命令文本当成日志读数，
+和把日志文本当成断言结果，是同一种错。**Windows 那一格仍然是空的。**
+
+### CI 回证（run 41270303470 = `6217d6f`，PATH 门那一轮）：六个作业全绿
+
+上一轮记在"仍未取证"里的那条（架构门 + PATH 门没有 CI 读数）由这一 run 兑现。
+逐作业读数，条数都对得上本轮新增的 2 条 `binfmt` 测试：
+
+| 作业 | 关键读数 |
+| --- | --- |
+| `rust-tests`（Ubuntu 22.04） | `cargo test (default)` **263 passed / 0 failed / 2 ignored**（上一 run 同一条是 261）；契约向量 32 条一致；`Setting up ffmpeg (7:4.4.2-0ubuntu0.22.04.1)` → `real media matrix` **2 passed / 0 failed** |
+| `windows-tests` | **265 passed / 0 failed / 2 ignored**（上一 run 263）；契约向量 32 条一致 |
+| `rust-tests-macos` | default **273 / 0 / 2 ignored**（与本机 `cargo test --lib` 完全一致）；`--features inproc-backends` **272 / 0**；APFS 崩溃注入 6 阶段全过 |
+| `appstore-tests` | **264 passed / 0 failed**（上一 run 262）+ 6 / 5 条 + 崩溃注入全过 |
+| `frontend-tests` / `swift-checks` | success |
+
+Windows 那一格仍然**没有**真实编码读数：`windows-tests` 只有 `cargo check --lib`、
+`cargo test --lib`、契约向量三步，没有 `--ignored` 真实矩阵，也没有 PE 引擎。
+所以本轮补的是"解析门不再骗人"，不是"Windows 视频轨可用"——后者连引擎都还没有。
+
+### 标签：`v0.3.6-rc.5` 已发布，架构门与 PATH 门走 `v0.3.6-rc.6`
 
 - `v0.3.6-rc.5` 指向 `56589af`（tests.yml run 41266916166 六作业全绿的那棵树的文档提交），
   已推送：`https://github.com/misswell/Sizqo/releases/tag/v0.3.6-rc.5`。它**不含**上面的
@@ -2003,8 +2039,15 @@ Linux AppImage/deb）。
 - Windows / Linux 产物仍未签名（无对应签名链），正式版的门禁照旧不通。
 - **仓库里提交的 macOS 产物仍只有 arm64 单切片**（7 个图片工具 + `video/bin/ffmpeg`、
   `ffprobe` + 全部 dylib）。CI 的 mac 矩阵不受影响：`collect_macos_tools.sh` 在每台
-  runner 上现场重采并按 `uname -m` 硬门校验，universal 再由 `lipo -create` 合并，
-  这一条本轮已由 run 41268093305 的日志取证。受影响的是**不经重采的那条路**：
+  runner 上现场重采并按 `uname -m` 硬门校验，universal 再由 `lipo -create` 成对合并 ——
+  这一条由 run 41268093305 的日志取证：merge 步骤对 `Contents/Resources/video/bin/ffmpeg`
+  与 `ffprobe` 都执行了"重签名"那一步，而该步骤只有在 `verify_macho_architectures`
+  通过之后才跑到；脚本对"arm64 有、Intel 没有对应文件"的非 dylib 资源是直接 `exit 1`
+  的。注意这是**按脚本契约推出来的结论，不是对已分发包的实测**：本轮试着把 universal
+  包从 Release 资产拉下来直接 `lipo -archs`，两条路（`gh release download`、带
+  `Accept: application/octet-stream` 的 `curl -C -`）都在 190 MB 的量级上跑到
+  KB/分钟级就停滞，取不到读数，因此这条**仍记为待实测**，不当已通过。
+  受影响的是**不经重采的那条路**：
   Intel mac 上 `git clone` 后直接构建 / 跑测试。架构门现在会正确拒绝 arm64 单切片，
   于是那条轨道的图片工具退到系统 PATH、视频轨报告不可用 —— 这是如实的拒绝，不是修复。
   要把这一条也补成"真有引擎"，缺的是把 universal / x86_64 切片一起提交进仓库
