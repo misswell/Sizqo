@@ -2005,19 +2005,47 @@ Windows 那一格仍然**没有**真实编码读数：`windows-tests` 只有 `ca
 `cargo test --lib`、契约向量三步，没有 `--ignored` 真实矩阵，也没有 PE 引擎。
 所以本轮补的是"解析门不再骗人"，不是"Windows 视频轨可用"——后者连引擎都还没有。
 
-### 标签：`v0.3.6-rc.5` 已发布，架构门与 PATH 门走 `v0.3.6-rc.6`
+### CI 与发布回证（run 41271479123 / 41271481909 = `v0.3.6-rc.6`）
 
-- `v0.3.6-rc.5` 指向 `56589af`（tests.yml run 41266916166 六作业全绿的那棵树的文档提交），
-  已推送：`https://github.com/misswell/Sizqo/releases/tag/v0.3.6-rc.5`。它**不含**上面的
-  架构门（也不含本轮的 PATH 门），因此那棵树上"Intel mac 本地构建 + 仓库提交的 arm64 引擎"
+Tests run **41271479123**（版本提交 `c181614`）6 作业全 success，逐作业读数与上一 run
+逐条相同（本轮只动版本串，测试集合没变）：`rust-tests` default **263 / 0 / 2 ignored**
++ 契约向量 32 条 + `Setting up ffmpeg (7:4.4.2-0ubuntu0.22.04.1)` + `real media matrix`
+**2 / 0**；`windows-tests` **265 / 0 / 2 ignored**；`rust-tests-macos` **273 / 0** 与
+`--features inproc-backends` **272 / 0** + APFS 崩溃注入 6 阶段；`appstore-tests`
+**264 / 0** + 6 / 5 条；`frontend-tests` / `swift-checks` success。
+
+Release run **41271481909**（标签 `v0.3.6-rc.6`）8 作业全 success：
+`compression-parity`（含标签/版本守卫，日志 `RELEASE_TAG: v0.3.6-rc.6`、
+`SOURCE_REF: v0.3.6-rc.6`）、`verify-appstore`、`build-windows`、
+`build-macos (arm64)`、`build-macos (x86_64, macos-15-intel)`、`build-macos-universal`、
+`build-linux`、`release`。发出去的门禁结论：
+
+| 门禁项 | 读数 |
+| --- | --- |
+| 预发布不抢 latest | `gh release view v0.3.6-rc.6` → `prerelease: true`；`gh release view`（latest）→ `latest=v0.3.5 prerelease=false` |
+| 不产 `latest.json` | `release` 作业日志原文「预发布 v0.3.6-rc.6：不产出 latest.json，应用内更新源保持指向上一个正式版」 |
+| Windows/RPM 版本串去后缀 | 资产名 `Sizqo_0.3.6_x64_en-US.msi` / `Sizqo_0.3.6_x64-setup.exe` / `Sizqo_0.3.6_amd64.deb` / `_amd64.AppImage`（无 `rc`）；macOS 三件仍带完整 `v0.3.6-rc.6` |
+| 更新包签名 | `Sizqo_v0.3.6-rc.6_macos_universal.app.tar.gz` + `.sig` 均在位（`TAURI_SIGNING_PRIVATE_KEY` 已配置，缺失时该作业按设计中止发版） |
+| 资产总数 | 9 个 |
+
+### 标签：`v0.3.6-rc.5` 与 `v0.3.6-rc.6` 都已发布，都不算正式版
+
+- `v0.3.6-rc.5` 指向 `56589af`：`https://github.com/misswell/Sizqo/releases/tag/v0.3.6-rc.5`。
+  它**不含**架构门也不含 PATH 门，因此那棵树上"Intel mac 本地构建 + 仓库提交的 arm64 引擎"
   仍是平台门放行、编码时才炸 `EBADARCH`；已分发的 Intel/universal 安装包不受影响，
-  依据是上一条表格里 runner 现场重采 + `lipo` 合并的日志。
-  `rc.1…4` 一律不动，已发布的 `rc.5` 标签也不改写（owner 明确要求不强制覆盖已分发标签）。
+  依据是上面表格里 runner 现场重采 + `lipo` 合并的日志。
 - 这条标签说明正文里有一句笔误：写成了"FFmpeg 9 已删新…"，本意是"FFmpeg 9 已删 `-vsync`"。
   标签已分发，改它等于 force-push 覆盖已发布标签，因此**不改写**，正确结论以本节与代码
   注释为准。
-- 架构门与本轮的 PATH 门作为新一轮工作打 `v0.3.6-rc.6`（版本号先经 `chore(release)` 提交
-  落到三处配置），数字不与任何已分发标签重叠。
+- `v0.3.6-rc.6` 指向 `c181614`（架构门 `e175a7c` + PATH 门 `6217d6f` + 版本提交）：
+  `https://github.com/misswell/Sizqo/releases/tag/v0.3.6-rc.6`。版本串这轮落到**四处**并对齐：
+  `package.json` / `tauri.conf.json` / `tauri.conf.appstore.json` / `Cargo.toml`（+ `Cargo.lock`）。
+  App Store 那份配置原先还停在 `rc.3` —— `scripts/build_appstore.sh` 只从它自己读版本号，
+  没有任何地方把它和 Direct 对齐，而 `release.yml` 的守卫只查三处，所以那条轨道的 bundle
+  元数据落后了三轮。守卫的覆盖面缺口记在这里，本轮先对齐数值，不改守卫逻辑（改法要么是
+  第四处进守卫，要么是单一版本源，两者都超出本轮范围）。
+- `rc.1…5` 一律不动、不改写；`v0.3.6` 正式版仍等发布门禁齐了才打。
+
 
 ### 仍未取证的部分（如实）
 
