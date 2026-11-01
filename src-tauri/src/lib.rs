@@ -1,4 +1,5 @@
 mod app_settings;
+mod binfmt;
 pub mod video;
 mod video_commands;
 mod commands;

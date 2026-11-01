@@ -2514,6 +2514,42 @@ mod tests {
         );
     }
 
+    /// 同一道门在 Windows 上的形态：那边不吃权限位，"读不出来"的自然来源是另一个句柄
+    /// 占着文件且不给任何共享位（ERROR_SHARING_VIOLATION）。
+    ///
+    /// 这里必须用 `share_mode(0)`，和上面「删不掉」那条正好相反：那一条要的是
+    /// 读得到、删不掉，这一条要的就是读不到，共享位留一个都会把门测成假绿。
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_output_is_a_conflict_not_a_pass() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let source = sample_source(dir.path(), "locked.png", b"payload12");
+        let mut entry = entry_for(&source, &source, now_millis());
+        entry.output_modified_at = file_mtime_millis(&source);
+        let blocker = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&source)
+            .unwrap();
+        let state = HistoryStore::conflict_state(&entry);
+        let conflicted = HistoryStore::has_conflict(&entry);
+        let restore_outcome =
+            store.restore(&entry, false, false, open_access().as_ref(), &mut || false);
+        drop(blocker);
+        let bytes_now = fs::read(&source).unwrap();
+        fs::remove_file(&source).unwrap();
+        assert_eq!(state, ConflictState::Unreadable,
+            "读不出来 = 证明不了归属，必须拦");
+        assert!(conflicted);
+        assert!(
+            matches!(restore_outcome, Err(RestoreError::Conflict) | Err(RestoreError::Io(_))),
+            "未加 force 的恢复不得覆盖读不出来的文件"
+        );
+        assert_eq!(bytes_now, b"payload12".to_vec(), "被拦下的恢复一个字节都不能动");
+    }
+
     #[test]
     fn same_size_and_mtime_edit_is_still_a_conflict_thanks_to_the_fingerprint() {
         let dir = tempfile::tempdir().unwrap();

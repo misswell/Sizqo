@@ -28,12 +28,14 @@ jobs:
         run: cargo test --lib rust_executes_every_contract -- --nocapture
       - name: real media matrix (--ignored 真实编码，需要真的 FFmpeg 引擎)
         working-directory: src-tauri
-        # Linux runner 既不随包 resources/video（那是 macOS 的 Mach-O 二进制），
-        # PATH 上也没有 ffmpeg —— 上一轮这一步 0 passed / 2 failed，panic 在
-        # "找不到 ffmpeg"。装一个系统引擎让这条门禁真的跑，而不是把测试挪走。
+        # 上一轮这一步 0 passed / 2 failed，panic 是 "Exec format error (os error 8)"：
+        # 仓库里提交的 resources/video/bin 是 macOS arm64 Mach-O，Linux 上按存在性命中
+        # 之后交给 Command 必然炸。binfmt 闸门把这类候选跳掉之后，这里装一个系统 ELF
+        # 引擎，让这条门禁真的在 Linux 上跑一次真实编码，而不是把测试挪走。
         run: |
           sudo apt-get install -y --no-install-recommends ffmpeg
           ffmpeg -hide_banner -encoders | grep -q libx264
+          ffmpeg -hide_banner -encoders | grep -q libx265
           cargo test --lib real -- --ignored
 
   # macOS 才成立的行为（ImageIO 系统转换等）以前只被 swift-checks 间接碰到，

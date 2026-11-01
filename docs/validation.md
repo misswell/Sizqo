@@ -1549,9 +1549,10 @@ md5 `bb6f122a…` 一致，三者复跑均为绿。
 
 ### 已知不对称与遗留（不冒充完成）
 
-- **Windows 运行时**：本轮只做到"CI 里有作业真的跑 `cargo test --lib`"，其结果待推送
-  后以 Actions 为准；本机无法交叉编译（见 P0-3 取证限制）。在拿到 `windows-tests` 的
-  绿色记录之前，Windows 线的目录 fsync 与隔离改名都按"未验证"处理。
+- **Windows 运行时**：~~本轮只做到"CI 里有作业真的跑 `cargo test --lib`"，其结果待推送
+  后以 Actions 为准~~ —— 已兑现：run 41235873134 的 `windows-tests` **success**，
+  `cargo test --lib` 249 passed / 0 failed / 2 ignored，32 条契约向量在 Windows 上一致
+  （见下方第四轮）。目录 fsync 与隔离改名不再是"未验证"。
 - **非 unix 平台的 inode 凭证**：~~`file_identity` 在非 unix 返回 `None`~~ —— Windows
   已在 0.3.6-rc.5 补上卷号 + 文件号（见下方第四轮）；只剩"其他平台"这一支仍返回
   `None`，此时归属判定退化为内容对账，只有 `output_sha256` 也没记上的老日志才会走
@@ -1614,10 +1615,80 @@ Windows 的视频轨因此在**还没开始编码时**就整条失败。现在�
   `latest.json`。也就是说：**只要 Windows 打包一绿，一个 rc 标签就会成为仓库的
   "latest"，并把应用内更新源指向门禁未齐的构建**。现在按标签判定 —— 带 `-` 的
   （`vX.Y.Z-rc.N`）标成 pre-release、不抢 latest、不产 `latest.json`。
-- `real media matrix` 在 Ubuntu 上从没真的跑过：runner 既没有随包 `resources/video`
-  （那是 Mach-O），PATH 上也没有 ffmpeg，`process::command("ffmpeg")` 直接 panic
-  （`ffmpeg_backend.rs:130` 等），报的是 0 passed / 2 failed。现在先装 ffmpeg 并
-  断言 `libx264` 在场，再跑 `--ignored` —— 让门禁真跑，而不是把测试挪走。
+- `real media matrix` 在 Ubuntu 上从没真的跑过：`process::command("ffmpeg")` 直接
+  panic（`ffmpeg_backend.rs:132`），报的是 0 passed / 2 failed。先装系统 ffmpeg 并断言
+  `libx264`/`libx265` 都在场，再跑 `--ignored` —— 让门禁真跑，而不是把测试挪走。
+  本轮把这一步接上之后它仍然红，红出来的东西见下一节：装 ffmpeg 只是必要条件，
+  不是那一轮我以为的根因。
+
+### CI 回证（run 41235873134）：`windows-tests` 首次转绿，Ubuntu 真实矩阵揭出更根本的一扇门
+
+| 作业 | 结论 | 关键读数 |
+| --- | --- | --- |
+| `windows-tests` | **success** | `cargo test --lib` → **249 passed / 0 failed / 2 ignored**（上一轮 241 / 7 failed）；契约向量 **32 条与 Swift 期望一致**（上一轮的门只让人看到第 1 条） |
+| `rust-tests` (Ubuntu) | failure，且只红在一步 | `cargo test (default)` 251 / 0；契约向量 32 条一致；崩溃注入绿；**只有 `real media matrix` 红** |
+| `rust-tests-macos` / `appstore-tests` / `frontend-tests` / `swift-checks` | success | — |
+
+上一轮 P0-3 要的"运行时结论"因此第一次拿到：Windows 的目录 `FlushFileBuffers`、隔离
+改名、句柄身份、`SetFileTime`、`GetDiskFreeSpaceExW` 都在真机上跑过了 249 条测试。
+7 项失败的处置逐条兑现，没有一条是靠删测试或放宽断言变绿的。
+
+**Ubuntu 那一步红出来的不是"缺 ffmpeg"**，而是两条 panic 的原文：
+
+- `ffmpeg_backend.rs:132` → `called Result::unwrap() on an Err value: "Exec format error (os error 8)"`
+- `ffmpeg_backend.rs:227` → `内置 ffmpeg 必须有 libx264/libx265`
+
+根因：`src-tauri/resources/video/bin/{ffmpeg,ffprobe}` 与 `src-tauri/resources/bin/` 里
+7 个图片编码器（`file -b` 实测全是 `Mach-O 64-bit executable arm64`，`resources/lib`
+全是 dylib）**就提交在仓库里**，而 `video::process::tool()` 与 `engine::find_tool()`
+判"这台机器有没有这个后端"用的是 `is_file()` / `exists()`。于是 Linux/Windows 上：
+能力矩阵先把它报告成"可用"，直到真正 `spawn` 才炸 `Exec format error` —— 正是
+AGENTS §12 反着要求的行为（不可用的原生后端绝不 spawn）。上一轮我在 `tests.yml`
+里写的"runner 既不随包 `resources/video`"这句话是错的，随包了，随的是 macOS 的包；
+已就地改正。
+
+处置（本轮新增，`07061e3` 之后的追加提交）：
+
+| 位置 | 改动 |
+| --- | --- |
+| `src-tauri/src/binfmt.rs`（新） | `format_of()` 读 4 字节魔数（Mach-O thin/fat 双向 6 个、ELF、PE），`runnable_here()` 只认本机平台那一种；认不出的头部（脚本、空文件、目录）一律"不是本机后端" |
+| `video/process.rs::tool()` | 内置 bundle 候选、`resources/video/bin` 候选、PATH 候选都要过格式门；顺带修第二个真实缺口 —— 这里**从不加 `.exe`**，Windows 上即便随包放了 `ffmpeg.exe` 也永远命中不了（图片线的 `find_tool` 早就处理了这件事） |
+| `engine.rs::find_tool()` | 三处随包候选同样加门，回退语义不变 |
+| `history.rs` | 补 `#[cfg(windows)]` 的 `an_unreadable_output_is_a_conflict_not_a_pass`：这条"读不出来 = 证明不了归属，必须拦"的门此前只有 unix 覆盖。Windows 上权限位不管用，用 `share_mode(0)` 造 `ERROR_SHARING_VIOLATION`，断言与 unix 那条一字不差 |
+| `swift/Tests/HistoryStoreCheck/ContractVectors.swift:368` | 通过时日志打成 `ok 契约向量不一致: …（实际 X，期望 X）` —— 自相矛盾的日志。改成中性标签，判定由 `ok`/`FAIL` 前缀给 |
+
+新增 6 条测试（`binfmt` 2 + 图片线解析 2 + 视频线解析 2），其中两条正向对照只在
+macOS 编译：格式闸门不能把自家内置产物一起拒掉，那会让 Direct 主线静默退化成
+"全不可用"而单元测试照样全绿。`cargo test --lib` 因此 259 → **265**。
+
+那条 `#[cfg(windows)]` 测试在 macOS 上**根本不参与编译**，本机无法证明它能编。用
+std-only 表达式桩过了一遍目标类型检查：
+`rustc --edition 2021 --crate-type lib --target x86_64-pc-windows-msvc`（`OpenOptions` +
+`share_mode(0)` + `fs::read` + `Vec<u8>` 比较 + `remove_file`），EXIT=0。运行时结论
+仍以下一次 Actions 为准。
+
+### 追加一轮的门禁读数（macOS 本机，同一日内）
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib` | 265 passed / 0 failed / 2 ignored（23.92s），EXIT=0 |
+| `cargo test --lib --features inproc-backends` | 265 / 0 / 0，EXIT=0 |
+| `cargo test --no-default-features --features inproc-backends --lib` | 265 / 0（10:19:26→10:20:16 实测重编），EXIT=0 |
+| `cargo test`（含集成） | lib 265 / 0；崩溃注入 6 / 0；压缩契约 5 / 0，EXIT=0 |
+| `cargo test --lib real -- --ignored` | 2 passed —— 捆绑的 macOS 引擎在闸门之后**仍**被正确解析 |
+| `npm run test:frontend` | 全绿；N=1000 scroll×100=48.5ms、N=5000=89.6ms、N=10000=121.4ms（windowRows=20），10k 全量参考 first=246.2ms / clean=10.48ms |
+| `bash scripts/test_swift_history.sh` | 全部 `ok` / 0 FAIL（含 32 条契约向量标签修正后复跑） |
+| `rustc --crate-type lib --target x86_64-pc-windows-msvc`（Windows 新测试的表达式桩） | EXIT=0 |
+
+追加轮的负向对照（亲手拆门，证这两条新门不是空话）：
+
+| 拆掉的门 | 期望的失败 | 实测 |
+| --- | --- | --- |
+| `binfmt.rs`：`Some(Format::Elf) => cfg!(target_os = "linux")` 改成 `=> true` | 平台归属门必须响 | `assertion left == right failed / left: true / right: false`，1 passed / 1 failed |
+| `binfmt.rs`：`runnable_here` 对任何存在的文件返回 `false` | 两条**正向**对照必须响 | `cwebp: macOS 上内置工具必须仍是解析结果`、`macOS 上内置 ffmpeg 必须仍是解析结果`，0 passed / 2 failed |
+
+两处改完都原地还原并核对 md5（`2fd2425a…`，控制前后同值），还原后复跑 265 全绿。
+
 
 ### 本轮门禁命令与结果（macOS 本机，2026-11-01）
 
@@ -1651,8 +1722,11 @@ Windows 的视频轨因此在**还没开始编码时**就整条失败。现在�
   Windows 分支里除 `win32_fs.rs` 单独过了目标类型检查外，其余（`source_identity`、
   `output_transaction`、`history` 的 `share_mode` 现场、`commands` 的路径、
   `image_capabilities` 的 Windows 半条、`video` 的两个新原语）**只能由 CI 的
-  `windows-tests` 作业取证**。本轮同样不声称 Windows 已通过 —— 依据是推送后的
-  Actions 记录。
+  `windows-tests` 作业取证** —— 这一条已经在 run 41235873134 上兑现（249 / 0）。
+- **追加轮（`binfmt` 格式门、`tool()` 的 `.exe`、Windows 版"读不出来"门）尚未被任何
+  Actions 记录看过**：本机只能证明 macOS 侧行为不变（265 全绿 + `real --ignored`
+  2 passed）和 Windows 那条测试的表达式可类型检查。Linux 真实矩阵第一次"用系统
+  ELF 引擎跑通"也还没绿 —— 三条都要等推送后的那一次 run 才算数。
 - Windows / Linux 产物仍未签名（无对应签名链），正式版的门禁照旧不通。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))

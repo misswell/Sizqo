@@ -365,7 +365,9 @@ func runContractVectors() {
             let temp = freshRoot("contract-\(name.replacingOccurrences(of: ".json", with: ""))")
             let actual = contractRunScenario(scenario, temp)
             checked += 1
-            check(actual == expected, "契约向量不一致: \(name) :: \(scenario)（实际 \(actual)，期望 \(expected)）")
+            // 标签由 check() 加上 ok/FAIL 前缀，这里再写"不一致"就成了自相矛盾：
+            // 绿的行读起来像挂了，红的行反而看不出这是同一条格式串。
+            check(actual == expected, "契约向量 \(name) :: \(scenario)（实际 \(actual)，期望 \(expected)）")
         }
     }
     check(checked >= 20, "契约向量数量不应缩水（实际 \(checked)）")

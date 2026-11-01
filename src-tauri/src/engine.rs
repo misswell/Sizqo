@@ -404,20 +404,22 @@ fn find_tool(name: &str) -> Option<PathBuf> {
     };
 
     // 1. Tauri bundled: <res>/resources/bin/<tool>
+    //    内置候选先要"这台机器跑得动"：仓库里提交的是 macOS 产物，按存在性交出去
+    //    会让能力矩阵在 Linux/Windows 上把不可用的后端报成可用（§12）。
     if let Some(res_dir) = RESOURCE_DIR.get() {
         let bundled = res_dir.join("resources").join("bin").join(&exe_name);
-        if bundled.exists() {
+        if bundled.exists() && crate::binfmt::runnable_here(&bundled) {
             return Some(bundled);
         }
         // package.sh style: <res>/bin/<tool>
         let bundled = res_dir.join("bin").join(&exe_name);
-        if bundled.exists() {
+        if bundled.exists() && crate::binfmt::runnable_here(&bundled) {
             return Some(bundled);
         }
     }
     // 2. Dev mode: src-tauri/resources/bin/<tool>
     let dev_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources").join("bin").join(&exe_name);
-    if dev_path.exists() {
+    if dev_path.exists() && crate::binfmt::runnable_here(&dev_path) {
         return Some(dev_path);
     }
     // 3. System PATH
@@ -2605,5 +2607,60 @@ mod intent_tests {
         assert_eq!(parsed.target_met, None);
         assert_eq!(parsed.warnings, None);
         assert!(!parsed.has_product(), "没有结论的旧载荷不许拿 outputPath 猜产物");
+    }
+}
+
+/// 内置后端的"本机跑不动就别端出去"门（格式判定见 `binfmt`）。
+///
+/// 仓库里 `resources/bin` 提交的是 macOS arm64 产物。Linux/Windows 上按存在性把它
+/// 交给 `Command` 会当场 `Exec format error (os error 8)`，而在此之前能力矩阵已经把它
+/// 报成了"可用"——§12 要的恰恰是相反的行为：不可用的原生后端绝不 spawn。
+#[cfg(test)]
+mod tool_resolution_tests {
+    use super::*;
+
+    const BUNDLED: [&str; 7] =
+        ["cwebp", "pngquant", "gifsicle", "avifenc", "cjxl", "cjpeg", "oxipng"];
+
+    fn exe_of(name: &str) -> String {
+        if cfg!(windows) { format!("{name}.exe") } else { name.to_string() }
+    }
+
+    #[test]
+    fn a_bundled_image_tool_this_os_cannot_exec_is_never_offered() {
+        let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/bin");
+        for name in BUNDLED {
+            let candidate = dev.join(exe_of(name));
+            if !(candidate.is_file() && !crate::binfmt::runnable_here(&candidate)) {
+                continue;
+            }
+            if let Some(resolved) = find_tool(name) {
+                assert_ne!(resolved, candidate, "{name}: 本机跑不了的内置候选被当成了后端");
+                assert!(
+                    crate::binfmt::runnable_here(&resolved),
+                    "{name}: 解析结果本机也跑不了：{}",
+                    resolved.display()
+                );
+            }
+        }
+    }
+
+    /// 反向对照：格式闸门不能把 macOS 自家的内置工具一起拒掉 ——
+    /// 那会让 Direct 主线静默退化成"全不可用"，而能力矩阵的测试照样全绿。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_bundled_image_tools_still_resolve() {
+        for name in BUNDLED {
+            let dev = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("resources/bin")
+                .join(name);
+            if dev.is_file() {
+                assert_eq!(
+                    find_tool(name).as_deref(),
+                    Some(dev.as_path()),
+                    "{name}: macOS 上内置工具必须仍是解析结果"
+                );
+            }
+        }
     }
 }
