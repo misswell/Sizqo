@@ -425,11 +425,9 @@ fn find_tool(name: &str) -> Option<PathBuf> {
     // 3. System PATH
     if cfg!(target_os = "windows") {
         if let Ok(path_var) = std::env::var("PATH") {
-            for dir in path_var.split(';') {
-                let p = Path::new(dir).join(&exe_name);
-                if p.exists() {
-                    return Some(p);
-                }
+            let dirs: Vec<PathBuf> = path_var.split(';').map(PathBuf::from).collect();
+            if let Some(found) = crate::binfmt::system_tool_in(&dirs, &exe_name) {
+                return Some(found);
             }
         }
         let mut where_cmd = std::process::Command::new("where");
@@ -441,10 +439,17 @@ fn find_tool(name: &str) -> Option<PathBuf> {
         }
         if let Ok(out) = where_cmd.output() {
             if out.status.success() {
-                if let Some(line) = String::from_utf8_lossy(&out.stdout).lines().next() {
+                // `where` 会列出所有同名命中，逐个问"这台机器跑不跑得动"：
+                // 第一个命中是别的平台的二进制时（用户从别处拷来的静态包），
+                // 直接端出去照样炸 Exec format error，而后面往往就有一个能跑的。
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
                     let s = line.trim();
-                    if !s.is_empty() {
-                        return Some(PathBuf::from(s));
+                    if s.is_empty() {
+                        continue;
+                    }
+                    let p = PathBuf::from(s);
+                    if p.is_file() && crate::binfmt::plausible_system_backend(&p) {
+                        return Some(p);
                     }
                 }
             }
@@ -457,17 +462,17 @@ fn find_tool(name: &str) -> Option<PathBuf> {
             "/usr/bin",
             "/opt/local/bin",
         ];
-        for dir in extra {
-            let p = Path::new(dir).join(name);
-            if p.exists() {
-                return Some(p);
-            }
+        if let Some(found) = crate::binfmt::system_tool_in(extra.into_iter(), name) {
+            return Some(found);
         }
         if let Ok(out) = std::process::Command::new("which").arg(name).output() {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !s.is_empty() {
-                    return Some(PathBuf::from(s));
+                    let p = PathBuf::from(s);
+                    if crate::binfmt::plausible_system_backend(&p) {
+                        return Some(p);
+                    }
                 }
             }
         }

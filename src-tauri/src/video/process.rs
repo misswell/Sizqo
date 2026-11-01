@@ -31,8 +31,7 @@ pub fn tool(name: &str) -> Result<PathBuf,String> {
         present_but_unrunnable = true;
     }
     let paths = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&paths).map(|p|p.join(&file_name))
-        .find(|p|p.is_file() && crate::binfmt::runnable_here(p))
+    crate::binfmt::system_tool_in(std::env::split_paths(&paths), &file_name)
         .ok_or_else(||if present_but_unrunnable {
             format!("{name} unavailable: the bundled engine does not match this platform or CPU; ship the matching slice")
         } else {

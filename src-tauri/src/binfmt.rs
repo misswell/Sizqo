@@ -10,7 +10,7 @@
 //! 而发布线同时出 `x86_64-apple-darwin` 与 universal —— Intel 上拿到 arm64 切片时
 //! Rosetta 帮不上（它只反着帮），`posix_spawn` 直接 `EBADARCH`「Bad CPU type in
 //! executable」。所以 Mach-O 这条路要多问一层切片架构，问不出就当作不可用。
-use std::{fs, io::Read, path::Path};
+use std::{fs, io::Read, path::{Path, PathBuf}};
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Format {
@@ -133,6 +133,27 @@ pub(crate) fn runnable_here(path: &Path) -> bool {
     }
 }
 
+/// 系统里（PATH）的候选只能用这一条，不能用 `runnable_here` 那种正向闸门。
+///
+/// 差别只在"认不出格式"这一支：随包产物认不出就该拒（那是我们自己投的，必须是本机
+/// 原生二进制）；用户装的认不出就该放行 —— flatpak/snap 的 shim、shell 包装都是真能
+/// exec 的东西，用正向闸门会把它们一起报成"引擎不可用"，而这台机器其实跑得好。
+/// 认得出格式但格式不是本机的那一种，照旧拒绝：那正是 `Exec format error` 的来源，
+/// 只不过候选来自 PATH 而不是 `resources`。引擎到底行不行由能力探测真跑一次定论。
+pub(crate) fn plausible_system_backend(path: &Path) -> bool {
+    format_of(path).is_none() || runnable_here(path)
+}
+
+/// PATH 候选的扫描只留一份实现：图片线和视频线走同一条门，避免以后又是一处补、一处漏。
+pub(crate) fn system_tool_in<P: AsRef<Path>, I: IntoIterator<Item = P>>(
+    dirs: I,
+    file_name: &str,
+) -> Option<PathBuf> {
+    dirs.into_iter()
+        .map(|dir| dir.as_ref().join(file_name))
+        .find(|path| path.is_file() && plausible_system_backend(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +251,61 @@ mod tests {
         assert!(!runnable_here(&empty));
         // 目录不是可执行文件，也不许因为"存在"被端出去。
         assert!(!runnable_here(dir.path()));
+    }
+
+    /// PATH 那条门和随包那条门在"认不出格式"上必须分家：用户装的 shell 包装 /
+    /// flatpak shim 是真能 exec 的，正向闸门会把跑得动的机器报成"引擎不可用"；
+    /// 而"认得出格式却不是本机那一种"照样要拒 —— 那和随包产物是同一个
+    /// `Exec format error`，只是候选来自 PATH。
+    #[test]
+    fn the_path_gate_rejects_foreign_formats_but_not_wrappers() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = thin(dir.path(), "native", false, host_cpu_type().unwrap_or(CPU_ARM64));
+        let elf = magic(dir.path(), "linux-engine", [0x7F, b'E', b'L', b'F']);
+        let macho = thin(dir.path(), "mac-engine", false, CPU_ARM64);
+        let pe = magic(dir.path(), "win-engine.exe", [b'M', b'Z', 0x90, 0x00]);
+        let wrapper = dir.path().join("shim");
+        fs::write(&wrapper, b"#!/bin/sh\nexec ffmpeg \"$@\"\n").unwrap();
+
+        assert_eq!(plausible_system_backend(&native), cfg!(target_vendor = "apple"));
+        assert_eq!(plausible_system_backend(&elf), cfg!(target_os = "linux"));
+        assert_eq!(
+            plausible_system_backend(&macho),
+            cfg!(all(target_vendor = "apple", target_arch = "aarch64"))
+        );
+        assert_eq!(plausible_system_backend(&pe), cfg!(windows));
+        // 只有这一支和 runnable_here 不同：认不出格式就交给真跑一次的能力探测定论。
+        assert!(plausible_system_backend(&wrapper), "脚本包装不该被格式门误杀");
+        assert!(!runnable_here(&wrapper), "同一条文件在随包那一步仍然不算后端");
+    }
+
+    /// 扫描要真按门跳：前面的目录躺着本机跑不动的引擎时，必须继续找到后面那个，
+    /// 而不是把第一个"存在"的东西交出去。
+    #[test]
+    fn the_path_scan_steps_over_an_unexecuable_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad");
+        let good = dir.path().join("good");
+        fs::create_dir(&bad).unwrap();
+        fs::create_dir(&good).unwrap();
+        let foreign: [u8; 4] = if cfg!(target_os = "macos") {
+            [0x7F, b'E', b'L', b'F']
+        } else {
+            [0xFE, 0xED, 0xFA, 0xCF]
+        };
+        magic(&bad, "ffmpeg", foreign);
+        magic(&good, "ffmpeg", [b'#', b'!', b'/', b'i']);
+
+        assert_eq!(
+            system_tool_in([bad.as_path()], "ffmpeg"),
+            None,
+            "本机跑不动的 PATH 候选不许被当成后端"
+        );
+        assert_eq!(
+            system_tool_in([bad.as_path(), good.as_path()], "ffmpeg"),
+            Some(good.join("ffmpeg")),
+            "跳过跑不动的候选之后要找得到下一个"
+        );
+        assert_eq!(system_tool_in([bad.as_path()], "ffprobe"), None, "找不到就是 None");
     }
 }

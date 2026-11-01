@@ -1840,11 +1840,37 @@ video/lib/*.dylib  全部 arm64（libavcodec.63 / libavformat.63 / libSvtAv1Enc.
 
 而 `release.yml` 的 mac 线同时构建 `aarch64-apple-darwin`、`x86_64-apple-darwin`
 与二者的 universal 合并包（`build-macos` 矩阵 + `build-macos-universal`）。也就是说：
-**Intel 切片里那套随包引擎是 arm64 单架构，`posix_spawn` 只会得到 `EBADARCH`
-「Bad CPU type in executable」** —— Rosetta 只反着帮（Intel 机器跑不了 arm64），
-所以这不是"可能有问题"，是与上一轮 `Exec format error` 同一条链的下一环，而且这次
-红的是自家发布产物。发布说明里那句"macOS Intel：已签名公证，但尚无人在 Intel 真机上
-完成验收"因此不只是缺验收，而是那条轨道上根本没有可用引擎。
+**仓库里提交的这套引擎是 arm64 单切片，Intel 上拿到它 `posix_spawn` 只会得到
+`EBADARCH`「Bad CPU type in executable」** —— Rosetta 只反着帮（Intel 机器跑不了
+arm64），所以这不是"可能有问题"，是与上一轮 `Exec format error` 同一条链的下一环。
+
+**这条结论的范围，本轮由 run 41268093305 的日志收窄了，属于我自己的过度声明，如实更正**：
+`build-macos` 的 `Install CLI tools` 会在**各自 runner 上**跑
+`scripts/collect_macos_tools.sh`，该脚本重写 `resources/video/bin` 并在末尾用
+`expected_arch="$(uname -m)"` 对每个产物做 `file … | grep -q "${expected_arch}"`，
+不匹配直接 `exit 1`；`build-macos-universal` 再对所有 Mach-O 成对 `lipo -create`。
+实测日志：
+
+```
+build-macos (x86_64 …)  Install CLI tools    Collected 2 tools -> src-tauri/resources/video/bin (19 dylibs)
+build-macos (x86_64 …)  Install CLI tools    Collected macOS tools for x86_64: src-tauri/resources
+build-macos-universal   Merge Universal app  …/Contents/Resources/video/bin/ffmpeg: replacing existing signature
+build-macos-universal   Merge Universal app  …/Contents/Resources/video/bin/ffprobe: replacing existing signature
+```
+
+所以**已分发的 Intel dmg 与 universal 包里的视频引擎是架构对得上的**（x86_64 切片 /
+双切片），上一轮那句"那条轨道上根本没有可用引擎"对发布产物不成立，撤回。
+架构门真正吃得住的是这四类：
+
+| 场景 | 门生效与否 |
+| --- | --- |
+| Intel mac 上 `git clone` 后直接 `cargo tauri build` / 跑测试（用仓库里 arm64 的提交产物） | 生效 —— 这正是 `EBADARCH` 的现场 |
+| Linux / Windows 上任何构建（提交的是 Mach-O） | 生效（上一轮的格式门，本轮仍在） |
+| 任何跳过 `collect_macos_tools.sh` 的打包步骤 | 生效 —— 投递错切片不再静默 |
+| CI 的 mac 矩阵（每次现场重采） | 不参与结论：那里的引擎本来就是本机架构 |
+
+发布说明里"macOS Intel：已签名公证，但尚无人在 Intel 真机上完成验收"这条不变：
+缺的仍是**真机验收**，不是引擎。
 
 处置（`src/binfmt.rs`）：
 
@@ -1874,17 +1900,88 @@ Intel、Linux、Windows 上都不空判。`cargo test --lib` 271 passed / 0 fail
 先把干净版本复制成 `/tmp/binfmt_pristine.rs`，两条控制都改用副本还原并核对 md5。
 **在带未提交工作的文件上做注入实验，还原手段必须是副本，不能是 `git checkout`。**
 
+### 同一类问题的第三处：PATH 上的候选走的是同一条门，但不是同一句判断
+
+`runnable_here` 补完架构之后，回头查它的**消费方**，发现还剩一段没问：随包候选过了门，
+系统候选没过。图片线 `engine::find_tool` 的 PATH 扫描是 `p.exists()` 就返回，
+`where` 只取第一行；视频线 `video::process::tool()` 更糟 —— 它把随包那条
+**正向**门（`runnable_here`）直接套在 PATH 上。两边各错一半：
+
+| 位置 | 原来 | 错在哪 |
+| --- | --- | --- |
+| `engine.rs` PATH / `where` | 存在即返回 | 用户从别处拷来的另一平台二进制（`~/.local/bin/ffmpeg` 是 Mach-O 而机器是 Linux）照样被端出去，炸的还是 `Exec format error (os error 8)`；`where` 命中多个时只看第一个，后面明明有一个能跑的 |
+| `video/process.rs` PATH | 必须过 `runnable_here` | 把**认不出格式**也当成不可用。flatpak / snap 的 shim、shell 包装是真能 exec 的，这条会把跑得动的机器报成"引擎不可用" —— 是上一轮"闸门误杀自家产物"同一种错，只是这次杀的是用户的引擎 |
+
+所以分家成两句（`src/binfmt.rs`，仍然只有一份实现）：
+
+- `runnable_here`：正向门。格式认不出 → 不是后端。用在**随包**候选上，因为那是我们自己投的文件，
+  必须是本机原生二进制，投错了就该拒。
+- `plausible_system_backend`：`format_of(path).is_none() \|\| runnable_here(path)`。
+  只拒"认得出格式且不是本机那一种"这一类。用在系统候选上；引擎到底行不行，交给真跑一次的
+  能力探测（`discover()` / `probe_frame_timing_flag`）定论，而不是靠猜文件长相。
+- `system_tool_in(dirs, file_name)`：PATH 扫描本身也收成一份，图片线（Windows 的 `;` 分隔 +
+  `where` 全部命中逐条问）和视频线（`split_paths`）共用，避免"一处补、一处漏"。
+
+新增 2 条测试（`binfmt`）：`the_path_gate_rejects_foreign_formats_but_not_wrappers`
+（本机格式 / ELF / Mach-O / PE 四种输入的结论逐一对上本机平台，且同一条脚本文件在两句判断下
+结论**必须相反** —— 这条是两句分家本身的断言）与
+`the_path_scan_steps_over_an_unexecuable_candidate`（前一个目录躺着跑不动的候选时必须继续找，
+而不是把第一个"存在"的交出去；找不到才是 `None`）。
+
+本轮门禁命令与结果（macOS 本机，2026-11-01，全部 EXIT=0）：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib` | **273 passed / 0 failed / 2 ignored**（`binfmt` 单跑 5 条全绿） |
+| `cargo test --features inproc-backends` | 272 passed / 0 failed，另 6 / 5 条全绿 |
+| `cargo test --no-default-features --features inproc-backends` | 272 passed / 0 failed，另 6 / 5 条全绿 |
+| `cargo test --test crash_injection` | 崩溃注入 6 个阶段（每阶段 SIGKILL + 两次恢复）全部通过 |
+| `cargo test --lib rust_executes_every_contract` | 契约向量 32 条与 Swift 期望一致 |
+| `cargo test --lib real -- --ignored` | 2 passed / 0 failed（本机 ffmpeg 真编码） |
+| `npm run test:frontend` | 27 条 PASS，`N=10000` first=10.8ms / clean=0.75ms |
+| `bash scripts/test_swift_history.sh` | 546 行 `ok`，脚本自检全通过；两次运行的差异仅为临时目录 UUID 与时间戳 |
+
+负向对照（`/tmp/binfmt_pristine_b.rs`，md5 `a7a57cf3…`，两轮都按副本还原并核对）：
+
+| 亲手拆的门 | 期望的失败 | 实测 |
+| --- | --- | --- |
+| `system_tool_in` 里去掉 `&& plausible_system_backend(path)` | 扫描门必须响 | `the_path_scan_steps_over_an_unexecuable_candidate ... FAILED`，`left: Some("…/bad/ffmpeg") right: None`，4 passed / 1 failed |
+| `plausible_system_backend` 退化成 `runnable_here`（去掉"认不出就放行"那半） | 分家本身必须响 | `the_path_gate_rejects_foreign_formats_but_not_wrappers`（「脚本包装不该被格式门误杀」）与扫描那条一起 FAILED，3 passed / 2 failed |
+
+### CI 回证（run 41268093305 = `v0.3.6-rc.5` 三轨道构建，run 41269122796 = `e175a7c` 测试）
+
+`tests.yml` run **41269122796**（提交 `e175a7c`，含架构门）7 个作业全 success，逐作业读数：
+
+| 作业 | 关键读数 |
+| --- | --- |
+| `rust-tests`（Ubuntu） | `cargo test (default)` **261 passed / 0 failed / 2 ignored**；契约向量 32 条一致；`real media matrix` **2 passed**（apt 的 4.4 走 `-vsync` 那一支） |
+| `windows-tests` | **263 passed / 0 failed / 2 ignored**；契约向量 32 条一致 |
+| `rust-tests-macos` | default **271 passed / 0**；`--features inproc-backends` **270 / 0**；APFS 崩溃注入 6 阶段全过 |
+| `appstore-tests` | **262 passed / 0 failed** + 6 / 5 条 + 崩溃注入全过 |
+| `frontend-tests` / `swift-checks` | success |
+
+发布 run **41268093305**（标签 `v0.3.6-rc.5`）8 个作业全 success：
+`verify-appstore`、`build-windows`、`build-macos (arm64)`、`build-macos (x86_64, macos-15-intel)`、
+`build-macos-universal`、`build-linux`、`compression-parity`、`release`。
+门禁项逐条对上：Windows 版本串去后缀生效（`Sizqo_0.3.6_x64_en-US.msi` / `_amd64.deb` 无 `rc`）；
+`release` 作业按标签判定预发布 —— 日志原文「预发布 v0.3.6-rc.5：不产出 latest.json，
+应用内更新源保持指向上一个正式版」，Release 的 `prerelease: true`，仓库 `latest` 仍是 `v0.3.5`。
+`v0.3.6-rc.5` 资产 9 个（3 个 macOS dmg + universal 更新包及其 `.sig` + Windows msi/setup.exe +
+Linux AppImage/deb）。
+
 ### 标签：`v0.3.6-rc.5` 已发布，架构门走 `v0.3.6-rc.6`
 
 - `v0.3.6-rc.5` 指向 `56589af`（tests.yml run 41266916166 六作业全绿的那棵树的文档提交），
   已推送：`https://github.com/misswell/Sizqo/releases/tag/v0.3.6-rc.5`。它**不含**上面的
-  架构门，因此 Intel 轨道仍然是"随包 arm64 引擎 + 平台门放行"，编码时才炸 `EBADARCH`。
+  架构门（也不含本轮的 PATH 门），因此那棵树上"Intel mac 本地构建 + 仓库提交的 arm64 引擎"
+  仍是平台门放行、编码时才炸 `EBADARCH`；已分发的 Intel/universal 安装包不受影响，
+  依据是上一条表格里 runner 现场重采 + `lipo` 合并的日志。
   `rc.1…4` 一律不动，已发布的 `rc.5` 标签也不改写（owner 明确要求不强制覆盖已分发标签）。
 - 这条标签说明正文里有一句笔误：写成了"FFmpeg 9 已删新…"，本意是"FFmpeg 9 已删 `-vsync`"。
   标签已分发，改它等于 force-push 覆盖已发布标签，因此**不改写**，正确结论以本节与代码
   注释为准。
-- 架构门作为新一轮工作打 `v0.3.6-rc.6`（版本号先经 `chore(release)` 提交落到三处配置），
-  数字不与任何已分发标签重叠。
+- 架构门与本轮的 PATH 门作为新一轮工作打 `v0.3.6-rc.6`（版本号先经 `chore(release)` 提交
+  落到三处配置），数字不与任何已分发标签重叠。
 
 ### 仍未取证的部分（如实）
 
@@ -1904,10 +2001,19 @@ Intel、Linux、Windows 上都不空判。`cargo test --lib` 271 passed / 0 fail
     类型错误确认会报错，再撤掉错误取 EXIT=0。**一个不知道自己是否在跑的探针，
     和没有探针等价。**
 - Windows / Linux 产物仍未签名（无对应签名链），正式版的门禁照旧不通。
-- **Intel mac 的随包引擎缺口仍未由打包补齐**：架构门现在会正确拒绝 arm64 单切片，
-  于是那条轨道的图片工具退到系统 PATH、视频轨直接报告不可用。要让 Intel 真有引擎，
-  缺的是投递 universal / x86_64 切片的 FFmpeg 与 7 个图片工具（以及对应的 GPL 对应
-  源码义务），不是把闸门放宽回"平台对上就 exec"。
+- **仓库里提交的 macOS 产物仍只有 arm64 单切片**（7 个图片工具 + `video/bin/ffmpeg`、
+  `ffprobe` + 全部 dylib）。CI 的 mac 矩阵不受影响：`collect_macos_tools.sh` 在每台
+  runner 上现场重采并按 `uname -m` 硬门校验，universal 再由 `lipo -create` 合并，
+  这一条本轮已由 run 41268093305 的日志取证。受影响的是**不经重采的那条路**：
+  Intel mac 上 `git clone` 后直接构建 / 跑测试。架构门现在会正确拒绝 arm64 单切片，
+  于是那条轨道的图片工具退到系统 PATH、视频轨报告不可用 —— 这是如实的拒绝，不是修复。
+  要把这一条也补成"真有引擎"，缺的是把 universal / x86_64 切片一起提交进仓库
+  （以及对应的 GPL 对应源码义务），不是把闸门放宽回"平台对上就 exec"。
+- 本轮新记一条：**引擎版本随 runner 而变** —— Intel runner 实测装到
+  `ffmpeg 9.0.1`（`-vsync` 已删的那一支），Ubuntu 22.04 的 apt 是 `7:4.4.2`（只有
+  `-vsync`）。两条拼写由同一次真跑探测定论，因此这条差异不需要在文档里"钉一个版本"；
+  但它意味着**已分发安装包里的引擎并不相同**，跨机器复现时间轴类问题时得先问
+  `caps.frame_timing_flag`，而不是假设两处一致。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
