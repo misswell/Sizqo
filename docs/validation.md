@@ -2206,7 +2206,7 @@ cargo test --lib real -- --ignored
 | `latest.json` | **没有这个资产**；`release` 作业打出「预发布 v0.3.6-rc.7：不产出 latest.json，应用内更新源保持指向上一个正式版」 |
 | `latest` 指针 | 仍指 `v0.3.5`（`prerelease=false`）—— 在线更新源没有被这个门禁未齐的构建抢走 |
 | 资产 | 9 个：`Sizqo_v0.3.6-rc.7_macos_{arm64,x86_64,universal}.dmg`、`…_macos_universal.app.tar.gz` + `.sig`、`Sizqo_0.3.6_x64-setup.exe`、`…_x64_en-US.msi`、`…_amd64.deb`、`…_amd64.AppImage` |
-| 签名/公证/装订 | `build-macos-universal` 里 3 次 `Current status: Accepted` + 3 次 `The staple and validate action worked!`（随后各一次 `The validate action worked!`），证书链 `Developer ID Application: Guofeng Liu … → Developer ID Certification Authority → Apple Root CA`；`Create signed DMGs from the ticketed apps` 在这之后 |
+| 签名/公证/装订 | `build-macos-universal` 里 **6** 次 `Current status: Accepted` + **6** 次 `The staple and validate action worked!` + 6 次 `The validate action worked!`：脚本是**两轮**——`Notarize the three apps` → `Staple the notarization tickets into the apps`，再 `Create signed DMGs from the ticketed apps` → `Submit three DMGs to Apple notarization` → `Staple and validate the DMG tickets`。证书链 `Developer ID Application: Guofeng Liu … → Developer ID Certification Authority → Apple Root CA`。**更正**：本行先前记的是 3 次，那是我 `grep | head` 截断只看到第一轮造成的少数；rc.8 用同一脚本按 `grep -oE … | uniq -c` 重数得 6，回查 rc.7 同一份日志同为 6。 |
 
 两条要如实记下的观察：
 
@@ -2294,6 +2294,52 @@ bash scripts/verify_bundle_arch.sh src-tauri/resources/video/bin $(uname -m=arm6
 CI 也不跑这个脚本（mac 腿走的是 `sign_notarize_macos_ci.sh`）。它的第一次真实执行
 是下一次本机三轨道构建，届时读数补进本节。
 
+### CI 回证（run 41277477011 = `v0.3.6-rc.8`）：universal 包内第一次量到双切片
+
+标签 `v0.3.6-rc.8` → `3f5d9d7`：`https://github.com/misswell/Sizqo/releases/tag/v0.3.6-rc.8`。
+8 个作业全 success（含 `release`）。`rc.1…7` 一律不动、不改写；这一条也仍是预发布，
+`v0.3.6` 正式版要等验收矩阵、GPL 对应源码、Windows/Linux 签名与 App Store 沙盒运行时
+四样都齐了才打。两条上一轮记为"已接线、未跑过"的门，这个 run 都给了读数：
+
+**1）`Refuse a universal bundle whose execs lost a slice` 的首次执行**（合并之后、签名之前，
+`work/universal/Sizqo.app`）：
+
+```
+ok   sizqo → x86_64 arm64            …/Contents/MacOS 里 1 个 Mach-O 都含 arm64 与 x86_64
+ok   ffmpeg → x86_64 arm64           …/Resources/video/bin 里 2 个 Mach-O 都含 arm64 与 x86_64
+ok   ffprobe → x86_64 arm64
+ok   cjpeg/oxipng/avifenc/gifsicle/pngquant/cwebp/cjxl → x86_64 arm64
+                                    …/Resources/resources/bin 里 7 个 Mach-O 都含 arm64 与 x86_64
+```
+
+10 个会被 exec 的文件逐个点名，全部双切片 —— **"已分发 universal 包真的带两切片"从
+脚本契约推论升级为包内实测**。仍要说清测量的时点：这一步在签名之前，而两个 mac 资产
+（DMG 与 `app.tar.gz`）都由这同一个 app 目录签出来；`codesign --force` 改的是签名块，
+不改 fat header，所以我**没有**再加一道签名后的重复检查（为不会发生的场景加门不是严谨）。
+下载路线本身仍然是死的，见上一节。
+
+**2）四处版本串守卫的 CI 首跑**：`compression-parity` 作业里那条 `Refuse a tag that does
+not match the app version` 的执行文本包含 `APPSTORE_VERSION="$(jq -r .version
+src-tauri/tauri.conf.appstore.json)"` 与 `|| [ "$APPSTORE_VERSION" != "$CONFIG_VERSION" ]`，
+作业 success —— 即第四处参与了判定并通过。上一轮"本机三条读数 + 旧守卫对照"的缺口由此
+补上，`rc.7` 标签注释里那句提前声称的话到这里才算真的成立。
+
+**3）发布侧**（`gh release view` 查回）：`prerelease=true`、`draft=false`、9 个资产，
+mac 三个 DMG + `app.tar.gz` + `.sig` 都带 `v0.3.6-rc.8`，Windows/Linux 四个资产名仍是
+被有意剥掉的 `0.3.6`；`release` 作业打出「预发布 v0.3.6-rc.8：不产出 latest.json」，
+`latest` 指针仍为 `v0.3.5 prerelease=false`。公证与装订按更正后的数法仍是 6/6/6
+（三轮 app + DMG 各 3），两腿引擎照旧 `ffmpeg--9.0.2_1.arm64_tahoe` 与
+`ffmpeg--9.0.1.sonoma` —— 上一轮记的"两片不是同一支"在本轮复现。
+
+**4）单架构腿回归**（同一 run）：arm64 腿 `video/bin 2 个 + resources/bin 7 个 都含 arm64`，
+x86_64 腿同数 `都含 x86_64`；家族匹配改动（`arm64`/`arm64e`）没有把这两条改成空判。
+
+**5）Tests run 41277463452（`3f5d9d7`）六作业全绿**：`windows-tests` 265 / 0 / 2 ignored，
+真实矩阵 `2 passed; 0 failed; 0 ignored; 265 filtered out`（2.96s，引擎
+`C:\ProgramData\chocolatey\bin\ffmpeg.exe`）；`rust-tests` 263 / 0 / 2 + 真实矩阵 2 passed；
+`rust-tests-macos` 273 / 0 / 2 与 272 / 0；`appstore-tests` 264 + 6 + 5；
+`frontend-tests` / `swift-checks` success。
+
 ### 仍未取证的部分（如实）
 
 - 本机交叉编译依旧不可行（`ring` 的 cc-rs 报 `'assert.h' file not found`），所以
@@ -2330,7 +2376,9 @@ CI 也不跑这个脚本（mac 腿走的是 `sign_notarize_macos_ci.sh`）。它
   KB/分钟级就停滞，取不到读数，因此这条**仍记为待实测**，不当已通过。
   本轮又用小资产试了第三次（57 MB 的 `…_macos_universal.app.tar.gz`，10 分钟只到 229 KB），
   同一堵墙 —— 判定为本机到 Release 资产 CDN 的路线问题，不再第四次重试；测量改由
-  `build-macos-universal` 的新步在 CI 里做，那个 run 之前这条仍是待实测。
+  `build-macos-universal` 的新步在 CI 里做，**run 41277477011 已兑现**（主程序 1 +
+  视频引擎 2 + 图片工具 7 全部 `x86_64 arm64`，见该节）。测量点在签名之前，
+  签名不改 fat header，故不再为此加第二道门。
   受影响的是**不经重采的那条路**：
   Intel mac 上 `git clone` 后直接构建 / 跑测试。架构门现在会正确拒绝 arm64 单切片，
   于是那条轨道的图片工具退到系统 PATH、视频轨报告不可用 —— 这是如实的拒绝，不是修复。
