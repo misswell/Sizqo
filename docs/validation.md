@@ -2390,6 +2390,98 @@ x86_64 腿同数 `都含 x86_64`；家族匹配改动（`arm64`/`arm64e`）没�
   但它意味着**已分发安装包里的引擎并不相同**，跨机器复现时间轴类问题时得先问
   `caps.frame_timing_flag`，而不是假设两处一致。
 
+## 第五轮：无覆盖改名原语与降级路径（2026-11-01，0.3.6-rc.9）
+
+RC.8 之后按"文件安全"的维度再查了一遍事务链路，剩下的问题都指向同一件事：
+**"放进一个必须是空位的名字"曾经用「`exists()` 查空 + `fs::rename`」实现**。
+POSIX rename 无条件替换目标，Rust 在 Windows 上带 `MOVEFILE_REPLACE_EXISTING`，
+所以查空与改名之间的那段窗口会把外面新放进去的文件直接顶掉。
+
+| 现场 | 位置 | 上一版行为 |
+| --- | --- | --- |
+| 硬链接不可用时的占名 | `output_transaction.rs:install_at_free_path` | 落回「查空 + rename」，exFAT / 部分网络盘上可覆盖外部文件 |
+| 隔离名放回原位 | `output_transaction.rs:restore_quarantined` | 原位为空时裸 `fs::rename`；**与文件系统无关**，失败回卷路径上都有 |
+| Swift 两条发布降级路 | `OutputTransactionStore.swift` | 原子交换不可用时「验一眼再 `Darwin.rename`」 |
+| Swift 占位提交降级路 | `OutputTransactionStore.swift` | 同上 |
+| Swift 冲突名迁移 | `TempOwnership.protectForeignBytes` | `conflictSibling` 探到空名再 rename，同一类窗口 |
+
+### 修法：一条原语 + 三级台阶
+
+新增 `rename_no_replace(from, to)`，三个平台各有原生实现，**不新增依赖**：
+
+| 平台 | 原语 | "不支持"的判据 |
+| --- | --- | --- |
+| macOS | `renamex_np(RENAME_EXCL)`（libc 0.2.186 已导出） | `EINVAL` / `ENOSYS` / `EOPNOTSUPP` |
+| Linux | `renameat2(RENAME_NOREPLACE)` | 同上 |
+| Windows | `MoveFileExW` **不带** `MOVEFILE_REPLACE_EXISTING` | 目标存在即 `ERROR_ALREADY_EXISTS` |
+
+`install_at_free_path` 与 Swift `installNoClobber` 都改成同一条三级台阶：
+
+1. 原生无覆盖改名 —— 一步到位，目标存在就失败；
+2. 硬链接占名 —— 目标存在必然失败，成功后收回候选旧名（同一 inode）；
+3. `O_EXCL` 占位 + rename 覆盖**自己的**占位 —— 覆盖对象从"任何人"缩小到
+   "我们刚创建的那个 0 字节文件"（收尾时按 `(dev,ino)` 核对，只收走自己的）。
+
+三级之外没有第四种写法：装不进去就是拒绝提交。`restore_quarantined` 也走同一条
+台阶，装不进去（说明原位在装回途中被占了）再转原子交换 —— 两条路都保不住时，
+字节留在隔离名上等人工确认。
+
+同格式覆盖在"没有原子交换"的文件系统上本来就要覆盖一个**已存在**的目标，
+所以 Swift 与 Rust 都走隔离路线（`publish_replace_via_quarantine` /
+`publishReplaceViaQuarantine`）：移走目标 → 复验移出来的字节 → 不覆盖地装候选 →
+对不上就放回原位并拒绝。`publish_claimed` 也改成「先交换再验证被换出的占位 inode」，
+与 `publishIfPlaceholderMatches` 同一顺序；交换不可用时走隔离路线。
+
+另修一处窄窗口：`retire_original` 复验通过后、删除前再看一眼体积。改名不会让外部
+**已持有的 fd** 失效，所以"复验之后仍被追加"这个窗口真实存在 —— 这一眼拦得住
+"又长了字节"的那一类，同长度原地改写仍由覆盖前的原图备份兜底（Rust 与 Swift 同步）。
+
+### 新增测试（本轮）
+
+Rust（`output_transaction.rs` 测试模块，5 条）：
+
+| 测试 | 钉住的事 |
+| --- | --- |
+| `installing_a_candidate_falls_back_to_the_hard_link_rung` | 第一级不可用时第二级接得住 |
+| `installing_a_candidate_falls_back_to_an_exclusive_placeholder` | 两级都不可用时第三级接得住 |
+| `the_last_install_rung_still_refuses_an_occupied_target` | 第三级也不许退化成覆盖 |
+| `restoring_a_quarantined_file_never_overwrites_a_file_that_took_its_place` | 放回原位时原位被抢占 → 交换或保留，绝不覆盖 |
+| `a_writer_that_appends_after_verification_keeps_the_original_on_disk` | 复验后追加写入 → 删除前拦住，原图放回 |
+
+降级链由 `ForcePrimitive`（`#[cfg(test)]` 的 thread-local 开关）强制触发 ——
+上一版这两条台阶是**从没被执行过的代码**，本轮它们各自有了断言。
+
+Swift（`HistoryStoreCheck/main.swift` 新段 ⑧b）：用 `swapUnavailableForTesting`
+把 `renameatx_np(RENAME_SWAP)` 强制成"这台机器没有"，把正常 APFS 上永远走不到的
+降级分支真的跑起来：同格式覆盖提交成立 / 基线不符时拒绝 / `installNoClobber`
+空位装得上与被占住时拒绝 / 占位提交隔离路线成立与拒绝 / 隔离名放回时不覆盖。
+
+### 本机实跑（macOS arm64，2026-11-01）
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib` | **278 passed / 0 failed / 2 ignored** |
+| `cargo test --lib --features inproc-backends` | **277 passed / 0 failed** |
+| `cargo test --no-default-features --features inproc-backends --lib` | **277 passed / 0 failed** |
+| `npm run test:frontend` | 29 套全部 PASS（10,000 项队列基准 6.8ms / 0.45ms / 71.4ms） |
+| `bash scripts/test_swift_history.sh` | 全部通过，契约向量 32 条 |
+
+### 仍未取证（如实）
+
+- **Windows 的 `MoveFileExW` 分支只过了目标类型检查**：本机交叉编译仍卡在
+  `ring` 的 cc-rs（`'assert.h' file not found`），所以 Windows 上"不带
+  `MOVEFILE_REPLACE_EXISTING` 是否真的拒绝已存在的目标"只能由 `windows-tests`
+  作业取证。新增的 5 条 Rust 测试在该作业里会照常运行，其中
+  `installing_a_candidate_falls_back_to_an_exclusive_placeholder` 走的正是
+  `CreateFileW(CREATE_NEW)` 那一级。
+- **Windows / Linux 安装包内依旧没有视频引擎**（`resources/video/bin` 里没有
+  `.exe`，`build-windows` / `build-linux` 的 `bundle.resources` 只投递
+  `resources/bin/*`，Linux 的这半条此前未被记录）。CI 的真实编码读数靠 runner 现场
+  `choco install ffmpeg` / `apt install ffmpeg`，证明的是"代码在 Windows/Linux 上
+  编得出、跑得对"，不是"装了包的人能压视频"。补齐需要 PE / ELF 切片进仓库
+  （以及对应的 GPL 对应源码义务），不是把闸门放宽。
+- Windows / Linux 产物仍未签名（无对应签名链），正式版门禁照旧不通。
+
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
 Before any tag/Release: full three-track build, signed Direct runtime check,
