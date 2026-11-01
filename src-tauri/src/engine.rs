@@ -2647,6 +2647,8 @@ mod tool_resolution_tests {
 
     /// 反向对照：格式闸门不能把 macOS 自家的内置工具一起拒掉 ——
     /// 那会让 Direct 主线静默退化成"全不可用"，而能力矩阵的测试照样全绿。
+    /// 条件放在"这台 mac 跑得动这个切片"上：跑不动的那一半由上面那条断言负责，
+    /// 两条合起来在 arm64 与 Intel 上都不空判。
     #[cfg(target_os = "macos")]
     #[test]
     fn the_macos_bundled_image_tools_still_resolve() {
@@ -2654,11 +2656,25 @@ mod tool_resolution_tests {
             let dev = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("resources/bin")
                 .join(name);
-            if dev.is_file() {
+            if dev.is_file() && crate::binfmt::runnable_here(&dev) {
                 assert_eq!(
                     find_tool(name).as_deref(),
                     Some(dev.as_path()),
-                    "{name}: macOS 上内置工具必须仍是解析结果"
+                    "{name}: macOS 上跑得动的内置工具必须仍是解析结果"
+                );
+            }
+        }
+    }
+
+    /// 切片不匹配不能靠"报成没装"蒙过去：解析结果要么本机真跑得动，要么根本没有结果。
+    #[test]
+    fn every_resolved_image_tool_is_runnable_on_this_machine() {
+        for name in BUNDLED {
+            if let Some(resolved) = find_tool(name) {
+                assert!(
+                    crate::binfmt::runnable_here(&resolved),
+                    "{name}: 解析出的后端本机跑不了：{}",
+                    resolved.display()
                 );
             }
         }

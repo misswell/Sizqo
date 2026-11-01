@@ -4,23 +4,40 @@ pub fn tool(name: &str) -> Result<PathBuf,String> {
     // Windows 上带扩展名的才是那个文件：只查 "ffmpeg" 会永远找不到，
     // 于是把装好的内置后端报成"不可用"（图片线的 find_tool 早就处理了这件事）。
     let file_name = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+    // 「随包了但本机跑不动」和「根本没随包」是两条不同的结论，必须分开说：
+    // 前者要的是重新投递对应切片，后者要的是补打包步骤。合成一句会把排查带偏。
+    let mut present_but_unrunnable = false;
     let exe = std::env::current_exe().map_err(|e|e.to_string())?;
     if let Some(macos) = exe.parent() {
         let bundled = macos.join("../Resources/video/bin").join(&file_name);
         // 内置候选必须先是"这台机器跑得动"的格式：仓库里躺着的是 macOS 产物，
         // 在别的平台上把它交出去，能力矩阵就已经在说谎，编码时才炸 Exec format error。
-        if bundled.is_file() && crate::binfmt::runnable_here(&bundled) { return Ok(bundled); }
+        if bundled.is_file() {
+            if crate::binfmt::runnable_here(&bundled) { return Ok(bundled); }
+            present_but_unrunnable = true;
+        }
         // Bundled applications must never silently depend on the host's PATH.
         if macos.file_name().and_then(|s|s.to_str()) == Some("MacOS") {
-            return Err(format!("Sizqo bundle has no runnable video/bin/{name}"));
+            return Err(if present_but_unrunnable {
+                format!("Sizqo bundle's video/bin/{name} cannot run on this machine (platform or CPU slice mismatch)")
+            } else {
+                format!("Sizqo bundle has no runnable video/bin/{name}")
+            });
         }
     }
     let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/video/bin").join(&file_name);
-    if dev.is_file() && crate::binfmt::runnable_here(&dev) { return Ok(dev); }
+    if dev.is_file() {
+        if crate::binfmt::runnable_here(&dev) { return Ok(dev); }
+        present_but_unrunnable = true;
+    }
     let paths = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&paths).map(|p|p.join(&file_name))
         .find(|p|p.is_file() && crate::binfmt::runnable_here(p))
-        .ok_or_else(||format!("{name} unavailable; build the bundled video runtime"))
+        .ok_or_else(||if present_but_unrunnable {
+            format!("{name} unavailable: the bundled engine does not match this platform or CPU; ship the matching slice")
+        } else {
+            format!("{name} unavailable; build the bundled video runtime")
+        })
 }
 pub fn command(name: &str) -> Result<Command,String> {
     let path=tool(name)?;
@@ -81,12 +98,31 @@ mod tests {
     /// 上面那条在 macOS 上是空跑的（内置产物本来就跑得动），所以正向结论必须有
     /// 这条独立的门背书：格式闸门不能把自家内置 ffmpeg 一起拒掉 ——
     /// 那会让视频线在 Direct 主平台上静默变成"引擎不可用"，而单元测试照样全绿。
+    /// 只问"这台机器跑得动的内置产物有没有被端出去"；跑不动的那一半由上面那条管，
+    /// 两条合起来在任何平台都不空判。
     #[cfg(target_vendor = "apple")]
     #[test]
     fn the_macos_bundled_engine_is_still_the_resolution() {
         let dev=Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/video/bin/ffmpeg");
-        if dev.is_file() {
-            assert_eq!(tool("ffmpeg").ok().as_deref(),Some(dev.as_path()),"macOS 上内置 ffmpeg 必须仍是解析结果");
+        if dev.is_file() && crate::binfmt::runnable_here(&dev) {
+            assert_eq!(tool("ffmpeg").ok().as_deref(),Some(dev.as_path()),"macOS 上跑得动的内置 ffmpeg 必须仍是解析结果");
+        }
+    }
+
+    /// 「随包了但本机跑不动」要说清是切片/平台不匹配，而不是含糊的"build the bundled
+    /// runtime"：Intel mac 拿到 arm64 单切片时，前一句指向上游投递问题，后一句会把人
+    /// 带去重跑打包 —— 两条结论的排查方向完全不同。
+    #[test]
+    fn an_incompatible_bundled_engine_names_the_half_that_failed() {
+        let dev=Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/video/bin")
+            .join(if cfg!(windows) {"ffmpeg.exe"} else {"ffmpeg"});
+        if !dev.is_file() { return } // 没随包（打包前的工作区）时这条对照不适用
+        match tool("ffmpeg") {
+            Ok(resolved)=>assert!(crate::binfmt::runnable_here(&resolved),"解析结果本机跑不了：{}",resolved.display()),
+            Err(reason)=>{
+                assert!(!crate::binfmt::runnable_here(&dev),"内置候选跑得动却报错：{reason}");
+                assert!(reason.contains("does not match"),"跑不动的内置产物必须说明是平台/切片不匹配: {reason}");
+            }
         }
     }
 }

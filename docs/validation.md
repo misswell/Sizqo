@@ -1826,6 +1826,66 @@ App Store 组合编译失败 —— 三条特性组合实测 EXIT=0。
 可用再在 `spawn` 处炸 —— 这一条的缺口在打包投递与对应平台的编码器取证，不在源码里
 把错误改成静默。
 
+### 同一类问题的另一半：平台对上，架构还没对上（Mach-O 切片门）
+
+格式门转绿之后回头审它自己，发现 `runnable_here` 只回答"这是不是 mac 的产物"，
+没有回答"这台 mac 接不接得住"。`lipo -info` 逐个实测（本轮取证）：
+
+```
+video/bin/ffmpeg   arm64      video/bin/ffprobe  arm64
+bin/cwebp          arm64      bin/pngquant       arm64
+bin/oxipng         arm64      bin/cjxl           arm64
+video/lib/*.dylib  全部 arm64（libavcodec.63 / libavformat.63 / libSvtAv1Enc.4 / …）
+```
+
+而 `release.yml` 的 mac 线同时构建 `aarch64-apple-darwin`、`x86_64-apple-darwin`
+与二者的 universal 合并包（`build-macos` 矩阵 + `build-macos-universal`）。也就是说：
+**Intel 切片里那套随包引擎是 arm64 单架构，`posix_spawn` 只会得到 `EBADARCH`
+「Bad CPU type in executable」** —— Rosetta 只反着帮（Intel 机器跑不了 arm64），
+所以这不是"可能有问题"，是与上一轮 `Exec format error` 同一条链的下一环，而且这次
+红的是自家发布产物。发布说明里那句"macOS Intel：已签名公证，但尚无人在 Intel 真机上
+完成验收"因此不只是缺验收，而是那条轨道上根本没有可用引擎。
+
+处置（`src/binfmt.rs`）：
+
+| 点 | 内容 |
+| --- | --- |
+| 切片判定 | thin Mach-O 读 `magic + cputype`（`0x01000007` = x86_64、`0x0100000C` = arm64），字节序由魔数决定（`CFFAEDFE`/`FEEDFACE` 小端，`FEEDFACF`/`CEFAEDFE` 大端）；fat（`CAFEBABE`/`BEBAFECA`）逐条扫描 `fat_arch.cputype`，最多 16 条 |
+| 判定失败的方向 | 结构读不出、本机架构不认识、切片里没有本机架构 → 一律"不是后端"。半截头（只有 4 字节魔数）也归此类：证明不了就不 exec |
+| universal | 同时列出两个切片 → 两种 mac 都放行，否则闸门会把自家产物一起拒掉（这条有独立断言） |
+| 刻意保守的一条 | 只有 x86_64 切片的引擎在 Apple Silicon 上返回不可用，尽管装了 Rosetta 2 能跑。不假设 Rosetta 存在，因为这条门要拦的正是"以为能跑"；真要支持，靠打包投 universal 引擎，不靠猜 |
+| 结论要能区分 | `video::process::tool()` 现在分两句报错：`… cannot run on this machine (platform or CPU slice mismatch)` / `… unavailable: the bundled engine does not match this platform or CPU; ship the matching slice` 对比 `build the bundled video runtime`。"跑不动"与"没随包"的排查方向完全不同，含糊成一句会把人带去重跑打包 |
+
+新增 3 条测试（`binfmt` 架构门 1 条 + 图片线"解析结果必须本机跑得动"1 条 + 视频线
+"报错要说清是哪半条门失败"1 条），并把两条 macOS 正向对照的条件从"文件存在"改成
+"文件存在**且本机跑得动**"，其反面由既有的拒绝断言负责 —— 两条合起来在 arm64、
+Intel、Linux、Windows 上都不空判。`cargo test --lib` 271 passed / 0 failed（三种特性
+组合 271 / 270 / 270，`real --ignored` 2 passed，崩溃注入 6 阶段全过）。
+
+两条控制（都用 `/tmp` 里的逐字节副本还原并核对 md5 `eb907fe7…`）：
+
+| 亲手拆的门 | 期望的失败 | 实测 |
+| --- | --- | --- |
+| `runnable_here` 里去掉 `&& macho_has_host_slice(path)` | 架构门必须响 | `a_macho_slice_the_host_cpu_cannot_run_is_never_a_backend ... FAILED`，2 passed / 1 failed |
+| `macho_has_host_slice` 一律返回 `false` | 正向对照必须响 | `a_native_format_is_runnable_only_on_its_own_platform ... FAILED` 与同一条架构测试一起 FAILED（universal 不许被误杀那句），1 passed / 2 failed |
+
+本轮另有一条自己的操作失误要记下：做控制 A 的还原时用了 `git checkout -- src/binfmt.rs`，
+而该文件里还压着**本轮未提交的新代码**，一条命令把它打回上一版的 96 行。重写之后
+先把干净版本复制成 `/tmp/binfmt_pristine.rs`，两条控制都改用副本还原并核对 md5。
+**在带未提交工作的文件上做注入实验，还原手段必须是副本，不能是 `git checkout`。**
+
+### 标签：`v0.3.6-rc.5` 已发布，架构门走 `v0.3.6-rc.6`
+
+- `v0.3.6-rc.5` 指向 `56589af`（tests.yml run 41266916166 六作业全绿的那棵树的文档提交），
+  已推送：`https://github.com/misswell/Sizqo/releases/tag/v0.3.6-rc.5`。它**不含**上面的
+  架构门，因此 Intel 轨道仍然是"随包 arm64 引擎 + 平台门放行"，编码时才炸 `EBADARCH`。
+  `rc.1…4` 一律不动，已发布的 `rc.5` 标签也不改写（owner 明确要求不强制覆盖已分发标签）。
+- 这条标签说明正文里有一句笔误：写成了"FFmpeg 9 已删新…"，本意是"FFmpeg 9 已删 `-vsync`"。
+  标签已分发，改它等于 force-push 覆盖已发布标签，因此**不改写**，正确结论以本节与代码
+  注释为准。
+- 架构门作为新一轮工作打 `v0.3.6-rc.6`（版本号先经 `chore(release)` 提交落到三处配置），
+  数字不与任何已分发标签重叠。
+
 ### 仍未取证的部分（如实）
 
 - 本机交叉编译依旧不可行（`ring` 的 cc-rs 报 `'assert.h' file not found`），所以
@@ -1844,6 +1904,10 @@ App Store 组合编译失败 —— 三条特性组合实测 EXIT=0。
     类型错误确认会报错，再撤掉错误取 EXIT=0。**一个不知道自己是否在跑的探针，
     和没有探针等价。**
 - Windows / Linux 产物仍未签名（无对应签名链），正式版的门禁照旧不通。
+- **Intel mac 的随包引擎缺口仍未由打包补齐**：架构门现在会正确拒绝 arm64 单切片，
+  于是那条轨道的图片工具退到系统 PATH、视频轨直接报告不可用。要让 Intel 真有引擎，
+  缺的是投递 universal / x86_64 切片的 FFmpeg 与 7 个图片工具（以及对应的 GPL 对应
+  源码义务），不是把闸门放宽回"平台对上就 exec"。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
