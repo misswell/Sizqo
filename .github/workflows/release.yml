@@ -124,6 +124,29 @@ jobs:
           chmod 755 "$APP/Contents/Resources/video/bin/"*
           echo "video/bin:"; ls -1 "$APP/Contents/Resources/video/bin"
 
+      - name: Refuse an engine bundle without the target slice
+        # src/binfmt.rs 那道运行时的门只会把错切片报成「引擎不可用」：用户看到的是视频/
+        # 图片功能凭空缺失，日志里一个错都没有。所以刚拷完就在包内按 lipo 实测每个要 exec
+        # 的 Mach-O，目标架构缺一片就让这个 job 红 —— 这是错切片唯一能被看见的地方。
+        # 采集时的校验（collect_macos_tools.sh 按 uname -m）护的是源目录，护不到
+        # 「有人跳过采集、换镜像、加缓存、手改资源路径」之后的包。
+        run: |
+          set -euo pipefail
+          APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Sizqo.app"
+          # 图片工具那一段的落点由 Tauri 决定，不是这一步写的，所以两种已知布局都试；
+          # 都没命中就把 Resources 列出来再红 —— 一次运行要说清"缺的是切片还是我的路径猜错"。
+          TOOLS=""
+          for cand in "$APP/Contents/Resources/resources/bin" "$APP/Contents/Resources/bin"; do
+            [ -d "$cand" ] && { TOOLS="$cand"; break; }
+          done
+          [ -n "$TOOLS" ] || {
+            echo "✗ 找不到内置图片工具目录，实际布局是：" >&2
+            ls -R "$APP/Contents/Resources" | head -60 >&2
+            exit 1
+          }
+          bash scripts/verify_bundle_arch.sh "$APP/Contents/Resources/video/bin" "${{ matrix.arch }}"
+          bash scripts/verify_bundle_arch.sh "$TOOLS" "${{ matrix.arch }}"
+
       - name: Package app for signing
         run: |
           APP="src-tauri/target/${{ matrix.target }}/release/bundle/macos/Sizqo.app"

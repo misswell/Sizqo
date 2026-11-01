@@ -2028,6 +2028,47 @@ Release run **41271481909**（标签 `v0.3.6-rc.6`）8 作业全 success：
 | 更新包签名 | `Sizqo_v0.3.6-rc.6_macos_universal.app.tar.gz` + `.sig` 均在位（`TAURI_SIGNING_PRIVATE_KEY` 已配置，缺失时该作业按设计中止发版） |
 | 资产总数 | 9 个 |
 
+### 同一条门搬到投递侧：包里错切片现在会让发布作业红
+
+运行时那道门（`binfmt.rs`）只会把错切片报成「引擎不可用」—— 用户看到的是图片/视频
+功能凭空缺失，日志里一个错都没有。采集侧的校验（`collect_macos_tools.sh` 按 `uname -m`）
+护的是**源目录**，护不到"跳过采集、换 runner 镜像、加缓存、手改资源路径"之后的包。
+所以补上第三个时点：**装进 .app 之后**，按这个 job 的目标架构在包内实测。
+
+- 新增 `scripts/verify_bundle_arch.sh <目录> <arm64|x86_64>`：对目录里每个 Mach-O
+  跑 `lipo -archs`，缺目标切片就 `exit 1`；非 Mach-O 跳过；一个 Mach-O 都没数到也
+  `exit 1`（空目录和通过长得一模一样，这是最危险的假绿）。
+- `release.yml` 的 `build-macos` 矩阵在 `Bundle the video engine` 之后接一步
+  `Refuse an engine bundle without the target slice`，检查
+  `Contents/Resources/video/bin`（这一步的路径是本步自己写的，确定）与
+  图片工具目录 —— 后者的落点由 Tauri 决定，所以 `resources/bin` 与 `bin` 两种已知布局
+  都试，都没命中就先把 `Contents/Resources` 列出来再红：一次运行要能说清
+  "缺的是切片，还是我的路径猜错"。
+  **不**加到 `build-macos-universal`：合并包里合法地存在单架构 dylib
+  （本轮日志就有 `Keeping arm64-only resource: Contents/Resources/video/lib/libcrypto.4.dylib`
+  与 `Keeping x86_64-only resource: …/libssl.3.dylib`），那条 job 的判据是
+  `merge_macos_universal.sh` 自己的配对与 `verify_macho_architectures`，不是这一条。
+- 本轮只验到 YAML 可解析、脚本 `bash -n` 干净、循环在 `set -euo pipefail` 下不会被
+  未命中的候选目录提前退出（实测过），以及 `build-macos` 步骤顺序正确。
+  **这一步的真实执行要等下一个标签的 release run**，在那之前它属于"已接线、未跑过"，
+  不算通过。
+
+本机实测（提交树，五种读数，含两条对照）：
+
+```
+bash scripts/verify_bundle_arch.sh src-tauri/resources/bin arm64        → ok ×7，EXIT=0
+bash scripts/verify_bundle_arch.sh src-tauri/resources/video/bin arm64  → ok ffmpeg/ffprobe，EXIT=0
+bash scripts/verify_bundle_arch.sh src-tauri/resources/video/bin x86_64 → ✗ ffmpeg 的切片 [arm64] 里没有目标架构 x86_64，EXIT=1
+bash scripts/verify_bundle_arch.sh <空目录> arm64                        → ✗ 没有任何 Mach-O，EXIT=1
+bash scripts/verify_bundle_arch.sh src-tauri/resources/bin ppc64         → ✗ 目标架构只能是 arm64 / x86_64，EXIT=2
+```
+
+顺带把上一轮"待实测"那条结清：提交树里的引擎实测 `lipo -archs ffmpeg` = `arm64`，
+图片工具 7 个同样只有 arm64 —— 也就是本轮文档里那句"仓库提交的产物是 arm64 单切片"
+是量出来的，不是从 `file` 输出推的。**已分发 universal 包**内的双切片仍未直接实测
+（190 MB 资产下载不动）；这一步上了 CI 之后，Intel 那条 job 会自己打出
+`ok ffmpeg → x86_64` 这样的读数，届时按日志取证。
+
 ### 标签：`v0.3.6-rc.5` 与 `v0.3.6-rc.6` 都已发布，都不算正式版
 
 - `v0.3.6-rc.5` 指向 `56589af`：`https://github.com/misswell/Sizqo/releases/tag/v0.3.6-rc.5`。
