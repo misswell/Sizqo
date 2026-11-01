@@ -1978,7 +1978,7 @@ Linux AppImage/deb）。
 | macOS 本机（homebrew） | 已删 `-vsync` → 只有 `-fps_mode` | 探测选 `-fps_mode`，argv 里无裸 `fps_mode` | 本机 `cargo test --lib real -- --ignored` |
 | Intel runner（apt/brew `ffmpeg 9.0.1`） | 同上 | 已部署的 universal 包（`lipo -archs` 两切片齐全）用的正是这支，`-vsync` 在其中不存在 | run 41268093305 的 `build-macos (x86_64)` 日志 `Pouring ffmpeg--9.0.1.sonoma.bottle.tar.gz` |
 | Ubuntu 22.04（apt `7:4.4.2-0ubuntu0.22.04.1`） | 只有 `-vsync` | 探测回退到 `-vsync passthrough` 并真编码通过 | run 41269122796：`Setting up ffmpeg (7:4.4.2-0ubuntu0.22.04.1)` + `real media matrix` **2 passed / 0 failed** |
-| Windows | **无任何真实编码取证**（Direct 轨缺 PE 引擎） | 仍未取证 | — |
+| Windows | **无任何真实编码取证**（Direct 轨缺 PE 引擎） | 写作当时的读数 | 下一轮由 run 41274801316 兑现，见「Windows 第一次真的编码」 |
 
 这里要撤回我自己上一轮写的一句话。我写过"`file` 校验与 `libx264` 断言在同一 step、
 同一份日志里"，并把 `ffmpeg -hide_banner -encoders | grep -q libx264` 当作某个
@@ -1987,6 +1987,7 @@ Linux AppImage/deb）。
 **`real media matrix` 那一步**，而且 `windows-tests` 作业根本没有这一步（它只有
 `cargo check --lib` / `cargo test --lib` / 契约向量三步）。把命令文本当成日志读数，
 和把日志文本当成断言结果，是同一种错。**Windows 那一格仍然是空的。**
+（这句是当时的事实；下一轮把它补成了读数，见 run 41274801316 那一节。）
 
 ### CI 回证（run 41270303470 = `6217d6f`，PATH 门那一轮）：六个作业全绿
 
@@ -2004,6 +2005,9 @@ Linux AppImage/deb）。
 Windows 那一格仍然**没有**真实编码读数：`windows-tests` 只有 `cargo check --lib`、
 `cargo test --lib`、契约向量三步，没有 `--ignored` 真实矩阵，也没有 PE 引擎。
 所以本轮补的是"解析门不再骗人"，不是"Windows 视频轨可用"——后者连引擎都还没有。
+（此为该 run 的读数。下一轮 `windows-tests` 补了第 6 步真实矩阵，run 41274801316 拿到
+`2 passed / 0 failed / 0 ignored`，见「Windows 第一次真的编码」一节；"包里仍无 PE 引擎"
+那半条依然成立。）
 
 ### CI 与发布回证（run 41271479123 / 41271481909 = `v0.3.6-rc.6`）
 
@@ -2067,7 +2071,9 @@ bash scripts/verify_bundle_arch.sh src-tauri/resources/bin ppc64         → ✗
 图片工具 7 个同样只有 arm64 —— 也就是本轮文档里那句"仓库提交的产物是 arm64 单切片"
 是量出来的，不是从 `file` 输出推的。**已分发 universal 包**内的双切片仍未直接实测
 （190 MB 资产下载不动）；这一步上了 CI 之后，Intel 那条 job 会自己打出
-`ok ffmpeg → x86_64` 这样的读数，届时按日志取证。
+`ok ffmpeg → x86_64` 这样的读数，届时按日志取证。**（已兑现：run 41274483578 两条腿
+分别打出 `→ x86_64` / `→ arm64`，见「投递侧架构门第一次真的跑」那一节。universal 包
+自身仍记为待实测。）**
 
 ### 标签：`v0.3.6-rc.5` 与 `v0.3.6-rc.6` 都已发布，都不算正式版
 
@@ -2125,6 +2131,69 @@ C 的负向对照是关键：如果只写新行、不拿旧守卫跑同一棵树
   因此**不改写**（与 `rc.5` 那句 `-vsync` 笔误同一处置），正确结论以本节与代码为准。
 - `rc.1…6` 一律不动、不改写。
 
+### Windows 第一次真的编码：`windows-tests` 补上 `--ignored` 真实矩阵（run 41274801316）
+
+审查里那句 P0-3 批评的是"编译检查通过就当运行时成立"，而 Windows 这一格当时正好就是这么读的：
+只有 `cargo check --lib` / `cargo test --lib` / 契约向量三步，**没有任何一步真编过一段视频**。
+Linux 上一轮已经按同一处置补过（装系统 ELF 引擎，而不是把测试挪走），Windows 照做：
+
+```
+$engine → C:\ProgramData\chocolatey\bin\ffmpeg.exe   (choco ffmpeg v9.0.2，runner 上原本没有)
+libx264 / libx265 预检通过
+cargo test --lib real -- --ignored
+  → test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 265 filtered out; finished in 2.48s
+  → video::ffmpeg_backend::tests::metadata_policies_hold_on_real_encoded_fixtures ... ok
+  → video::ffmpeg_backend::tests::s11_real_media_matrix ... ok
+```
+
+`0 ignored / 265 filtered out` 是这条读数里最要紧的两个数：它说明两条 `#[ignore]` 用例
+**真的被执行了**，而不是"匹配到 0 条测试然后绿"。同 run 的默认那步里这两个名字是
+`... ignored`，只有 `--ignored` 这步把它们跑成 `ok`。
+
+这条证到什么、没证到什么，分开说：
+
+- **证到**：探测 → `EncodePlan` argv → 真编码 → §56 全量校验这条链在 Windows 上成立，
+  且引擎是经 PATH 解析、由 `binfmt` 门放行后交给 `Command` 的（`tool()` 里
+  `ffmpeg.exe` 那条 Windows 分支从此有真实命中，不再只是代码路径）。
+  夹具的双音轨/字幕/章节、VFR passthrough 都是真文件真产物，不是合成 probe 值。
+- **没证到**：**已分发的 Windows 包里没有引擎**。仓库里 `resources/video/bin` 没有任何
+  `.exe`，这次能跑全靠 runner 现场装的 PE 引擎。所以 Windows 用户机上视频轨仍是
+  如实的"不可用"，直到补进 PE 切片；产物也仍未签名。这两条留在下面的缺口里。
+- 一条推论（**不是日志读数**）：runner 装的是 FFmpeg 9.0.2，即 `-vsync` 已删的那一支，
+  而用例断言 `caps.frame_timing_flag` 非空并通过 —— 说明探测在这台引擎上选了 `-fps_mode`。
+  日志没有直接打出选中的开关名，故记为推论。
+
+方法上补一句：这段 PowerShell 本机没有 `pwsh`，除了 YAML 可解析之外**无法预验**，
+第一次执行就是 CI。它绿了，但"没预验"这件事本身应当记档，而不是事后当成一直有把握。
+
+### CI 回证（run 41274483578 = `v0.3.6-rc.7`）：投递侧架构门第一次真的跑，两条 mac 腿都量到
+
+上一轮那句"这一步的真实执行要等下一个标签的 release run，在那之前属于已接线、未跑过"
+由这个 run 兑现。逐条读数取自两条 job 的日志（`gh api .../actions/jobs/<id>/logs`），
+不是脚本契约推论：
+
+| job | 包内实测 |
+| --- | --- |
+| `build-macos (x86_64, macos-15-intel)` | `ok ffmpeg → x86_64`、`ok ffprobe → x86_64`，`…/video/bin 里 2 个 Mach-O 都含 x86_64`；`cjpeg/oxipng/avifenc/gifsicle/pngquant/cwebp/cjxl` 全 `→ x86_64`，`…/resources/bin 里 7 个 Mach-O 都含 x86_64` |
+| `build-macos (arm64, macos-latest)` | 同一批：`video/bin` 2 个 + `resources/bin` 7 个，全部 `→ arm64` |
+
+这一条结掉了记了好几轮的"待实测"：
+
+- **Intel 包里的引擎有 x86_64 切片，现在是包内量出来的。** 以前的依据是
+  `collect_macos_tools.sh` 按 `uname -m` 重采 + `merge_macos_universal.sh` 配对合并
+  这套**脚本契约**，再加一句"所以包应该是好的"；直接下 universal 资产做 `lipo -archs`
+  那条路 190 MB 卡在 KB/分钟级，两次都没取到读数。现在这一步在打包之后、签名之前，
+  对**真包内的真文件**跑 `lipo -archs`。
+- 通过不是白通过：同一台机器上，把目标架构写成 `x86_64` 去问仓库里那份 arm64 单切片
+  的产物会 `✗ ffmpeg 的切片 [arm64] 里没有目标架构 x86_64` 并 `EXIT=1`（本轮上一节的
+  本机对照）。一条只会说"通过"的门没有价值，能红的那一半才是它的信用。
+- 计数也被证实不是空转：2 + 7 = 9 个 Mach-O 被点名，与"一个 Mach-O 都没数到就 `exit 1`"
+  那条假绿防线是同一处代码。
+- **仍未直接实测的那一半**：`build-macos-universal` 按设计不受这一步管（合并包里合法地
+  存在单架构 dylib，上一节记过理由），所以已分发的 **universal zip 本身**还是没有
+  包内 `lipo -archs` 读数 —— 它现在有了两条更强的间接依据（两腿的输入都被逐个量过），
+  但间接依据不改成"已实测"。
+
 
 ### 仍未取证的部分（如实）
 
@@ -2144,6 +2213,12 @@ C 的负向对照是关键：如果只写新行、不拿旧守卫跑同一棵树
     类型错误确认会报错，再撤掉错误取 EXIT=0。**一个不知道自己是否在跑的探针，
     和没有探针等价。**
 - Windows / Linux 产物仍未签名（无对应签名链），正式版的门禁照旧不通。
+- **Windows 包内依旧没有 PE 引擎**：run 41274801316 那次真实编码靠的是 runner 现场
+  `choco install ffmpeg`（v9.0.2，解析到 `C:\ProgramData\chocolatey\bin\ffmpeg.exe`），
+  而 `src-tauri/resources/video/bin` 里没有任何 `.exe`。所以这条读数证明的是
+  **"这套代码在 Windows 上编得出、跑得对"**，不是**"装了我们包的人能压视频"** ——
+  后者缺的是把 PE 切片打进 Direct 轨的 Windows 打包步骤（以及它的 GPL 对应源码义务），
+  不是把测试挪到别处。
 - **仓库里提交的 macOS 产物仍只有 arm64 单切片**（7 个图片工具 + `video/bin/ffmpeg`、
   `ffprobe` + 全部 dylib）。CI 的 mac 矩阵不受影响：`collect_macos_tools.sh` 在每台
   runner 上现场重采并按 `uname -m` 硬门校验，universal 再由 `lipo -create` 成对合并 ——
