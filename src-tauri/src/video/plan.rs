@@ -6,6 +6,9 @@ use std::path::Path;
 pub struct EncodePlan {pub encoder:String,pub container:String,pub bitrate_kbps:Option<u64>,pub crf:Option<f64>,pub width:u32,pub height:u32,pub passes:u32,pub threads:usize,pub warnings:Vec<String>,
     /// §55 已解析的策略；序列化给前端时仍看 `options.metadataPolicy`，这里不额外暴露一份。
     #[serde(skip)] pub metadata_policy:MetadataPolicy,
+    /// 「保留源时间戳」用哪个开关名表达，由能力探测给出（FFmpeg 5.0 前后不通用）。
+    /// 同样不进前端契约：前端要说的是时间轴怎么处理的，那已经在 `warnings` 里。
+    #[serde(skip)] pub frame_timing_flag:String,
     pub options:VideoOptions}
 fn member(value:&str,allowed:&[&str],what:&str)->Result<(),String>{if allowed.contains(&value){Ok(())}else{Err(format!("Invalid {what}: {value}"))}}
 pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budget:usize)->Result<EncodePlan,String>{
@@ -38,6 +41,13 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
     // §5.3 帧时间轴的默认行为：保留源 PTS（passthrough）。`r_frame_rate != avg_frame_rate`
     // 不能严格判定 VFR，更不是把时间轴重排成平均帧率的理由；只有用户明确指定
     // 帧率时才执行 CFR 转换。
+    // 「保留源 PTS」必须有一个**这台引擎认得**的名字才谈得上兑现：`-fps_mode` 与
+    // `-vsync` 是同一个开关的新旧两名且互不兼容（4.4 没有 `-fps_mode`，FFmpeg 9 已删
+    // `-vsync`）。两种都不认时直接拒绝 —— 退回 ffmpeg 默认的 `auto` 会丢帧/重复帧，
+    // 那是拿另一件事冒充"保留时间戳"（规则 11）。
+    if options.frame_rate.is_none() && caps.frame_timing_flag.is_empty(){
+        return Err("This FFmpeg honors neither -fps_mode nor -vsync; preserving source timestamps cannot be guaranteed".into());
+    }
     if probe.variable_frame_rate && options.frame_rate.is_none(){
         warnings.push("Variable-frame-rate source: original timestamps are preserved (passthrough)".into());
     }
@@ -96,7 +106,7 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
         let source=video.bit_rate.or(probe.bit_rate).unwrap_or(estimated*1000)/1000;
         let b=options.bitrate_kbps.unwrap_or(estimated.min(source*3/4).max(200));if !(32..=500000).contains(&b){return Err("Video bitrate range is 32…500000 kbps".into());}Some(b)
     }else{None};
-    Ok(EncodePlan {encoder,container:options.container.clone(),bitrate_kbps,crf,width,height,passes:if ["twoPass","targetSize"].contains(&options.mode.as_str()){2}else{1},threads:if options.threads==0{budget.max(1)}else{options.threads.max(1).min(budget.max(1))},warnings,metadata_policy,options:options.clone()})
+    Ok(EncodePlan {encoder,container:options.container.clone(),bitrate_kbps,crf,width,height,passes:if ["twoPass","targetSize"].contains(&options.mode.as_str()){2}else{1},threads:if options.threads==0{budget.max(1)}else{options.threads.max(1).min(budget.max(1))},warnings,metadata_policy,frame_timing_flag:caps.frame_timing_flag.clone(),options:options.clone()})
 }
 impl EncodePlan {
     pub fn argv(&self,input:&Path,output:&Path,pass:u32,passlog:&Path)->Vec<String>{
@@ -108,7 +118,7 @@ impl EncodePlan {
         if self.encoder.ends_with("videotoolbox"){add("-allow_sw","0".into());}else if self.encoder=="libsvtav1"{let speed=match self.options.preset.as_str(){"ultrafast"=>12,"veryfast"=>10,"slow"=>4,_=>8};add("-preset",speed.to_string());add("-svtav1-params",format!("lp={}",self.threads));}else if self.encoder=="libvpx-vp9"{let cpu_used=match self.options.preset.as_str(){"ultrafast"=>"5","veryfast"=>"4","slow"=>"1",_=>"2"};add("-deadline","good".into());add("-cpu-used",cpu_used.into());add("-row-mt","1".into());}else{add("-preset",self.options.preset.clone());if self.encoder=="libx265"{add("-x265-params",format!("pools={}:frame-threads=1",self.threads));}}
         if let Some(c)=self.crf{add("-crf",c.to_string());if self.encoder=="libvpx-vp9"{add("-b:v","0".into());}}if let Some(b)=self.bitrate_kbps{add("-b:v",format!("{b}k"));}
         // §5.3 未指定帧率 = 保留源 PTS（passthrough）；只有用户明确指定才 CFR。
-        if let Some(f)=self.options.frame_rate{add("-r",f.to_string());}else{add("-fps_mode","passthrough".into());}
+        if let Some(f)=self.options.frame_rate{add("-r",f.to_string());}else{add(&self.frame_timing_flag,"passthrough".into());}
         if self.passes==2{add("-pass",pass.to_string());add("-passlogfile",passlog.to_string_lossy().into());}
         if self.encoder.contains("hevc")||self.encoder=="libx265"{if self.container=="mp4"||self.container=="mov"{add("-tag:v","hvc1".into());}}
         if self.passes==2&&pass==1{a.extend(["-an".into(),"-sn".into(),"-f".into(),"null".into(),"-progress".into(),"pipe:1".into(),"-nostats".into(),"-".into()]);return a;}
@@ -138,7 +148,7 @@ impl EncodePlan {
 }
 #[cfg(test)]mod tests {
     use super::*; use crate::video::capabilities::EncoderCapability;
-    pub fn caps()->CapabilityMatrix{CapabilityMatrix {backend:"ffmpeg".into(),available:true,reason:None,encoders:["libx264","libx265","libsvtav1","libvpx-vp9","hevc_videotoolbox"].iter().map(|id|EncoderCapability{id:id.to_string(),label:id.to_string(),modes:if id.ends_with("videotoolbox"){vec!["abr".into()]}else if *id=="libx264"||*id=="libvpx-vp9"{vec!["crf".into(),"abr".into(),"twoPass".into(),"targetSize".into()]}else{vec!["crf".into(),"abr".into()]},presets:vec![]}).collect(),muxers:vec!["mp4".into(),"mkv".into(),"webm".into(),"ts".into()],audio_encoders:vec!["aac".into(),"libopus".into(),"libmp3lame".into(),"flac".into()],diagnostics:vec![]}}
+    pub fn caps()->CapabilityMatrix{CapabilityMatrix {backend:"ffmpeg".into(),available:true,reason:None,encoders:["libx264","libx265","libsvtav1","libvpx-vp9","hevc_videotoolbox"].iter().map(|id|EncoderCapability{id:id.to_string(),label:id.to_string(),modes:if id.ends_with("videotoolbox"){vec!["abr".into()]}else if *id=="libx264"||*id=="libvpx-vp9"{vec!["crf".into(),"abr".into(),"twoPass".into(),"targetSize".into()]}else{vec!["crf".into(),"abr".into()]},presets:vec![]}).collect(),muxers:vec!["mp4".into(),"mkv".into(),"webm".into(),"ts".into()],audio_encoders:vec!["aac".into(),"libopus".into(),"libmp3lame".into(),"flac".into()],diagnostics:vec![],frame_timing_flag:"-fps_mode".into()}}
     pub fn probe()->VideoProbe{VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":720,"height":1280,"codec_name":"h264","pix_fmt":"yuv420p","avg_frame_rate":"30/1"}],"format":{"duration":"10","format_name":"mp4"}}),1234).unwrap()}
     pub fn vfr_probe()->VideoProbe{VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":3840,"height":2160,"codec_name":"hevc","pix_fmt":"yuv420p","avg_frame_rate":"130500/9191","r_frame_rate":"89/6"}],"format":{"duration":"30.636667","format_name":"mov"}}),1234).unwrap()}
     #[test]fn combinations_are_checked(){let mut o=VideoOptions::default();o.encoder="libx264".into();o.container="webm".into();assert!(build(&o,&probe(),&caps(),3).is_err());o.container="mp4".into();o.encoder="hevc_videotoolbox".into();o.mode="crf".into();assert!(build(&o,&probe(),&caps(),3).is_err());}
@@ -163,6 +173,30 @@ impl EncodePlan {
         let explicit=build(&o,&vfr_probe(),&caps(),3).unwrap();
         let a=explicit.argv(Path::new("in.mov"),Path::new("out.mp4"),1,Path::new("stats"));
         assert!(a.windows(2).any(|w|w==["-r","24"]));assert!(!a.contains(&"passthrough".into()));
+    }
+
+    /// §5.3 开关名由引擎探测给出，不是写死在某一台机器上：发行版 4.4 只认 `-vsync`，
+    /// FFmpeg 9 已删 `-vsync` 只认 `-fps_mode`。argv 必须用被认得的那一名。
+    #[test]fn the_frame_timing_spelling_comes_from_the_engine_probe(){
+        let mut old=caps();old.frame_timing_flag="-vsync".into();
+        let mut o=VideoOptions::default();o.encoder="libx265".into();
+        let a=build(&o,&vfr_probe(),&old,3).unwrap().argv(Path::new("in.mov"),Path::new("out.mp4"),1,Path::new("stats"));
+        assert!(a.windows(2).any(|w|w==["-vsync","passthrough"]),"老引擎只能用 -vsync");
+        assert!(!a.iter().any(|x|x.as_str()=="-fps_mode"),"探测到 -vsync 还塞 -fps_mode 会被老引擎整条拒掉");
+    }
+
+    /// 两名都不认时「保留源时间戳」无法兑现：编码前拒绝，不退回 ffmpeg 默认的
+    /// `auto`（会丢帧/重复帧，等于拿另一件事冒充保留时间戳）。明确指定帧率走 `-r`，
+    /// 不依赖这个开关，因此那条路照常放行。
+    #[test]fn an_engine_without_either_spelling_refuses_before_encoding(){
+        let mut none=caps();none.frame_timing_flag=String::new();
+        let mut o=VideoOptions::default();o.encoder="libx265".into();
+        let error=build(&o,&vfr_probe(),&none,3).unwrap_err();
+        assert!(error.contains("timestamps"),"拒绝理由必须说清是时间轴问题: {error}");
+        o.frame_rate=Some(24.0);
+        let a=build(&o,&vfr_probe(),&none,3).unwrap().argv(Path::new("in.mov"),Path::new("out.mp4"),1,Path::new("stats"));
+        assert!(a.windows(2).any(|w|w==["-r","24"]));
+        assert!(!a.iter().any(|x|x.as_str()=="passthrough"),"没有可用的开关名就不该写出 passthrough");
     }
 
     /// §5.1 输入门由能力分类器判定：白名单外的像素格式给不出精确理由就拒绝。

@@ -320,6 +320,7 @@ mod tests {
             threads: 1,
             warnings: vec![],
             metadata_policy: policy,
+            frame_timing_flag: "-fps_mode".into(),
             options: VideoOptions {
                 encoder: "libx264".into(),
                 mode: "crf".into(),

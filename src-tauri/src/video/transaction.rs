@@ -116,4 +116,15 @@ pub fn commit(source:&Path,partial:&Path,target:&Path,o:&VideoOptions,probe:&Vid
 #[cfg(test)]mod tests{use super::*;
     #[test]fn suffix_conflicts_never_claim_source(){let d=tempfile::tempdir().unwrap();let s=d.path().join("clip.mp4");fs::write(&s,b"source").unwrap();fs::write(d.path().join("clip_compressed.mp4"),b"existing").unwrap();let p=destination(&s,&VideoOptions::default(),&[]).unwrap();assert_eq!(p.file_name().unwrap(),"clip_compressed_1.mp4");assert_eq!(fs::read(s).unwrap(),b"source");}
     #[test]fn source_identity_detects_changes(){let d=tempfile::tempdir().unwrap();let s=d.path().join("clip");fs::write(&s,b"original").unwrap();let id=SourceIdentity::read(&s).unwrap();fs::write(&s,b"changed and longer").unwrap();assert_ne!(id,SourceIdentity::read(&s).unwrap());}
+
+    /// 编码前的第一个检查点就是这一步：`Err` 在非 unix 上曾无条件返回，Windows 视频轨
+    /// 因此**还没开始编码就整条失败**。这一条要在 Windows runner 上真的问出数字，
+    /// 而不是靠 `cargo check` 通过就当作运行时成立（P0-3 的教训）。
+    #[test]fn available_space_answers_for_a_real_directory(){
+        let d=tempfile::tempdir().unwrap();
+        match available_space(d.path()){
+            Ok(free)=>assert!(free>0,"能回答就必须给出正数，拿到 0 等于没读到"),
+            Err(e)=>assert!(cfg!(not(any(unix,windows))),"{e}：只有 unix/windows 之外才允许答不出来"),
+        }
+    }
 }

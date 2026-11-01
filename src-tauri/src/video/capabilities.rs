@@ -5,10 +5,16 @@ pub const NATIVE_UNAVAILABLE:&str="Sizqo App Store video encoding is unavailable
 pub struct EncoderCapability {pub id:String,pub label:String,pub modes:Vec<String>,pub presets:Vec<String>}
 #[derive(Debug,Clone,Serialize,Deserialize)]
 #[serde(rename_all="camelCase")]
-pub struct CapabilityMatrix {pub backend:String,pub available:bool,pub reason:Option<String>,pub encoders:Vec<EncoderCapability>,pub muxers:Vec<String>,pub audio_encoders:Vec<String>,pub diagnostics:Vec<String>}
+pub struct CapabilityMatrix {pub backend:String,pub available:bool,pub reason:Option<String>,pub encoders:Vec<EncoderCapability>,pub muxers:Vec<String>,pub audio_encoders:Vec<String>,pub diagnostics:Vec<String>,
+    /// 「保留源时间戳」这个开关在 FFmpeg 5.0 改过名：新版只认 `-fps_mode`，发行版里的
+    /// 4.4 只认 `-vsync`，而 FFmpeg 9 已经把 `-vsync` **删掉**了（实测 `Unrecognized
+    /// option 'vsync'`）。上一轮 Linux CI 就是被硬编码的 `-fps_mode` 拦在编码中途。
+    /// 名字由引擎自己回答 —— 一次真试用，不猜版本号。空串 = 两种都不认，
+    /// 那时 §5.3 的 passthrough 无法兑现，必须在编码前拒绝而不是默默换别的语义。
+    #[serde(default)] pub frame_timing_flag:String}
 impl CapabilityMatrix {
     pub fn encoder(&self,id:&str)->Option<&EncoderCapability>{self.encoders.iter().find(|e|e.id==id)}
-    pub fn unavailable(reason:String)->Self{Self {backend:"unavailable".into(),available:false,reason:Some(reason),encoders:vec![],muxers:vec![],audio_encoders:vec![],diagnostics:vec![]}}
+    pub fn unavailable(reason:String)->Self{Self {backend:"unavailable".into(),available:false,reason:Some(reason),encoders:vec![],muxers:vec![],audio_encoders:vec![],diagnostics:vec![],frame_timing_flag:String::new()}}
 }
 #[cfg(feature="inproc-backends")]
 pub fn capabilities()->CapabilityMatrix{CapabilityMatrix::unavailable(NATIVE_UNAVAILABLE.into())}
@@ -51,5 +57,23 @@ fn discover()->Result<CapabilityMatrix,String>{
     }
     let muxers=[("mp4","mp4"),("mov","mov"),("mkv","matroska"),("webm","webm"),("ts","mpegts")].iter().filter(|(_,real)|mux.lines().any(|s|s.split_whitespace().nth(1)==Some(*real))).map(|(ui,_)|ui.to_string()).collect();
     let audio_encoders=["aac","libopus","libmp3lame","flac"].iter().filter(|s|exists(s)).map(|s|s.to_string()).collect();
-    Ok(CapabilityMatrix{backend:"ffmpeg".into(),available:!encoders.is_empty(),reason:if encoders.is_empty(){Some("No encoder passed the runtime trial".into())}else{None},encoders,muxers,audio_encoders,diagnostics})
+    let frame_timing_flag=probe_frame_timing_flag();
+    if frame_timing_flag.is_empty(){diagnostics.push("frame timing: neither -fps_mode nor -vsync is honored".into());}
+    Ok(CapabilityMatrix{backend:"ffmpeg".into(),available:!encoders.is_empty(),reason:if encoders.is_empty(){Some("No encoder passed the runtime trial".into())}else{None},encoders,muxers,audio_encoders,diagnostics,frame_timing_flag})
+}
+
+/// 一次真试用决定"保留源时间戳"的开关叫什么：lavfi 黑场 → `rawvideo` → `-f null`。
+/// 选 `rawvideo` 是因为它在任何 FFmpeg 构建里都在，这条探测因此不会被编码器差异污染；
+/// 顺序先新后旧（FFmpeg 9 已经没有 `-vsync`）。两种都失败时返回空串，由 `plan` 在
+/// 编码前拒绝 —— 语义换成"重排时间轴"不是可用的兜底，那是另一件事。
+#[cfg(not(feature="inproc-backends"))]
+fn probe_frame_timing_flag()->String{
+    use super::process::{command,capture};use std::time::Duration;
+    for flag in ["-fps_mode","-vsync"] {
+        if let Ok(mut cmd)=command("ffmpeg"){
+            cmd.args(["-hide_banner","-v","error","-nostdin","-f","lavfi","-i","color=c=black:s=128x128:r=1","-frames:v","1","-threads","1","-c:v","rawvideo",flag,"passthrough","-f","null","-"]);
+            if capture(cmd,Duration::from_secs(30),65536).is_ok(){return flag.to_string();}
+        }
+    }
+    String::new()
 }

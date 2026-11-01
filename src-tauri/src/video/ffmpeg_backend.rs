@@ -163,6 +163,7 @@ mod tests {
         assert_eq!(source_probe.format_tags["MAKE"],"SizqoCam");
         let caps=capabilities::capabilities();
         assert!(caps.encoder("libx264").is_some(),"内置 ffmpeg 必须通过 libx264 运行时试用");
+        assert!(!caps.frame_timing_flag.is_empty(),"这台 ffmpeg 既不认 -fps_mode 也不认 -vsync：时间轴语义无法保证");
 
         let kept=encode_policy(dir.path(),&source,&source_probe,&caps,"preserve","mkv");
         assert_eq!(kept.format_tags["title"],"Sizqo Metadata Test");
@@ -225,6 +226,7 @@ mod tests {
         let root=dir.path();
         let caps=capabilities::capabilities();
         assert!(caps.encoder("libx264").is_some()&&caps.encoder("libx265").is_some(),"内置 ffmpeg 必须有 libx264/libx265");
+        assert!(!caps.frame_timing_flag.is_empty(),"这台 ffmpeg 既不认 -fps_mode 也不认 -vsync：时间轴语义无法保证");
         let base=VideoOptions{encoder:"libx264".into(),mode:"crf".into(),crf:Some(23.0),preset:"ultrafast".into(),audio_policy:"copy".into(),metadata_policy:"preserve".into(),container:"mkv".into(),threads:2,..Default::default()};
 
         // ① SDR 双音轨 + 字幕 + 章节：copy 策略下轨道全部活着，输出过全量校验。
@@ -252,17 +254,22 @@ mod tests {
 
         // ② VFR 源：§5.3 默认 passthrough —— 保留源 PTS，不重排时间轴。
         // 用 mp4：mkv 会把丢帧后的时间戳归一化，探不出 r≠avg。
+        // 夹具本身也用探测到的开关名：造夹具的 ffmpeg 和被测的是同一台，
+        // 写死 `-fps_mode` 在只有 `-vsync` 的引擎上会当场失败（上一轮 CI 就是这么红的）。
+        let timing=caps.frame_timing_flag.as_str();
         let vfr=make_fixture(root,"vfr.mp4",&[
             "-f","lavfi","-i","testsrc2=size=160x120:rate=30:duration=2",
-            "-vf","select='not(mod(n\\,5))'","-fps_mode","passthrough",
+            "-vf","select='not(mod(n\\,5))'",timing,"passthrough",
             "-c:v","libx264","-preset","ultrafast"]);
         let vfr_probe=probe::probe(&vfr).unwrap();
         assert!(vfr_probe.variable_frame_rate,"夹具必须真的是 VFR（r≠avg）");
         let mut vfr_options=base.clone();vfr_options.audio_policy="none".into();vfr_options.container="mp4".into();
         let vfr_plan=plan::build(&vfr_options,&vfr_probe,&caps,2).unwrap();
         let vfr_argv=vfr_plan.argv(&vfr,&root.join("vfr-out.mp4"),1,&root.join("stats"));
-        assert!(vfr_argv.windows(2).any(|w|w==["-fps_mode","passthrough"]),"VFR 源默认保留原始时间戳");
-        assert!(!vfr_argv.windows(2).any(|w|w==["-fps_mode","cfr"]),"不许再自动归一化成 CFR");
+        assert!(vfr_argv.windows(2).any(|w|w[0]==timing&&w[1]=="passthrough"),"VFR 源必须用这台引擎认得的名字保留时间戳（探测结果 {timing}）");
+        for name in ["-fps_mode","-vsync"] {
+            assert!(!vfr_argv.windows(2).any(|w|w[0]==name&&w[1]=="cfr"),"不许把 VFR 源自动归一化成 CFR");
+        }
         let vfr_encoded=encode_with(root,&vfr,&vfr_options);
         // passthrough 的意义就是时间轴原样：时长漂移不超过帧间隔容差（§5.4），
         // 产物平均帧率等于源平均帧率（时间戳没被重排的证据）。

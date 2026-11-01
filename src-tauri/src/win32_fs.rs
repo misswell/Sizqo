@@ -200,3 +200,41 @@ pub fn available_space(path: &Path) -> Result<u64, String> {
     }
     Ok(free_bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 目录句柄是 Windows 上最容易"编译过但运行时错"的一类：不带
+    /// `FILE_FLAG_BACKUP_SEMANTICS` 就开不了目录。同盘合并估算（AGENTS 规则 5）
+    /// 正好建在"目录能问出卷号"上，所以这一条必须在 windows runner 上真问出数字。
+    #[test]
+    fn a_directory_yields_its_volume_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = volume_id_of_path(dir.path())
+            .expect("目录开不出卷号：BACKUP_SEMANTICS 那一步没生效就在这里露馅");
+        let parent = volume_id_of_path(
+            dir.path().parent().expect("临时目录必须有父目录"),
+        )
+        .expect("父目录同样要开得出卷号");
+        assert_eq!(own, parent, "同一块盘上的两个目录必须给出同一个卷号");
+    }
+
+    /// 文件与它所在目录同卷：把"路径能开"和"句柄能查身份"两件事一起钉住。
+    #[test]
+    fn a_file_and_its_directory_share_a_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("clip.mp4");
+        fs::write(&file, b"source").unwrap();
+        assert_eq!(volume_id_of_path(&file), volume_id_of_path(dir.path()));
+    }
+
+    /// `GetDiskFreeSpaceExW` 的运行时结论：编码前的第一个检查点就靠它。
+    /// 此前它只有目标类型检查背书，一次都没在 Windows 上被调用过。
+    #[test]
+    fn available_space_is_a_positive_number_for_a_writable_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let free = available_space(dir.path()).expect("GetDiskFreeSpaceExW 必须给出答案");
+        assert!(free > 0, "答成 0 等于没读到");
+    }
+}

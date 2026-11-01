@@ -1630,8 +1630,13 @@ Windows 的视频轨因此在**还没开始编码时**就整条失败。现在�
 | `rust-tests-macos` / `appstore-tests` / `frontend-tests` / `swift-checks` | success | — |
 
 上一轮 P0-3 要的"运行时结论"因此第一次拿到：Windows 的目录 `FlushFileBuffers`、隔离
-改名、句柄身份、`SetFileTime`、`GetDiskFreeSpaceExW` 都在真机上跑过了 249 条测试。
-7 项失败的处置逐条兑现，没有一条是靠删测试或放宽断言变绿的。
+改名、句柄身份、`SetFileTime` 都在真机上跑过了 249 条测试。7 项失败的处置逐条兑现，
+没有一条是靠删测试或放宽断言变绿的。
+
+要如实分开说：那 249 条里**没有** `GetDiskFreeSpaceExW` 与卷号比较 —— 这两个新原语
+当时只有 `win32_fs.rs` 单文件的目标类型检查背书，一次都没被调用过（编码前的空间检查
+在 `ffmpeg_backend.rs` 里，而 Windows 上那条路径根本跑不到）。按 P0-3 自己的标准，
+"编译过 = 运行时成立"不成立，所以补了三条真调用的测试（见下表"原语的运行时背书"）。
 
 **Ubuntu 那一步红出来的不是"缺 ffmpeg"**，而是两条 panic 的原文：
 
@@ -1660,6 +1665,19 @@ AGENTS §12 反着要求的行为（不可用的原生后端绝不 spawn）。�
 新增 6 条测试（`binfmt` 2 + 图片线解析 2 + 视频线解析 2），其中两条正向对照只在
 macOS 编译：格式闸门不能把自家内置产物一起拒掉，那会让 Direct 主线静默退化成
 "全不可用"而单元测试照样全绿。`cargo test --lib` 因此 259 → **265**。
+
+这道门和打包脚本是对得上的，不是新加的限制：`release.yml` 的 `build-windows`
+先 `Remove-Item resources\bin\*` 再下载 `*.exe`，`build-linux` 先 `rm -f
+resources/bin/*` + `rm -rf resources/lib` 再拷系统 ELF —— 也就是说**发布产物里
+根本不会有这些 Mach-O**，被它们冒充的一直是"没跑打包准备步骤"的那条路（本机
+`cargo test`、CI 的测试作业）。闸门在 Linux/Windows 上放行的是打包后真正的
+ELF/PE 候选，方向与打包一致。
+
+顺带一条如实的结论：Windows 与 Linux 的 Direct 视频轨**至今没有随包引擎**
+（`video/bin` 只在 `build-macos` 里投递）。本轮之前它们不是"没有引擎"，而是
+"拿着 macOS 的引擎冒充可用、编码时炸 `Exec format error`"；现在是明确的
+`ffmpeg unavailable; build the bundled video runtime`。要让非 mac 平台真有视频轨，
+缺的是打包投递（以及对应的编码器能力取证），不是把错误改成静默。
 
 那条 `#[cfg(windows)]` 测试在 macOS 上**根本不参与编译**，本机无法证明它能编。用
 std-only 表达式桩过了一遍目标类型检查：
@@ -1716,6 +1734,66 @@ std-only 表达式桩过了一遍目标类型检查：
 
 两处改完都从 `/tmp` 逐字节还原并核对 md5（`89a15ecb…`、`c98f884f…`），还原后复跑为绿。
 
+### 第六次 CI 回证（run 41265224402）：格式闸门生效，红挪到下一层
+
+| 作业 | 结论 | 关键读数 |
+| --- | --- | --- |
+| `windows-tests` | **success**（连续第二次） | `cargo check --lib` + `cargo test --lib` + 契约向量，运行时结论与上一轮同向 |
+| `rust-tests` (Ubuntu) | failure，仍只红在 `real media matrix` | 上一轮的 `Exec format error (os error 8)` **消失**；这一轮两条 panic 原文：`FFmpeg failed: Unrecognized option 'fps_mode'. / Error splitting the argument list: Option not found`（`ffmpeg_backend.rs:144`、`:201`；`0 passed; 2 failed … 255 filtered out`） |
+| `rust-tests-macos` / `appstore-tests` / `frontend-tests` / `swift-checks` | success | — |
+
+这条读数恰好是新闸门**生效**的证据：Linux 不再拿 macOS 的 Mach-O 冒充可用，而是真的
+解析并执行了 apt 装的 ELF `ffmpeg` —— 引擎跑起来了，才谈得上"参数不认识"。红点因此
+从"这台机器根本没有引擎"挪到了更深一层：**参数写死了一台机器的拼法**。
+
+根因：`-vsync` 在 FFmpeg 5.0 改名成 `-fps_mode`，而 FFmpeg 9 把 `-vsync` **删掉**了
+（实测本机捆绑的 9.0.2：`-fps_mode` EXIT=0、`-vsync` EXIT=8）。Ubuntu 22.04 的 apt
+ffmpeg 是 4.4，只有旧名。`video/plan.rs` 的 §5.3 passthrough 硬编码 `"-fps_mode"`，
+真实矩阵的**夹具生成本身**也硬编码同一个串，于是 4.4 上必然中途炸 —— 而且炸在
+`run()` 里，等于"已经开跑才发现在这台机器上根本说不通"。
+
+处置（本轮，全部在编码前收口）：
+
+| 位置 | 改动 |
+| --- | --- |
+| `video/capabilities.rs` | `CapabilityMatrix` 新增 `frame_timing_flag`（`#[serde(default)]`，不进前端契约的语义变更）；`probe_frame_timing_flag()` 用一次真试用（`lavfi color → -c:v rawvideo → <flag> passthrough → -f null -`）在新旧两名里选出这台引擎认得的那一个。选 `rawvideo` 是因为它在任何构建里都在，探测结果因此不会被编码器差异污染。两名都不认 → 空串 + `diagnostics` 写明 |
+| `video/plan.rs` | `EncodePlan` 携带 `frame_timing_flag`（`#[serde(skip)]`）；argv 用它而不是写死的串；**编码前拒绝**：`This FFmpeg honors neither -fps_mode nor -vsync; preserving source timestamps cannot be guaranteed`。不退回 ffmpeg 默认的 `auto`（会丢帧/重复帧，那是拿另一件事冒充"保留时间戳"，规则 11） |
+| `video/ffmpeg_backend.rs` | 真实矩阵的 VFR 夹具与断言改用探测到的名字；`cfr` 的反向断言同时盯新旧两名；两条真实测试各自加 `assert!(!caps.frame_timing_flag.is_empty(), …)`，让"这台引擎说不清时间轴"以这句话失败，而不是以 `Unrecognized option` 失败 |
+| `src/win32_fs.rs` | 补 3 条 Windows 测试：目录给出卷号、文件与所在目录同卷、可写目录的剩余空间是正数。上一轮我写的"Windows 目录 fsync / 句柄身份 / `GetDiskFreeSpaceExW` 都在真机上跑过了 249 条测试"**是过度声明** —— `available_space()` 与 `volume_id_of_path()` 当时**一条测试都没有**（grep 为证），已就地更正文字并补上真的测试 |
+| `video/transaction.rs` | `available_space_answers_for_a_real_directory`：能回答就必须给出正数；答不出来只允许发生在 unix/windows 之外的平台（不是删断言，是把"不许静默 0"这件事写成断言） |
+
+新增 5 条本机可编译的测试（plan 2 + transaction 1 + real 矩阵内 2 处断言），win32_fs
+另加 3 条只在 Windows 编译。`cargo test --lib` 因此 265 → **268**（三种特性组合都是
+268 / 0）。
+
+本轮负向对照（证时间轴这道门不是摆设）：把 `probe_frame_timing_flag()` 的候选拼法改成
+两个不存在的名字（`-fps_modeXX` / `-vsyncXX`），等价于"这台引擎两名都不认"：
+
+```
+test video::ffmpeg_backend::tests::s11_real_media_matrix ... FAILED
+panicked at src/video/ffmpeg_backend.rs:229:9:
+这台 ffmpeg 既不认 -fps_mode 也不认 -vsync：时间轴语义无法保证
+（metadata_policies_hold_on_real_encoded_fixtures 同样在 :166 以同一句失败）
+```
+
+改完原地还原并核对 md5（`1e7916da…`，控制前后同值），还原后 `real --ignored` 复跑 2 passed。
+
+### 第六轮的门禁读数（macOS 本机，2026-11-01）
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib` | 268 passed / 0 failed / 2 ignored（24.06s），EXIT=0 |
+| `cargo test --lib --features inproc-backends`（`cargo test --features inproc-backends` 全量） | lib 268 / 0；集成 6 / 0 与 5 / 0；崩溃注入 harness 逐阶段通过，EXIT=0 |
+| `cargo test --no-default-features --features inproc-backends` | lib 268 / 0（43.51s）；集成同上，EXIT=0 |
+| `cargo test --test crash_injection -- --nocapture` | 6 阶段（每阶段 SIGKILL + 两次恢复）逐条打印并全通过，EXIT=0 |
+| `cargo test --lib real -- --ignored` | 2 passed —— 捆绑 FFmpeg 9 探测到 `-fps_mode`，真实编码与 §56 校验通过 |
+| `npm run test:frontend` | 全绿；N=1000 scroll×100=47.9ms、N=5000=88.8ms、N=10000=119.3ms（windowRows=20），10k 全量参考 first=243.2ms / clean=10.34ms |
+| `bash scripts/test_swift_history.sh` | 全部 `ok` / 0 FAIL，契约向量 32 条与 Swift 期望一致 |
+
+`inproc-backends` 分支下 `probe_frame_timing_flag()` 同样带 `#[cfg(not(feature =
+"inproc-backends"))]`：它引用只在 Direct 线存在的 `video::process`，不加闸门会让
+App Store 组合编译失败 —— 三条特性组合实测 EXIT=0。
+
 ### 仍未取证的部分（如实）
 
 - 本机交叉编译依旧不可行（`ring` 的 cc-rs 报 `'assert.h' file not found`），所以
@@ -1723,10 +1801,21 @@ std-only 表达式桩过了一遍目标类型检查：
   `output_transaction`、`history` 的 `share_mode` 现场、`commands` 的路径、
   `image_capabilities` 的 Windows 半条、`video` 的两个新原语）**只能由 CI 的
   `windows-tests` 作业取证** —— 这一条已经在 run 41235873134 上兑现（249 / 0）。
-- **追加轮（`binfmt` 格式门、`tool()` 的 `.exe`、Windows 版"读不出来"门）尚未被任何
-  Actions 记录看过**：本机只能证明 macOS 侧行为不变（265 全绿 + `real --ignored`
-  2 passed）和 Windows 那条测试的表达式可类型检查。Linux 真实矩阵第一次"用系统
-  ELF 引擎跑通"也还没绿 —— 三条都要等推送后的那一次 run 才算数。
+- `binfmt` 格式门、`tool()` 的 `.exe`、Windows 版"读不出来"门已被 run 41265224402
+  看过：`windows-tests` success，Linux 侧 `Exec format error` 消失、改为解析到 apt 的
+  ELF 引擎。仍未取证的两条：
+  - **`-vsync` 这一支本机无法验证** —— 本机只有 FFmpeg 9（旧名已删），没有 4.x 引擎
+    可试。探测逻辑的判别能力由负向对照证明（不存在的拼法 → 空串 → 编码前拒绝），
+    "4.4 认 `-vsync`"这件事只能由下一次 Actions 的 Linux 真实矩阵兑现。
+  - `win32_fs.rs` 新增的 3 条卷号/剩余空间测试在本机**不参与编译**，表达式已用
+    `--target x86_64-pc-windows-msvc` 的 std-only 桩过类型检查（EXIT=0），运行时
+    结论仍以下一次 Actions 为准。
+    这条探针本轮先自证了它不是假绿：第一版把测试原样放进 `#[cfg(test)] mod tests`
+    里跑，`--cfg test` 并**没有**让这段参与编译（rustc 反而回了一句"consider adding
+    `#[cfg(test)]`"，`use super::*` 报 unused）—— 一次 EXIT=0 的假证。改成剥掉
+    `#[cfg(test)]`/`#[test]` 让函数体作为普通代码编译，并先注入一条故意的类型错误
+    （`let _x: u32 = "not a number"`，必须报 `mismatched types`）确认这段真的在编译，
+    再撤掉错误取 EXIT=0。**一个不知道自己是否在跑的探针，和没有探针等价。**
 - Windows / Linux 产物仍未签名（无对应签名链），正式版的门禁照旧不通。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))
