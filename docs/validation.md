@@ -2466,6 +2466,22 @@ Swift（`HistoryStoreCheck/main.swift` 新段 ⑧b）：用 `swapUnavailableForT
 | `npm run test:frontend` | 29 套全部 PASS（10,000 项队列基准 6.8ms / 0.45ms / 71.4ms） |
 | `bash scripts/test_swift_history.sh` | 全部通过，契约向量 32 条 |
 
+### CI 实测（run 41314363535，6 个作业全绿）
+
+| 作业 | 读数 |
+| --- | --- |
+| `rust-tests`（Linux） | **268 passed / 0 failed / 2 ignored**；契约向量 1；真实视频矩阵 2 |
+| `windows-tests` | **270 passed / 0 failed / 2 ignored**；契约向量 1；真实视频矩阵 2 |
+| `rust-tests-macos` | **278 passed / 0 failed / 2 ignored**；`--features inproc-backends` 277 / 0 |
+| `appstore-tests` | **269 passed / 0 failed**（`--no-default-features --features inproc-backends`） |
+| `frontend-tests` / `swift-checks` | success |
+
+Windows 那一格第一次是红的：`restoring_a_quarantined_file_never_overwrites_a_file_that_took_its_place`
+把"原图回到原位"当成了跨平台结论，而 Windows 上 `atomic_swap` 是 Unsupported、
+正确结果是 `Kept`（两边字节各留原处）。断言改成每种现场各自成立之后转绿 ——
+这条红也是本轮"Windows 真的在跑测试"的证明：换作只有 `cargo check` 的年代，
+这类跨平台断言错误会一路带到用户机上。
+
 ### 仍未取证（如实）
 
 - **Windows 的 `MoveFileExW` 分支只过了目标类型检查**：本机交叉编译仍卡在
