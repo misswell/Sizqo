@@ -442,16 +442,24 @@ enum TempOwnership {
     /// 先尽力把它迁到用户看得见的冲突名；迁不动才写 `.protected` 标记。
     /// 两条路都没走通也绝不删 —— `isOurs` 的 inode 门照样拒绝清理。
     /// 返回这份字节现在所在的路径，调用方把它写进给人看的说明里。
+    ///
+    /// 迁移本身也不许覆盖：`conflictSibling` 探到"这个冲突名还没人用"之后再 rename，
+    /// 中间外部照样能建出同名文件。这里改成逐个名字试**不覆盖改名**，撞了就换下一个。
     static func protectForeignBytes(from temp: String, nextTo target: String) -> String {
-        let conflict = conflictSibling(for: target)
-        if Darwin.rename(temp, conflict) == 0 { return conflict }
+        let directory = (target as NSString).deletingLastPathComponent
+        let name = (target as NSString).lastPathComponent
+        for index in 0..<1000 {
+            let conflict = (directory as NSString)
+                .appendingPathComponent("\(name).sizqo-conflict-\(index)")
+            if OutputTransactionStore.installNoClobber(temp, to: conflict) { return conflict }
+        }
         if let detail = writeMarker(temp) {
             NSLog("Sizqo: 保护标记写入失败（归属门仍会拒绝清理）: %@", detail)
         }
         return temp
     }
 
-    /// 与目标同目录、用户看得见的冲突保留名。
+    /// 与目标同目录、用户看得见的冲突保留名（仅用于展示；落盘走 `installNoClobber`）。
     static func conflictSibling(for target: String) -> String {
         let directory = (target as NSString).deletingLastPathComponent
         let name = (target as NSString).lastPathComponent
@@ -597,13 +605,10 @@ struct StagedWrite {
         let tempPath = self.temp
         let swap = { OutputTransactionStore.atomicSwap(tempPath, target) }
         guard swap() else {
-            // 交换不可用：退回"先验身份再 rename"（与旧门同级）。
-            guard case .success(let current) = sha256OfFile(target),
-                  current == baselineSha256 else {
-                discard()
-                return .refused
-            }
-            return publish(to: target) ? .published : .refused
+            // 交换不可用：不退回「先验身份再 rename」—— 那条路的复核与改名之间
+            // 塞得进一次外部改写，而 rename 会无条件覆盖（上一轮 P1-c）。
+            // 覆盖的目标本来就存在，所以走隔离路线：移走 → 复验 → 不覆盖地装进去。
+            return publishReplaceViaQuarantine(to: target, baselineSha256: baselineSha256)
         }
         // 交换成功：temp 现在持有被换出来的目标旧内容。
         guard case .success(let swappedOut) = sha256OfFile(self.temp),
@@ -624,14 +629,50 @@ struct StagedWrite {
             ? .published : .publishedButNotDurable
     }
 
+    /// 没有原子交换时怎么把同格式覆盖做到同级：移走 → 复验 → 不覆盖地装候选。
+    ///
+    /// 覆盖的目标本来就存在，所以不能用"目标必须是空位"的不覆盖改名直接装 ——
+    /// 先把目标移进独占隔离名（覆盖的只是我们自己刚 O_EXCL 建的空文件），
+    /// 复验移出来的字节正是编码前基线，再用不覆盖改名把候选放进这个空位。
+    /// 任何一步对不上就把它放回原位并拒绝。上一轮的「验一眼再无条件 rename」
+    /// （P1-c）在复核与改名之间留的那次外部改写，在这里不存在。
+    private func publishReplaceViaQuarantine(
+        to target: String, baselineSha256: String
+    ) -> PublishOutcome {
+        let tempPath = self.temp
+        guard let quarantine = OriginalRetirement.claimQuarantineName(for: target) else {
+            discard()
+            return .refused
+        }
+        guard Darwin.rename(target, quarantine) == 0 else {
+            _ = Darwin.unlink(quarantine)
+            discard()
+            return .refused
+        }
+        guard case .success(let moved) = sha256OfFile(quarantine), moved == baselineSha256 else {
+            _ = OriginalRetirement.restoreQuarantined(quarantine, to: target)
+            discard()
+            return .refused
+        }
+        guard OutputTransactionStore.installNoClobber(tempPath, to: target) else {
+            _ = OriginalRetirement.restoreQuarantined(quarantine, to: target)
+            discard()
+            return .refused
+        }
+        // 被换出的原图：前面已经复验过，备份里还有一份可信副本，这份可以收走。
+        _ = Darwin.unlink(quarantine)
+        return syncDirectory(at: (target as NSString).deletingLastPathComponent)
+            ? .published : .publishedButNotDurable
+    }
+
     /// §28 审查修复：占位 inode 的**原子所有权验证**。
     ///
     /// 申请的 0 字节占位可能被外部删掉、又在同一路径放进自己的文件 ——
     /// 直接 rename 就把别人的内容盖掉了。这里用 `renameatx_np(RENAME_SWAP)`
     /// 先交换、再验证**被换出来**的字节是不是我们那个占位 inode：
     /// 一致 → 占位已被我们的候选顶掉，提交成立；不一致 → 换回原状并拒绝，
-    /// 外部文件一个字节都不动。不支持原子交换的文件系统退回"先验身份再
-    /// rename"（与旧门同级，绝不倒退到无条件覆盖）。
+    /// 外部文件一个字节都不动。不支持原子交换的文件系统走隔离路线
+    /// （`publishPlaceholderViaQuarantine`），绝不倒退到"看一眼再无条件 rename"。
     /// - Parameters:
     ///   - placeholderIdentity: 记账时占位文件的 `(dev,ino)`；nil = 无凭证
     ///     （replace 同格式覆盖没有占位），此时退回普通 publish。
@@ -667,13 +708,43 @@ struct StagedWrite {
             return .swappedButUnrecovered(
                 "输出位置在提交前一刻被外部改动，交换回滚也失败；那份内容保留在 \(relocated)")
         }
-        // 不支持原子交换：退回"先验身份再 rename"（与旧门同级）。
-        guard let actual = OutputTransactionStore.fileIdentity(target),
-              actual.device == expected.device && actual.inode == expected.inode else {
+        // 不支持原子交换：目标位上此刻是**我们自己的占位**，不覆盖改名必然撞车，
+        // 所以先把目标移进独占隔离名、复验移出来的确实是我们认领的那个 inode，
+        // 再用不覆盖的方式装候选。「看一眼身份就 rename」正是上一轮报的 P1-c。
+        return publishPlaceholderViaQuarantine(to: target, placeholderIdentity: expected)
+    }
+
+    /// 占位提交的隔离路线：移走目标 → 验它是不是我们的占位 → 不覆盖地装候选。
+    ///
+    /// 移进隔离名覆盖的是我们自己刚 O_EXCL 建的那个空文件，不可能顶掉别人的内容。
+    /// 任何一步对不上就把它放回原位并拒绝 —— 外部文件一个字节都不动。
+    private func publishPlaceholderViaQuarantine(
+        to target: String, placeholderIdentity expected: (device: Int64, inode: UInt64)
+    ) -> PublishOutcome {
+        guard let quarantine = OriginalRetirement.claimQuarantineName(for: target) else {
             discard()
             return .refused
         }
-        return publish(to: target) ? .published : .refused
+        guard Darwin.rename(target, quarantine) == 0 else {
+            _ = Darwin.unlink(quarantine)
+            discard()
+            return .refused
+        }
+        guard let moved = OutputTransactionStore.fileIdentity(quarantine),
+              moved.device == expected.device, moved.inode == expected.inode else {
+            _ = OutputTransactionStore.restoreQuarantine(quarantine, to: target)
+            discard()
+            return .refused
+        }
+        guard OutputTransactionStore.installNoClobber(self.temp, to: target) else {
+            _ = OutputTransactionStore.restoreQuarantine(quarantine, to: target)
+            discard()
+            return .refused
+        }
+        // 换出来的就是我们那个 0 字节占位：提交成立，收走隔离名。
+        _ = Darwin.unlink(quarantine)
+        return syncDirectory(at: (target as NSString).deletingLastPathComponent)
+            ? .published : .publishedButNotDurable
     }
 
     /// 独占 + 写入 + 改名一条龙：调用方不需要在中途记任何东西时使用。
@@ -727,12 +798,21 @@ enum OriginalRetirement {
 
     /// 把隔离出来的字节放回原位。原位已被外部占了时只有原子交换能保证
     /// 「放回原图」不等于「盖掉别人的文件」。
+    ///
+    /// 原位是空的时**也不许**「查空 + rename」：查空与改名之间外部新放进去的文件
+    /// 会被 rename 顶掉（上一轮 P1-b）。这里走与占名同一条三级台阶，装不进去就转
+    /// 原子交换 —— 两条路都保不住时，字节留在隔离名上等人工确认。
     static func restoreQuarantined(_ quarantine: String, to original: String) -> Restored {
         if fileExists(at: original) {
             return OutputTransactionStore.atomicSwap(quarantine, original)
                 ? .inPlaceForeignKept(quarantine) : .kept(quarantine)
         }
-        return Darwin.rename(quarantine, original) == 0 ? .inPlace : .kept(quarantine)
+        if OutputTransactionStore.installNoClobber(quarantine, to: original) { return .inPlace }
+        // 空位在装回的过程中被外部占住了：只有交换能同时保住两边的字节。
+        if fileExists(at: original), OutputTransactionStore.atomicSwap(quarantine, original) {
+            return .inPlaceForeignKept(quarantine)
+        }
+        return .kept(quarantine)
     }
 
     /// 放回原位的三种现场各自的那句实话。`action` 说清是哪一步没走通。
@@ -765,6 +845,14 @@ enum OriginalRetirement {
         //    这里必须是完整 verify —— 快速门看不出"同大小、同时间戳"的原地改写。
         if case .changed(let detail) = baseline.verify(at: quarantine) {
             return restoredMessage(restoreQuarantined(quarantine, to: file), detail: detail)
+        }
+        // ④ 删除前再看一眼体积：改名不会让外部**已经持有**的文件句柄失效，复验通过
+        //    之后那支 fd 仍能往同一个 inode 里追加。这一眼拦得住"又长了字节"的那一类；
+        //    同长度原地改写的兜底是覆盖前就做好的原图备份，不是这里。
+        let current = fileLength(quarantine)
+        if current != baseline.size {
+            return restoredMessage(restoreQuarantined(quarantine, to: file),
+                                   detail: "体积 \(baseline.size) → \(current)")
         }
         guard (try? FileManager.default.removeItem(atPath: quarantine)) != nil else {
             return restoredMessage(restoreQuarantined(quarantine, to: file),
@@ -1175,11 +1263,79 @@ final class OutputTransactionStore: @unchecked Sendable {
 
     /// §28 原子交换：macOS 10.13+ `renameatx_np(RENAME_SWAP)`。
     static func atomicSwap(_ a: String, _ b: String) -> Bool {
-        a.withCString { pa in
+        if swapUnavailableForTesting { return false }
+        return a.withCString { pa in
             b.withCString { pb in
                 renameatx_np(AT_FDCWD, pa, AT_FDCWD, pb, UInt32(RENAME_SWAP)) == 0
             }
         }
+    }
+
+    /// 测试缝：把原子交换强制成"这台机器没有 RENAME_SWAP"。
+    ///
+    /// 只在进程内生效，正式构建里没有调用方；存在的唯一理由是"网络盘 / 非 APFS"
+    /// 那条降级路径必须能在正常 APFS 上被真的跑到 —— 靠"找不到那种卷"就永远测不到。
+    static var swapUnavailableForTesting = false
+
+    /// 原子的「不覆盖改名」：目标已存在就失败，绝不替换任何人的文件。
+    ///
+    /// `Darwin.rename` 是无条件覆盖的（POSIX 语义），凡是"放进一个必须是空位的名字"
+    /// 都不许用它 —— 上一轮报的两条覆盖竞态都是「查空 + rename」那一步。
+    static func noReplaceRename(_ from: String, _ to: String) -> Bool {
+        from.withCString { pa in
+            to.withCString { pb in
+                renamex_np(pa, pb, UInt32(RENAME_EXCL)) == 0
+            }
+        }
+    }
+
+    /// 这一级的失败是"文件系统不支持"，而不是"目标被占了"或真错误吗？
+    private static func primitiveUnsupported() -> Bool {
+        errno == ENOTSUP || errno == EINVAL || errno == ENOSYS
+    }
+
+    /// 把候选放进**必须为空**的目标名，三级台阶，任何一级都不许覆盖已存在的文件。
+    ///
+    ///   ① `renamex_np(RENAME_EXCL)` —— 原生"目标已存在就失败"，一步到位；
+    ///   ② `link()` 占名 —— 目标存在必然失败，成功后收回候选旧名（同一 inode）；
+    ///   ③ `open(O_EXCL)` 占位 + rename 覆盖**自己的**占位 —— 覆盖对象从"任何人"
+    ///      缩小到"我们刚创建的那个空文件"。
+    ///
+    /// 三级之外没有第四种写法：装不进去就返回 false，调用方按拒绝提交收场。
+    static func installNoClobber(_ candidate: String, to target: String) -> Bool {
+        guard fileExists(at: candidate) else { return false }
+        if noReplaceRename(candidate, target) { return true }
+        if errno == EEXIST { return false }
+        if !primitiveUnsupported() { return false }
+
+        if Darwin.link(candidate, target) == 0 {
+            _ = Darwin.unlink(candidate)
+            return true
+        }
+        if errno == EEXIST { return false }
+        if !primitiveUnsupported() { return false }
+
+        let handle = Darwin.open(target, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard handle >= 0 else { return false }
+        Darwin.close(handle)
+        let claimed = fileIdentity(target)
+        if Darwin.rename(candidate, target) == 0 { return true }
+        // 只收走证明得了归属的占位：仍是刚才 O_EXCL 认领的那个 inode。
+        if let claimed, let current = fileIdentity(target), claimed == current {
+            _ = Darwin.unlink(target)
+        }
+        return false
+    }
+
+    /// 把隔离名上的字节放回原位，**绝不覆盖**刚被外部放进去的文件。
+    ///
+    /// 原位是空的时也不许「查空 + rename」（上一轮 P1-b）：先走三级台阶，装不进去
+    /// （说明原位在这期间被占了）再转原子交换 —— 两条路都保不住时留在隔离名上。
+    static func restoreQuarantine(_ quarantine: String, to original: String) -> Bool {
+        if fileExists(at: original) { return atomicSwap(quarantine, original) }
+        if installNoClobber(quarantine, to: original) { return true }
+        if fileExists(at: original) { return atomicSwap(quarantine, original) }
+        return false
     }
 
     /// 文件系统身份 `(dev,ino)`：占位凭证对账用。

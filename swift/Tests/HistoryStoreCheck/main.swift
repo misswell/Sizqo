@@ -2517,6 +2517,102 @@ do {
     check(StagedWrite.PublishOutcome.published != .publishedButNotDurable,
           "落盘没成的发布不许冒充已发布")
 
+    // ⑧b 原子交换不可用的降级路径：以前是「验一眼再无条件 rename」，复核与改名之间
+    //     又一次外部改写就会把别人的文件盖掉（上一轮 P1-c）。现在走隔离路线 +
+    //     不覆盖改名。这一支在正常 APFS 上永远走不到，所以要显式把交换关掉才测得着。
+    let noSwapDir = freshRoot("45ns")
+    OutputTransactionStore.swapUnavailableForTesting = true
+
+    // 基线一致 → 隔离路线提交成立：原图进隔离名，候选进原位，隔离名随提交收走。
+    let nsTarget = canonicalPath(noSwapDir + "/same.png")
+    writeData(nsTarget, [1, 2])
+    guard case let .success(nsBaseline) = SourceIdentity.readWithHash(nsTarget),
+          let nsHash = nsBaseline.sha256,
+          var nsStaged = StagedWrite.claim(target: nsTarget) else {
+        check(false, "测试前提：基线 / 临时名该读得到"); exit(1)
+    }
+    check(nsStaged.writeSyncedRecording(Data([5, 5])), "候选该写满并记下指纹")
+    check(nsStaged.publishReplaceIfIdentityMatches(to: nsTarget, baselineSha256: nsHash) == .published,
+          "交换不可用时，基线一致必须走隔离路线提交成立")
+    check(readBytes(nsTarget) == [5, 5], "候选必须落在原位")
+    check(((try? fm.contentsOfDirectory(atPath: noSwapDir)) ?? [])
+            .allSatisfy { !$0.contains(".sizqo-retire-") }, "提交后不许留下隔离名")
+
+    // 基线对不上 → 拒绝，外部刚改的那份原样保留。
+    let nsMoved = canonicalPath(noSwapDir + "/moved.png")
+    writeData(nsMoved, [1, 2])
+    guard case let .success(nsStale) = SourceIdentity.readWithHash(nsMoved),
+          let nsStaleHash = nsStale.sha256,
+          var nsStaged2 = StagedWrite.claim(target: nsMoved) else {
+        check(false, "测试前提：基线 / 临时名该读得到"); exit(1)
+    }
+    check(nsStaged2.writeSyncedRecording(Data([7, 7])), "候选该写满")
+    writeData(nsMoved, [3, 4])                       // 提交窗口内被外部改掉
+    check(nsStaged2.publishReplaceIfIdentityMatches(to: nsMoved, baselineSha256: nsStaleHash) == .refused,
+          "换出来的不是基线字节 → 拒绝（覆盖没发生）")
+    check(readBytes(nsMoved) == [3, 4], "外部刚改的内容一个字节都不许动")
+
+    // 不覆盖改名本身：空位装得上，被占住就拒绝且不动别人的字节。
+    let freeSlot = canonicalPath(noSwapDir + "/free.png")
+    let claimSource = canonicalPath(noSwapDir + "/claim.tmp")
+    writeData(claimSource, [9, 9])
+    check(OutputTransactionStore.installNoClobber(claimSource, to: freeSlot), "空位必须装得上")
+    check(readBytes(freeSlot) == [9, 9], "产物必须落在空位")
+    check(!fileExists(at: claimSource), "候选旧名必须随发布收走")
+    let takenSlot = canonicalPath(noSwapDir + "/taken.png")
+    let claimSource2 = canonicalPath(noSwapDir + "/claim2.tmp")
+    writeData(takenSlot, [1, 1])
+    writeData(claimSource2, [2, 2])
+    check(!OutputTransactionStore.installNoClobber(claimSource2, to: takenSlot),
+          "被占住的名字只能是拒绝")
+    check(readBytes(takenSlot) == [1, 1], "别人的字节一个都不动")
+
+    // 占位提交：交换不可用时走隔离路线 —— 移走目标、验它仍是我们的占位、再装候选。
+    let phTarget = canonicalPath(noSwapDir + "/out.webp")
+    let phHandle = Darwin.open(phTarget, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+    check(phHandle >= 0, "测试前提：占位该建得上"); Darwin.close(phHandle)
+    guard let phId = OutputTransactionStore.fileIdentity(phTarget),
+          var phStaged = StagedWrite.claim(target: phTarget) else {
+        check(false, "测试前提：占位身份 / 临时名该拿得到"); exit(1)
+    }
+    check(phStaged.writeSyncedRecording(Data([7, 7])), "候选该写满")
+    check(phStaged.publishIfPlaceholderMatches(to: phTarget, placeholderIdentity: phId) == .published,
+          "占位是我们自己的 → 隔离路线必须提交成立")
+    check(readBytes(phTarget) == [7, 7], "候选必须顶掉占位")
+
+    // 占位被外部换成自己的文件：隔离路线必须拒绝，外部内容原样保留。
+    let ph2Target = canonicalPath(noSwapDir + "/out2.webp")
+    let ph2Handle = Darwin.open(ph2Target, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+    check(ph2Handle >= 0, "测试前提：占位该建得上"); Darwin.close(ph2Handle)
+    guard let staleId = OutputTransactionStore.fileIdentity(ph2Target),
+          var ph2Staged = StagedWrite.claim(target: ph2Target) else {
+        check(false, "测试前提：占位身份 / 临时名该拿得到"); exit(1)
+    }
+    check(ph2Staged.writeSyncedRecording(Data([8, 8])), "候选该写满")
+    check(Darwin.unlink(ph2Target) == 0, "测试前提：外部拆掉我们的占位")
+    writeData(ph2Target, [9, 9])
+    check(ph2Staged.publishIfPlaceholderMatches(to: ph2Target, placeholderIdentity: staleId) == .refused,
+          "占位被外部换掉 → 拒绝，绝不覆盖")
+    check(readBytes(ph2Target) == [9, 9], "外部那份一个字节都不许动")
+
+    // 隔离名放回原位：原位被外部占住时不许覆盖，两边字节都得在。
+    let occupiedOriginal = canonicalPath(noSwapDir + "/occupied.png")
+    let quarantined = canonicalPath(noSwapDir + "/.sizqo-retire-test.keep")
+    writeData(quarantined, [4, 4])
+    writeData(occupiedOriginal, [6, 6])
+    let restored = OriginalRetirement.restoreQuarantined(quarantined, to: occupiedOriginal)
+    switch restored {
+    case .inPlace: check(false, "原位被占住时绝不允许覆盖")
+    case .inPlaceForeignKept(let kept):
+        check(readBytes(kept) == [6, 6], "外部那份必须还在，只是换了名字")
+        check(readBytes(occupiedOriginal) == [4, 4], "原图必须回到原位")
+    case .kept(let kept):
+        check(readBytes(kept) == [4, 4], "没有交换原语时字节留在隔离名上，一个都不丢")
+        check(readBytes(occupiedOriginal) == [6, 6], "外部那份一个字节都不动")
+    }
+
+    OutputTransactionStore.swapUnavailableForTesting = false
+
     // ⑨ 跨格式删原图：复核与删除之间不许留窗口。
     let retireDir = freshRoot("45r")
     func retireResidue() -> [String] {
