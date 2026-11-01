@@ -2062,7 +2062,7 @@ Release run **41271481909**（标签 `v0.3.6-rc.6`）8 作业全 success：
 ```
 bash scripts/verify_bundle_arch.sh src-tauri/resources/bin arm64        → ok ×7，EXIT=0
 bash scripts/verify_bundle_arch.sh src-tauri/resources/video/bin arm64  → ok ffmpeg/ffprobe，EXIT=0
-bash scripts/verify_bundle_arch.sh src-tauri/resources/video/bin x86_64 → ✗ ffmpeg 的切片 [arm64] 里没有目标架构 x86_64，EXIT=1
+bash scripts/verify_bundle_arch.sh src-tauri/resources/video/bin x86_64 → ✗ ffmpeg 的切片 [arm64] 里缺目标架构 x86_64，EXIT=1
 bash scripts/verify_bundle_arch.sh <空目录> arm64                        → ✗ 没有任何 Mach-O，EXIT=1
 bash scripts/verify_bundle_arch.sh src-tauri/resources/bin ppc64         → ✗ 目标架构只能是 arm64 / x86_64，EXIT=2
 ```
@@ -2073,7 +2073,7 @@ bash scripts/verify_bundle_arch.sh src-tauri/resources/bin ppc64         → ✗
 （190 MB 资产下载不动）；这一步上了 CI 之后，Intel 那条 job 会自己打出
 `ok ffmpeg → x86_64` 这样的读数，届时按日志取证。**（已兑现：run 41274483578 两条腿
 分别打出 `→ x86_64` / `→ arm64`，见「投递侧架构门第一次真的跑」那一节。universal 包
-自身仍记为待实测。）**
+自身在本轮仍无包内读数，测量路线改由 CI 承担，见「第三次下载失败之后」那一节。）**
 
 ### 标签：`v0.3.6-rc.5` 与 `v0.3.6-rc.6` 都已发布，都不算正式版
 
@@ -2227,6 +2227,49 @@ cargo test --lib real -- --ignored
    要复现时必须先问跑的是哪一片。上一轮"引擎版本随 runner 而变"那条由此从"apt vs brew"
    扩到了**同一次发布的两片之间**。
 
+### 第三次下载失败之后，把"实测 universal"搬到产物存在的地方
+
+那条"已分发 universal 包自身没有包内 `lipo -archs` 读数"跟了好几轮。本轮换小的资产再试：
+`Sizqo_v0.3.6-rc.7_macos_universal.app.tar.gz`（60,285,580 B，比上次的 190 MB dmg 小得多），
+结果**同一台机器同样的停滞** —— 约 10 分钟只到 229,376 B（≈18 KB/分钟），照这个速率
+57 MB 要五十几个小时。三次尝试（dmg、dmg 断点续传、tar.gz）都是同一堵墙，所以结论要改：
+**不是包太大，是本机到 Release 资产 CDN 的路线不行。** 继续重试不是取证，是耗时间。
+
+改法是把测量搬到产物本来就存在的地方 —— CI 的合并作业里，签名之前直接问包内的文件：
+
+- `scripts/verify_bundle_arch.sh` 加第三种目标 `universal`：目录里每个 Mach-O 必须
+  **同时**含 arm64 与 x86_64。`lib/` 不归它管（两腿 Homebrew 小版本不同点时依赖库按名字
+  分家，`libcrypto.4` vs `.3`、`libx265.217` vs `.216` 那些单架构 dylib 是合法产物；
+  硬要求双切片只会把发布作业永久钉红 —— 这条理由与上一节"不加进 universal 腿"同源）。
+- `release.yml` 的 `build-macos-universal` 在 `Merge Universal app` 与签名之间插一步
+  `Refuse a universal bundle whose execs lost a slice`，逐个检查
+  `Contents/MacOS`、`Contents/Resources/video/bin`、`Contents/Resources/resources/bin`；
+  目录不在就先把 `Contents/Resources` 列出来再红，一次运行要说清"缺的是切片还是布局猜错"。
+
+**探针先抓到我自己的假红。** 第一版按字面匹配 `arm64`，本机正向样本 `/bin/ls` 直接被判红：
+`lipo -archs /bin/ls` 打的是 `x86_64 arm64e arm64e.x1` —— Apple Silicon 的指针认证变体叫
+`arm64e`，不是 `arm64`。这条如果不被正向样本抓到，上了 CI 就是合法包被门拒掉，
+而门看上去"在工作"。现在按家族匹配：`arm64` 认 `arm64`/`arm64e`，`x86_64` 认
+`x86_64`/`x86_64h`。老消息 `里没有目标架构 …` 也顺手改成 `里缺目标架构 …`（单目标时
+列缺失项，双目标时能列出缺了两个）。
+
+本机读数（正向用 `lipo -create` 现场合成的真双切片，负向用仓库里的 arm64 产物）：
+
+```
+1 universal × 合成双切片(engine)        → ok engine → x86_64 arm64                     EXIT=0
+2 universal × /bin/ls(arm64e 双切片)    → ok ls → x86_64 arm64e arm64e.x1                EXIT=0   ← 家族匹配生效
+3 universal × arm64 单切片引擎          → ✗ ffmpeg 的切片 [arm64] 里缺目标架构 x86_64    EXIT=1
+4 universal × 空目录                    → ✗ 没有任何 Mach-O 文件                        EXIT=1
+5 回归 arm64 × 仓库图片工具(7 个)        → 全 ok，都含 arm64                             EXIT=0
+6 回归 x86_64 × 仓库视频引擎             → ✗ 里缺目标架构 x86_64                          EXIT=1
+7 非法目标 ppc64                        → ✗ 目标架构只能是 arm64 / x86_64 / universal   EXIT=2
+```
+
+工作流那一步的循环体也搬到本机跑过三种现场（合成包 / 缺 `video/bin` 目录 / 目录里躺
+arm64 单切片），结论分别是 `EXIT=0` / 先列实际布局再 `EXIT=1` / 点名缺 x86_64 且
+`EXIT=1`。**这一步的 CI 读数还不存在**：`release.yml` 只在推标签时跑，它属于
+"本机实测通过、已接线、等下一个标签的 run"。
+
 ### 仍未取证的部分（如实）
 
 - 本机交叉编译依旧不可行（`ring` 的 cc-rs 报 `'assert.h' file not found`），所以
@@ -2261,6 +2304,9 @@ cargo test --lib real -- --ignored
   包从 Release 资产拉下来直接 `lipo -archs`，两条路（`gh release download`、带
   `Accept: application/octet-stream` 的 `curl -C -`）都在 190 MB 的量级上跑到
   KB/分钟级就停滞，取不到读数，因此这条**仍记为待实测**，不当已通过。
+  本轮又用小资产试了第三次（57 MB 的 `…_macos_universal.app.tar.gz`，10 分钟只到 229 KB），
+  同一堵墙 —— 判定为本机到 Release 资产 CDN 的路线问题，不再第四次重试；测量改由
+  `build-macos-universal` 的新步在 CI 里做，那个 run 之前这条仍是待实测。
   受影响的是**不经重采的那条路**：
   Intel mac 上 `git clone` 后直接构建 / 跑测试。架构门现在会正确拒绝 arm64 单切片，
   于是那条轨道的图片工具退到系统 PATH、视频轨报告不可用 —— 这是如实的拒绝，不是修复。

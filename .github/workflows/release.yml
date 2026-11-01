@@ -230,6 +230,26 @@ jobs:
             work/x86_64/Sizqo.app \
             work/universal/Sizqo.app
 
+      - name: Refuse a universal bundle whose execs lost a slice
+        # 上一条包内架构门只管两条单架构腿，universal 那条按设计不进门 —— 于是
+        # "已分发合并包真的双切片"只剩两样证据：脚本契约推论，和两次都在 KB/分钟级
+        # 停滞、取不到读数的资产下载（190 MB dmg 与 57 MB app.tar.gz 各一次）。
+        # 修法是把测量搬到产物存在的地方：合并之后、签名之前，直接在包里 lipo。
+        # 只查会被 exec 的三类文件，不查 lib/：两腿的 Homebrew 小版本不同点时依赖库
+        # 按名字分家（本轮日志就有 libcrypto.4 vs .3、libx265.217 vs .216），
+        # 那些单架构 dylib 是合法产物，硬要求双切片只会把发布作业永久钉红。
+        run: |
+          set -euo pipefail
+          APP="work/universal/Sizqo.app"
+          for d in "$APP/Contents/MacOS" "$APP/Contents/Resources/video/bin" "$APP/Contents/Resources/resources/bin"; do
+            [ -d "$d" ] || {
+              echo "✗ 合并包里找不到 $d，实际布局是：" >&2
+              ls -R "$APP/Contents/Resources" | head -60 >&2
+              exit 1
+            }
+            bash scripts/verify_bundle_arch.sh "$d" universal
+          done
+
       - name: Sign, notarize, and staple macOS assets
         env:
           # 公证优先走 App Store Connect API key（本机实测唯一可用的非交互路线），
