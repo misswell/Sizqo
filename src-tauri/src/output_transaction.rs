@@ -3034,16 +3034,19 @@ mod tests {
         let restored = restore_quarantined(&quarantine, &original);
         match restored {
             Restored::InPlaceForeignKept(kept) => {
+                // 有原子交换（macOS / Linux）：原图回到原位，外部那份被换进隔离名。
                 assert!(kept.exists(), "外部那份必须仍然存在，只是换了名字");
                 assert_eq!(fs::read(&kept).unwrap(), b"external-took-the-slot");
+                assert_eq!(fs::read(&original).unwrap(), b"isolated-original");
             }
             Restored::Kept(path) => {
-                // 这台机器没有原子交换：字节留在隔离名上，同样一个都没丢。
+                // 没有原子交换（Windows）：放回等于覆盖，所以一律保留 —— 原图字节留在
+                // 隔离名上，原位继续归外部那份。两边都还在，一个都没丢。
                 assert_eq!(fs::read(&path).unwrap(), b"isolated-original");
+                assert_eq!(fs::read(&original).unwrap(), b"external-took-the-slot");
             }
             Restored::InPlace => panic!("原位被占住时绝不允许覆盖"),
         }
-        assert_eq!(fs::read(&original).unwrap(), b"isolated-original", "原图必须回到原位");
     }
 
     /// 用户上一轮问的那个极窄窗口：改名不会让外部**已持有的 fd** 失效，
