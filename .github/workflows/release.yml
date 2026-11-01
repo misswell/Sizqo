@@ -36,14 +36,19 @@ jobs:
           CONFIG_VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
           CARGO_VERSION="$(awk -F'"' '/^version = /{print $2; exit}' src-tauri/Cargo.toml)"
           PKG_VERSION="$(jq -r .version package.json)"
+          # 沙盒线的版本串各写各的：build_appstore.sh 只读 tauri.conf.appstore.json，
+          # 于是 App Store 包可以带着上一个版本的 CFBundleShortVersionString 出门，
+          # 而 Direct 侧的一切记录都显示新版本。rc.3 就是四处里漏了这处。
+          APPSTORE_VERSION="$(jq -r .version src-tauri/tauri.conf.appstore.json)"
           if [ "${RELEASE_TAG}" != "v${CONFIG_VERSION}" ]; then
             echo "✗ 标签 ${RELEASE_TAG} 与 src-tauri/tauri.conf.json 的 ${CONFIG_VERSION} 不一致" >&2
             echo "  要么先改版本号，要么删掉这个标签；推标签会立刻发布一个 Release" >&2
             exit 1
           fi
           # 三处版本号各写各的 = 发出去的包里混着上一个版本的元数据（0.3.6-rc.3 就是这么错的）。
-          if [ "$CARGO_VERSION" != "$CONFIG_VERSION" ] || [ "$PKG_VERSION" != "$CONFIG_VERSION" ]; then
-            echo "✗ 版本串不一致：tauri.conf=$CONFIG_VERSION Cargo.toml=$CARGO_VERSION package.json=$PKG_VERSION" >&2
+          if [ "$CARGO_VERSION" != "$CONFIG_VERSION" ] || [ "$PKG_VERSION" != "$CONFIG_VERSION" ] \
+            || [ "$APPSTORE_VERSION" != "$CONFIG_VERSION" ]; then
+            echo "✗ 版本串不一致：tauri.conf=$CONFIG_VERSION Cargo.toml=$CARGO_VERSION package.json=$PKG_VERSION appstore=$APPSTORE_VERSION" >&2
             exit 1
           fi
       - uses: actions/setup-node@v4

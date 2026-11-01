@@ -2084,8 +2084,46 @@ bash scripts/verify_bundle_arch.sh src-tauri/resources/bin ppc64         → ✗
   App Store 那份配置原先还停在 `rc.3` —— `scripts/build_appstore.sh` 只从它自己读版本号，
   没有任何地方把它和 Direct 对齐，而 `release.yml` 的守卫只查三处，所以那条轨道的 bundle
   元数据落后了三轮。守卫的覆盖面缺口记在这里，本轮先对齐数值，不改守卫逻辑（改法要么是
-  第四处进守卫，要么是单一版本源，两者都超出本轮范围）。
+  第四处进守卫，要么是单一版本源，两者都超出本轮范围）。**下一轮按第一种改法接上了**，
+  见下节。
 - `rc.1…5` 一律不动、不改写；`v0.3.6` 正式版仍等发布门禁齐了才打。
+
+### 第四处版本串进守卫：数值对齐之外，还得有个地方拒绝它跑偏
+
+上一轮把四处数值对齐了，但**没有任何东西守着这个不变量**，也就是下一轮改版本号时
+同样会漏一处 —— 而漏的偏偏是 App Store 那份：`scripts/build_appstore.sh` 用
+`sed` 从 `tauri.conf.appstore.json` 读 `APP_VERSION`，读到的就是送审包里的
+`CFBundleShortVersionString`。Direct 侧四处写着 rc.7、沙盒线带着 rc.6 出门，
+本机和 CI 都不会有任何一句报错。
+
+`release.yml` 的 `Refuse a tag that does not match the app version` 这一步现在把第四处
+一并比进去（同一个 `exit 1`，不新增作业）。本机三条读数 + 一条"旧守卫"对照，
+证明这一行是承重的而不是装饰：
+
+```
+A. 四处一致 + 标签对上                → guard: ok all four = 0.3.6-rc.7        EXIT=0
+B. 标签落后一格（rc.6 对 rc.7 的树）  → guard: refuse tag v0.3.6-rc.6 vs …     EXIT=1
+C. appstore 单独改成 rc.6（临时副本） → guard: mismatch … appstore=0.3.6-rc.6  EXIT=1
+   同棵树交给旧守卫（只看三处）        → "old guard: 放行了"                    —— 负向对照成立
+```
+
+C 的负向对照是关键：如果只写新行、不拿旧守卫跑同一棵树，就无法区分"补上了一个真实
+缺口"和"加了一行永远不改变结论的检查"。临时副本改串，仓库工作区没动。
+
+**这一步的 CI 读数还不存在**：它属于 `release.yml`，只在推标签时跑，而 `v0.3.6-rc.7`
+这个标签指向 `4cbe33f`（版本提交），那棵树上还没有这一行。所以本条目前是
+"本机实测通过、已接线、等下一个标签的 run"。
+
+### 标签：`v0.3.6-rc.7` 已发布，它不含第四处守卫 —— 标签注释里那句话是错的
+
+- `v0.3.6-rc.7` 指向 `4cbe33f`：`https://github.com/misswell/Sizqo/releases/tag/v0.3.6-rc.7`。
+  内容是上一轮的投递侧架构门（`scripts/verify_bundle_arch.sh` + `build-macos` 那一步）
+  第一次在 release run 里真的执行；这一轮没有新的代码修复进这个标签。
+- **这条标签的注释正文里有一句不成立**：写了"Release guard now also requires
+  `tauri.conf.appstore.json` to match the tag"，而 `4cbe33f` 里守卫仍旧只看三处 ——
+  那句话描述的是本条之后才落地的改动。标签已推送，改它等于 force-push 覆盖已分发标签，
+  因此**不改写**（与 `rc.5` 那句 `-vsync` 笔误同一处置），正确结论以本节与代码为准。
+- `rc.1…6` 一律不动、不改写。
 
 
 ### 仍未取证的部分（如实）
