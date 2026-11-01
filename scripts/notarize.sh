@@ -188,6 +188,18 @@ else
   fail "缺少视频引擎资源：$TAURI_DIR/resources/video/bin（先跑 scripts/collect_macos_tools.sh）"
 fi
 
+# ---------- 2.5 包内架构门（本机路线）----------
+# CI 的三条 mac 腿都有包内架构门，本机这条路线以前一个都没有 —— 而"本地构建的包"
+# 恰恰是最可能带着错切片出门的那种：collect 脚本按 uname -m 校验的是**源目录**，
+# 换机器 / 复用缓存 / 手改资源之后，包里的引擎可以是别的架构。运行时的 binfmt 门
+# 只会把它报成"引擎不可用"，用户看到的是功能凭空缺失，日志里一个错都没有。
+# 签名之前按同一把尺在包内实测：目标架构就是这台机器的。
+log "包内架构门（目标 $(uname -m)）"
+bash "$PROJECT_DIR/scripts/verify_bundle_arch.sh" "$BIN_DIR" "$(uname -m)" \
+  || fail "内置图片工具与本机架构不匹配：$BIN_DIR"
+bash "$PROJECT_DIR/scripts/verify_bundle_arch.sh" "$VIDEO_BIN" "$(uname -m)" \
+  || fail "内置视频引擎与本机架构不匹配：$VIDEO_BIN"
+
 # ---------- 3. 签名（先叶子后根：dylib → bin → 主程序） ----------
 CS_OPTS=( --force --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGNING_IDENTITY" )
 [ "${VERBOSE:-0}" = "1" ] && CS_OPTS=( --force --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGNING_IDENTITY" --verbose=4 )

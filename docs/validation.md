@@ -2270,6 +2270,30 @@ arm64 单切片），结论分别是 `EXIT=0` / 先列实际布局再 `EXIT=1` /
 `EXIT=1`。**这一步的 CI 读数还不存在**：`release.yml` 只在推标签时跑，它属于
 "本机实测通过、已接线、等下一个标签的 run"。
 
+### 本机这条打包路线以前一道门都没有，现在有了
+
+CI 三条 mac 腿都进了架构门，但**本机路线**（`scripts/notarize.sh`，AGENTS 要的
+"真实三轨道构建"走的就是它）一个门都没有：`collect_macos_tools.sh` 按 `uname -m`
+校验的是**源目录**，拷进 `.app` 之后没人再问过一次。换机器 / 复用缓存 / 手改资源路径
+之后，本机包里的引擎完全可以是别的架构 —— 而运行时的 `binfmt` 门只会把它报成
+「引擎不可用」，日志里一个错都没有。
+
+`scripts/notarize.sh` 因此在"拷贝内置工具"与"签名"之间多了 2.5 步，目标架构取
+`$(uname -m)`，两次调用都带 `|| fail`：
+
+```
+bash -n scripts/notarize.sh                                → 语法干净
+grep -n "包内架构门" scripts/notarize.sh                     → 191/192/197 行（接线在位）
+bash scripts/verify_bundle_arch.sh src-tauri/resources/bin      $(uname -m=arm64) → PASS
+bash scripts/verify_bundle_arch.sh src-tauri/resources/video/bin $(uname -m=arm64) → PASS
+把目标换成不存在的架构                                       → EXIT=2，`|| fail` 分支可达
+```
+
+**这条只能算"已接线"，不能算"跑过整脚本"**：本轮没有执行完整的 `notarize.sh`
+（它要真签名 + 真公证，而本机没有 `sizqo-notary` profile，脚本自己的注释就写了这点），
+CI 也不跑这个脚本（mac 腿走的是 `sign_notarize_macos_ci.sh`）。它的第一次真实执行
+是下一次本机三轨道构建，届时读数补进本节。
+
 ### 仍未取证的部分（如实）
 
 - 本机交叉编译依旧不可行（`ring` 的 cc-rs 报 `'assert.h' file not found`），所以
