@@ -88,6 +88,36 @@ jobs:
       - name: contract vectors (Windows side)
         working-directory: src-tauri
         run: cargo test --lib rust_executes_every_contract -- --nocapture
+      - name: real media matrix (--ignored 真实编码，Windows 侧)
+        working-directory: src-tauri
+        shell: pwsh
+        # 这一格以前只有 cargo check / cargo test --lib / 契约向量三步，也就是
+        # "Windows 编译通过"一直在替"Windows 视频轨可用"背书 —— P0-3 批评的正是这种
+        # 拿编译当运行的读法。仓库里的内置引擎是 Mach-O，PE 那半从来不存在，所以
+        # 与 Linux 同一处置：装一个本机跑得动的引擎，让真实编码真的在 Windows 上跑一次。
+        # 跑不动就让它红，红也是读数。
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg -y --no-progress
+            # choco 写的是机器 PATH，同一 job 的后续步骤未必重新读到；显式追加两个已知落点。
+            foreach ($d in @("$env:ProgramData\chocolatey\bin", "C:\ffmpeg\bin")) {
+              if (Test-Path $d) { $d | Out-File -FilePath $env:GITHUB_PATH -Encoding ascii -Append }
+            }
+            $env:Path = "C:\ffmpeg\bin;$env:ProgramData\chocolatey\bin;$env:Path"
+          }
+          $engine = (Get-Command ffmpeg).Source
+          Write-Host "engine: $engine"
+          # 顺带证一件事：PATH 上这条候选确实被格式门判成"本机可执行"（PE 头），
+          # 不是靠"存在就算"混进来的 —— 解析失败时 tool() 的报错会指名 PE/切片。
+          if (-not (Test-Path $engine)) { throw "ffmpeg 解析结果不存在：$engine" }
+          & $engine -hide_banner -encoders > $env:TEMP\enc.txt
+          foreach ($codec in @("libx264", "libx265")) {
+            if (-not (Select-String -Path $env:TEMP\enc.txt -Pattern $codec -Quiet)) {
+              throw "引擎缺少 $codec，真实矩阵无法验收"
+            }
+          }
+          cargo test --lib real -- --ignored
 
   appstore-tests:
     runs-on: ubuntu-22.04
