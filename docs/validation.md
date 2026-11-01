@@ -1734,7 +1734,7 @@ std-only 表达式桩过了一遍目标类型检查：
 
 两处改完都从 `/tmp` 逐字节还原并核对 md5（`89a15ecb…`、`c98f884f…`），还原后复跑为绿。
 
-### 第六次 CI 回证（run 41265224402）：格式闸门生效，红挪到下一层
+### CI 回证（run 41265224402）：格式闸门生效，红挪到下一层
 
 | 作业 | 结论 | 关键读数 |
 | --- | --- | --- |
@@ -1778,7 +1778,7 @@ panicked at src/video/ffmpeg_backend.rs:229:9:
 
 改完原地还原并核对 md5（`1e7916da…`，控制前后同值），还原后 `real --ignored` 复跑 2 passed。
 
-### 第六轮的门禁读数（macOS 本机，2026-11-01）
+### 本轮（时间轴开关）的门禁读数（macOS 本机，2026-11-01）
 
 | 命令 | 结果 |
 | --- | --- |
@@ -1794,6 +1794,38 @@ panicked at src/video/ffmpeg_backend.rs:229:9:
 "inproc-backends"))]`：它引用只在 Direct 线存在的 `video::process`，不加闸门会让
 App Store 组合编译失败 —— 三条特性组合实测 EXIT=0。
 
+### CI 回证（run 41266916166）：六个作业全绿，两处"待取证"同时兑现
+
+`b7d95ee` 触发的 run <https://github.com/misswell/Sizqo/actions/runs/41266916166>
+**conclusion=success**，六个作业逐个的原文读数：
+
+| 作业 | 结论 | 关键读数（日志原文） |
+| --- | --- | --- |
+| `rust-tests` (Ubuntu 22.04) | success | `cargo test (default)` → **258 passed / 0 failed / 2 ignored**；崩溃注入 6 阶段逐条打印绿；`契约向量 32 条与 Swift 期望一致`；**`real media matrix` → `test result: ok. 2 passed; 0 failed … 258 filtered out`** —— 这条门禁历史上第一次在 Linux 用真引擎转绿 |
+| `windows-tests` | success（连续第三次） | `cargo check --lib` 通过；`cargo test --lib` → running 262 / **260 passed / 0 failed / 2 ignored**；`win32_fs::tests::a_directory_yields_its_volume_id`、`a_file_and_its_directory_share_a_volume`、`available_space_is_a_positive_number_for_a_writable_directory` 三条**逐个 `... ok`**；`video::transaction::tests::available_space_answers_for_a_real_directory ... ok`；契约向量 32 条一致 |
+| `rust-tests-macos` | success | `cargo test --lib` → 268 / 0 / 2；`--features inproc-backends` → 268 / 0；崩溃注入绿 |
+| `appstore-tests` | success | `cargo test --no-default-features --features inproc-backends` → lib 260 / 0；集成 6 / 0 与 5 / 0 |
+| `frontend-tests` | success | 29 套件全绿（10k windowRows=20 基准照旧） |
+| `swift-checks` | success | 历史/备份/调度/契约自检全 `ok` |
+
+两条上一轮写着"只能等 Actions"的待证项因此同时关掉：
+
+1. **`-vsync` 这一支第一次被真老引擎兑现。** Ubuntu 装的是
+   `7:4.4.2-0ubuntu0.22.04.1`（日志 `Setting up ffmpeg …` 原行），它没有 `-fps_mode`：
+   真实矩阵现在能过，只能是探测选出了 `-vsync`，夹具与 `plan` 的 argv 都用了旧名，
+   产物还过了 §56 全量校验（时长/平均帧率在容差内）。这也反过来说明上一轮的红
+   **不是"CI 环境缺东西"**，而是我们确实把一台只认旧名的引擎的参数写死了新名。
+2. **Windows 的卷号与剩余空间原语拿到运行时结论。** `FILE_FLAG_BACKUP_SEMANTICS`
+   开目录句柄、`GetFileInformationByHandle` 的卷号一致性、`GetDiskFreeSpaceExW` 给出
+   正数，全部在 NTFS 上真跑过；P0-3 那条"编译检查通过不等于运行时成功"到此关闭，
+   上一轮我写下的过度声明也被真测试替代。
+
+仍要如实留着的一条：Windows / Linux 的 Direct 视频轨**依旧没有随包引擎**
+（`resources/video/bin` 只由 `build-macos` 投递）。现在的行为是能力矩阵回答
+`ffmpeg unavailable; build the bundled video runtime`，而不是拿 macOS 的 Mach-O 冒充
+可用再在 `spawn` 处炸 —— 这一条的缺口在打包投递与对应平台的编码器取证，不在源码里
+把错误改成静默。
+
 ### 仍未取证的部分（如实）
 
 - 本机交叉编译依旧不可行（`ring` 的 cc-rs 报 `'assert.h' file not found`），所以
@@ -1803,19 +1835,14 @@ App Store 组合编译失败 —— 三条特性组合实测 EXIT=0。
   `windows-tests` 作业取证** —— 这一条已经在 run 41235873134 上兑现（249 / 0）。
 - `binfmt` 格式门、`tool()` 的 `.exe`、Windows 版"读不出来"门已被 run 41265224402
   看过：`windows-tests` success，Linux 侧 `Exec format error` 消失、改为解析到 apt 的
-  ELF 引擎。仍未取证的两条：
-  - **`-vsync` 这一支本机无法验证** —— 本机只有 FFmpeg 9（旧名已删），没有 4.x 引擎
-    可试。探测逻辑的判别能力由负向对照证明（不存在的拼法 → 空串 → 编码前拒绝），
-    "4.4 认 `-vsync`"这件事只能由下一次 Actions 的 Linux 真实矩阵兑现。
-  - `win32_fs.rs` 新增的 3 条卷号/剩余空间测试在本机**不参与编译**，表达式已用
-    `--target x86_64-pc-windows-msvc` 的 std-only 桩过类型检查（EXIT=0），运行时
-    结论仍以下一次 Actions 为准。
-    这条探针本轮先自证了它不是假绿：第一版把测试原样放进 `#[cfg(test)] mod tests`
-    里跑，`--cfg test` 并**没有**让这段参与编译（rustc 反而回了一句"consider adding
-    `#[cfg(test)]`"，`use super::*` 报 unused）—— 一次 EXIT=0 的假证。改成剥掉
-    `#[cfg(test)]`/`#[test]` 让函数体作为普通代码编译，并先注入一条故意的类型错误
-    （`let _x: u32 = "not a number"`，必须报 `mismatched types`）确认这段真的在编译，
-    再撤掉错误取 EXIT=0。**一个不知道自己是否在跑的探针，和没有探针等价。**
+  ELF 引擎。上一轮记在这里的两条待证项（`-vsync` 分支、win32_fs 的 3 条新测试）
+  已由 run 41266916166 逐条兑现，见上表。
+  - 附带一条方法上的教训：目标类型检查的探针**必须先自证它在编译**。第一版把测试
+    原样留在 `#[cfg(test)]` 里，`--cfg test` 并**没有**让这段参与编译（rustc 反而提示
+    "consider adding `#[cfg(test)]`"、`use super::*` 报 unused）—— 那次 EXIT=0 是假的。
+    改成剥掉 `#[cfg(test)]`/`#[test]` 让函数体作为普通代码参与，并先注入一条故意的
+    类型错误确认会报错，再撤掉错误取 EXIT=0。**一个不知道自己是否在跑的探针，
+    和没有探针等价。**
 - Windows / Linux 产物仍未签名（无对应签名链），正式版的门禁照旧不通。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))
