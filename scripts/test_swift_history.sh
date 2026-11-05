@@ -53,6 +53,7 @@ xcrun swiftc \
   "$SRC_DIR/Services/OutputTransactionStore.swift" \
   "$SRC_DIR/Services/SourceIdentity.swift" \
   "$SRC_DIR/Services/SystemInfo.swift" \
+  "$SRC_DIR/Services/ImageMemory.swift" \
   "$SRC_DIR/Services/CompressionScheduler.swift" \
   "$SRC_DIR/Engine/CLIRunner.swift" \
   "$SRC_DIR/Engine/CompressionEngine.swift" \

@@ -262,10 +262,10 @@ do {
     makeFile(source, [1, 2, 3])
     let backup = store.ensureBackup(for: source)!
 
-    // 跨格式 replace：压缩结果是个新文件
+    // 跨格式 replace：压缩结果是个新文件；提交后原图位已腾空（原图被 retire）。
     let output = ((source as NSString).deletingPathExtension) + ".jpg"
     writeData(output, [5, 5, 5, 5])
-    writeData(source, [6, 6, 6])
+    try? FileManager.default.removeItem(atPath: source)
 
     var compressed = result(file: source, size: 4, outType: "jpg")
     compressed.outputPath = output
@@ -2376,14 +2376,15 @@ do {
     check(staged.publishIfPlaceholderMatches(to: claimedPath, placeholderIdentity: expected) != .published,
           "外部顶掉的占位绝不允许被盖")
     check(readBytes(claimedPath) == [1, 2, 3, 4], "外部内容一个字节都不许动")
-    // 无凭证（nil）路径退回普通 publish：直接提交（外部内容会被盖，调用方语义自担）。
+    // 无凭证（nil）路径必须失败关闭：证明不了占位归属就不许 rename，
+    // 目标位上的字节原样保留（与 Rust `publish_claimed` 同一裁决）。
     guard let stagedPlain = StagedWrite.claim(target: claimedPath) else {
         check(false, "无凭证路径的临时名该认领成功"); exit(1)
     }
     check(stagedPlain.writeSynced(Data([7, 7])), "无凭证路径的候选该写满落盘")
-    check(stagedPlain.publishIfPlaceholderMatches(to: claimedPath, placeholderIdentity: nil) == .published,
-          "无凭证路径按普通发布处理")
-    check(readBytes(claimedPath) == [7, 7], "无凭证发布落位")
+    check(stagedPlain.publishIfPlaceholderMatches(to: claimedPath, placeholderIdentity: nil) == .refused,
+          "无凭证路径必须拒绝提交，不许退化成普通 rename")
+    check(readBytes(claimedPath) == [1, 2, 3, 4], "无凭证拒绝之后外部内容原样")
 }
 // ─── 45. §28 审查修复（P0-2）：临时路径归属门、保护标记与跨格式隔离 ──────────
 print("[45] §28 P0-2 临时归属门 / 保护标记 / 交换失败现场 / 跨格式隔离复验")
@@ -2721,6 +2722,100 @@ do {
     check(txnSource.components(separatedBy: "TempOwnership.protectForeignBytes(from: self.temp, nextTo: target)").count - 1 == 2,
           "两处交换回滚失败都必须把外部字节交给保护处置")
     chmod(roDir, 0o700)
+}
+
+// ─── 46. R2 加固：内存预算 / 隔离凭证 / 恢复幂等与拒绝覆盖 ───────────────────
+print("[46] 内存预算 / 隔离名凭证 / 恢复幂等 / 恢复拒绝覆盖外来文件")
+do {
+    // ① 内存估算：宽×高×通道×3，溢出不许回绕。
+    check(ImageMemory.estimateBytes(width: 100, height: 100, channels: 4) == 100 * 100 * 4 * 3,
+          "解码估算按 宽×高×通道×安全系数 记账")
+    check(ImageMemory.estimateBytes(width: 0, height: 100, channels: 4) == ImageMemory.unknownEstimateBytes,
+          "尺寸读不出来按一张大图兜底")
+    check(ImageMemory.estimateBytes(width: Int.max, height: Int.max, channels: 4) == Int.max,
+          "溢出不许回绕成一个小数：那等于把超大图当成小图放行")
+    check(ImageMemory.channels(forExtension: "JPG") == 3 && ImageMemory.channels(forExtension: "png") == 4,
+          "通道数按最坏情况记账：JPEG 3、其余 4")
+    let budget = ImageMemory.budgetBytes()
+    check(budget >= ImageMemory.minBudgetBytes && budget <= ImageMemory.maxBudgetBytes,
+          "解码预算夹在 256 MiB…2 GiB")
+
+    // ② 调度器三档：超大图独占；小图照常并发；释放后总账归零。
+    let memScheduler = CompressionScheduler(maxParallelism: 8)
+    let huge = ImageMemory.maxBudgetBytes  // 必然 > budget/2
+    guard case .acquired(let hugePermit) = memScheduler.acquireOutcome(cancelled: { false }, memoryBytes: huge) else {
+        check(false, "空闸门必须放行第一张图（哪怕是超大图）"); exit(1)
+    }
+    // 超大图在跑：第二张（哪怕很小）不许开工。
+    let blocked = DispatchSemaphore(value: 0)
+    let worker = Thread {
+        _ = memScheduler.acquireOutcome(cancelled: { false }, memoryBytes: 1_000_000)
+        blocked.signal()
+    }
+    worker.start()
+    check(blocked.wait(timeout: .now() + 0.6) == .timedOut,
+          "超大图必须独占：它在跑的时候不许再开下一个任务")
+    hugePermit.release()
+    check(blocked.wait(timeout: .now() + 3) == .success,
+          "超大图释放之后等待者必须被唤醒")
+    memScheduler.stop()
+
+    // ③ 隔离名认领带凭证；凭证对不上时拒绝往这个名字上改名。
+    let dir46 = freshRoot("46")
+    let victim = canonicalPath(dir46 + "/p.png")
+    makeFile(victim, [1, 2, 3])
+    guard let claim = OriginalRetirement.claimQuarantine(for: victim) else {
+        check(false, "隔离名该认领成功"); exit(1)
+    }
+    check(claim.isStillOurs, "刚认领的隔离占位凭证必须对得上")
+    try? FileManager.default.removeItem(atPath: claim.path)
+    writeData(claim.path, [9, 9])
+    check(!claim.isStillOurs, "隔离占位被换成外来文件后凭证必须对不上")
+    try? FileManager.default.removeItem(atPath: claim.path)
+
+    // ④ retireConfirmed：用户确认的删除照常成立，路径上不留隔离残留。
+    let confirmed = canonicalPath(dir46 + "/c.jpg")
+    makeFile(confirmed, [4, 5, 6])
+    check(OriginalRetirement.retireConfirmed(file: confirmed) == nil, "确认过的文件删除必须成功")
+    check(!FileManager.default.fileExists(atPath: confirmed), "确认过的文件确实删掉了")
+
+    // ⑤ 恢复幂等：写回成功但历史没落盘 —— 再点一次收敛成 alreadyRestored。
+    let root = freshRoot("46-idem")
+    let store = HistoryStore(root: root)
+    let source = canonicalPath(NSTemporaryDirectory() + "sizqo-check-46/idem.png")
+    makeFile(source, [1, 2, 3])
+    let backup = store.ensureBackup(for: source)!
+    writeData(source, [9, 9, 9])   // 模拟压缩产物覆盖了源位置
+    let entry = HistoryEntry.record(source: source, result: result(file: source, size: 3),
+                                    output: source, backup: backup, retentionDays: 3)
+    store.add(entry)
+    // 模拟"上次恢复写回了原图、但历史状态没落盘"：源位已是原图字节。
+    writeData(source, [1, 2, 3])
+    let restored = try? store.restore(entry: store.list()[0], force: false)
+    check(restored?.alreadyRestored == true, "已恢复的原图必须识别为 alreadyRestored，不许再要 force")
+    check(readBytes(source) == [1, 2, 3], "幂等收敛不许改动原图")
+
+    // ⑥ 跨格式恢复：源位被外部文件占住 → 拒绝覆盖，备份与产物都留着。
+    let root2 = freshRoot("46-foreign")
+    let store2 = HistoryStore(root: root2)
+    let source2 = canonicalPath(NSTemporaryDirectory() + "sizqo-check-46/photo.png")
+    makeFile(source2, [1, 1, 1])
+    let backup2 = store2.ensureBackup(for: source2)!
+    let output2 = ((source2 as NSString).deletingPathExtension) + ".jpg"
+    writeData(output2, [5, 5, 5, 5])
+    var compressed2 = result(file: source2, size: 4, outType: "jpg")
+    compressed2.outputPath = output2
+    let entry2 = HistoryEntry.record(source: source2, result: compressed2, output: output2,
+                                     backup: backup2, retentionDays: 3)
+    store2.add(entry2)
+    writeData(source2, [7, 7, 7])   // 用户在腾空的源位上放了自己的文件
+    var refused = false
+    do { _ = try store2.restore(entry: store2.list()[0], force: false) }
+    catch { refused = true }
+    check(refused, "源位被外部文件占住时恢复必须拒绝")
+    check(readBytes(source2) == [7, 7, 7], "外来文件一个字节都不许动")
+    check(FileManager.default.fileExists(atPath: output2), "产物还在（没有被提前清掉）")
+    check(FileManager.default.fileExists(atPath: backup2), "备份还在")
 }
 
 runContractVectors()

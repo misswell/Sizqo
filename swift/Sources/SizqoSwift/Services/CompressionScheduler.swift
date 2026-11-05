@@ -34,6 +34,11 @@ final class CompressionScheduler: @unchecked Sendable {
     private var maintenanceActive = false
     private var maxParallelism: Int
     private var active = 0
+    /// §9 R2 内存账：正在跑的任务记下的解码预算总量。
+    /// 只数"几个任务"挡不住 6 张大 TIFF 同时解码 —— CPU 名额够、内存先爆。
+    private var memoryUsage = 0
+    /// 解码预算上限（物理内存的 1/4，夹在 256 MiB…2 GiB），构造时取一次。
+    private let memoryBudget = ImageMemory.budgetBytes()
 
     static let minParallelism = CPULimit.minParallelism
 
@@ -232,7 +237,11 @@ final class CompressionScheduler: @unchecked Sendable {
     /// 取消 → 停止 → 暂停/名额。取消排最前，是为了让"暂停中被取消的文件"能立刻退出；
     /// 停止排在暂停之前，是为了让"暂停中按停止"能真的结束整批，而不是继续堵在
     /// 关着的闸门上等用户点「继续」（那正是「停止」的反面）。
-    func acquireOutcome(cancelled: () -> Bool) -> AcquireOutcome {
+    ///
+    /// §9 R2：`memoryBytes` 是这张图预计的解码占用。三档与 Rust `try_acquire_with_memory`
+    /// 同一条：小图吃满 CPU；大图让总账不超过预算才开工；超大图（> 预算一半）独占。
+    /// `active == 0` 时永远放行 —— 一张图再大也得能压，否则整批会死等。
+    func acquireOutcome(cancelled: () -> Bool, memoryBytes: Int = 0) -> AcquireOutcome {
         condition.lock()
         while true {
             if cancelled() {
@@ -243,31 +252,51 @@ final class CompressionScheduler: @unchecked Sendable {
                 condition.unlock()
                 return .stopped
             }
-            if !paused && active < maxParallelism { break }
+            let admission = memoryAdmission(memoryBytes)
+            if !paused && active < maxParallelism && admission { break }
             _ = condition.wait(until: Date(timeIntervalSinceNow: 0.25))
         }
         active += 1
+        memoryUsage += max(0, memoryBytes)
         condition.unlock()
-        return .acquired(Permit(scheduler: self))
+        return .acquired(Permit(scheduler: self, memoryBytes: memoryBytes))
     }
 
-    fileprivate func release() {
+    /// 内存三档：调用方必须已持有 `condition` 锁。
+    private func memoryAdmission(_ memoryBytes: Int) -> Bool {
+        let requested = max(0, memoryBytes)
+        // 超大图（单项超过预算一半）独占：它在跑的时候不许再开下一个任务。
+        let exclusive = requested > memoryBudget / 2
+        if exclusive && active > 0 { return false }
+        // 一张图都没有时永远放行：否则一张超大图会让整批永远等下去。
+        if active == 0 { return true }
+        if exclusive { return false }
+        // 大图：总账不超预算才再开。普通小图自然会通过这一条。
+        let (sum, overflow) = memoryUsage.addingReportingOverflow(requested)
+        return !overflow && sum <= memoryBudget
+    }
+
+    fileprivate func release(memoryBytes: Int) {
         condition.lock()
         active = max(0, active - 1)
+        memoryUsage = max(0, memoryUsage - max(0, memoryBytes))
         condition.broadcast()
         condition.unlock()
     }
 
-    /// 一份 CPU 并行预算。忘记 release 也不会永久泄漏 —— deinit 兜底归还。
+    /// 一份 CPU 并行预算（外加它记下的内存账）。忘记 release 也不会永久泄漏 ——
+    /// deinit 兜底归还。
     final class Permit: @unchecked Sendable {
         private var scheduler: CompressionScheduler?
+        private let memoryBytes: Int
 
-        init(scheduler: CompressionScheduler) {
+        init(scheduler: CompressionScheduler, memoryBytes: Int = 0) {
             self.scheduler = scheduler
+            self.memoryBytes = memoryBytes
         }
 
         func release() {
-            scheduler?.release()
+            scheduler?.release(memoryBytes: memoryBytes)
             scheduler = nil
         }
 

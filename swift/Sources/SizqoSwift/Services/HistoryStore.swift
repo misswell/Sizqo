@@ -391,6 +391,14 @@ struct RestoreOutcome {
 struct RestoreResult {
     let historyIds: [String]
     let warning: String?
+    /// §46 幂等：这次点击没有真正写回，只是把"上次其实已经恢复"的状态收敛掉。
+    let alreadyRestored: Bool
+
+    init(historyIds: [String], warning: String?, alreadyRestored: Bool = false) {
+        self.historyIds = historyIds
+        self.warning = warning
+        self.alreadyRestored = alreadyRestored
+    }
 }
 
 // MARK: - 历史存储
@@ -1226,15 +1234,82 @@ final class HistoryStore: @unchecked Sendable {
     /// 跨格式 replace（PNG → JPG）时压缩结果是个新文件，恢复后不该留下孤儿。
     /// 同格式 replace 的输出就是源文件本身，绝不许删。
     /// 返回非 nil = 原图已经写回，但产物没能删掉：恢复算成功，清理失败必须让用户看见。
+    ///
+    /// 归属门（与 Rust `remove_generated_output` 同条）：只有内容指纹对得上才删；
+    /// 旧记录没有指纹时按大小（> 0）有界删除。删除本身走隔离 + 身份复核的
+    /// `retire`，检查与删除之间被外部换掉的文件不再被误删。
     private static func removeGeneratedOutput(_ entry: HistoryEntry) -> String? {
         guard let output = entry.outputPath else { return nil }
         guard !sameFile(output, entry.sourcePath) else { return nil }
         guard fileExists(at: output) else { return nil }
-        do {
-            try FileManager.default.removeItem(atPath: output)
-            return nil
-        } catch {
-            return "原图已恢复，但压缩结果未能删除：\(output)"
+        let ours: Bool
+        if let expected = entry.outputSha256 {
+            switch sha256OfFile(output) {
+            case .success(let actual): ours = actual == expected
+            case .failure: ours = false
+            }
+        } else {
+            ours = entry.compressedSize > 0 && fileLength(output) == entry.compressedSize
+        }
+        guard ours else {
+            // 用户编辑过这份产物：保留它，恢复照样算成功（这才是磁盘上的实情）。
+            return "原图已恢复；压缩结果已被修改，未删除：\(output)"
+        }
+        guard case .success(let identity) = SourceIdentity.read(output) else {
+            return "原图已恢复，但读不出压缩结果的当前状态，未删除：\(output)"
+        }
+        var baseline = identity
+        baseline.sha256 = entry.outputSha256
+        if let detail = OriginalRetirement.retire(file: output, baseline: baseline) {
+            return "原图已恢复，但压缩结果未能删除：\(detail)"
+        }
+        return nil
+    }
+
+    /// 恢复写回的提交原语（同 Rust `write_back_verified`）：先原子交换、
+    /// 再验证被换出来的字节正是历史记录里的产物（`baseline`），对不上换回撤销。
+    /// 交换不可用时由 `publishReplaceIfIdentityMatches` 内部走隔离路线 ——
+    /// 绝不回到"看一眼再 rename"。
+    static func writeBackupVerifyingProduct(
+        backup: String, target: String, baseline: String
+    ) throws {
+        guard var staged = StagedWrite.claim(target: target) else {
+            throw RestoreError.io("无法在目标旁边独占一个恢复临时文件名")
+        }
+        guard staged.copySynced(from: backup) else {
+            staged.discard()
+            throw RestoreError.io("无法写入恢复临时文件")
+        }
+        switch staged.publishReplaceIfIdentityMatches(to: target, baselineSha256: baseline) {
+        case .published:
+            return
+        case .refused:
+            throw RestoreError.io("目标文件在提交前一刻被外部改动；恢复已撤销，你现在的版本保持原样")
+        case .publishedButNotDurable:
+            throw RestoreError.io("原图已写回，但目标目录未能落盘，请再点一次恢复确认")
+        case .swappedButUnrecovered(let detail):
+            throw RestoreError.io("目标文件在提交前一刻被外部改动，交换回滚也失败：\(detail)")
+        }
+    }
+
+    /// 把备份放进一个**应当是空位**的原图位（跨格式提交后的空位 / 源文件被删）。
+    /// 三级台阶装进去；被外部占了就拒绝 —— 那个位置上的字节不是我们承诺恢复的东西，
+    /// 无条件 rename 会把用户的文件盖掉（同 Rust `write_back_to_vacated_path`）。
+    static func installBackupAtVacatedPath(backup: String, target: String) throws {
+        let staged = StagedWrite.claim(target: target)
+        guard let staged else {
+            throw RestoreError.io("无法在目标旁边独占一个恢复临时文件名")
+        }
+        guard staged.copySynced(from: backup) else {
+            staged.discard()
+            throw RestoreError.io("无法写入恢复临时文件")
+        }
+        guard OutputTransactionStore.installNoClobber(staged.temp, to: target) else {
+            staged.discard()
+            throw RestoreError.io("原位置已被其他文件占用，恢复拒绝覆盖")
+        }
+        if !syncDirectory(at: (target as NSString).deletingLastPathComponent) {
+            throw RestoreError.io("恢复目标目录未能落盘")
         }
     }
 
@@ -1247,20 +1322,50 @@ final class HistoryStore: @unchecked Sendable {
     @discardableResult
     func restore(entry: HistoryEntry, force: Bool, acceptLegacy: Bool = false) throws -> RestoreResult {
         guard entry.status != .restored else { throw RestoreError.notRestorable }
+        let crossFormat = entry.outputPath.map { !sameFile($0, entry.sourcePath) } ?? false
         guard entry.outputMode == "replace" else {
             // 后缀/目录模式原图从未被改动：撤销 = 删掉这次生成的压缩结果。
             // 产物被用户改过时先要 force：与 replace 模式同一份判据，不许静默丢编辑。
             // 有产物指纹的记录按 SHA-256 判（conflictState）；旧记录弱验证同 Rust。
             if !force && Self.hasConflict(entry) { throw RestoreError.conflict }
             if let output = entry.outputPath, fileExists(at: output) {
-                do {
-                    try FileManager.default.removeItem(atPath: output)
-                } catch {
-                    throw RestoreError.io(error.localizedDescription)
+                // 删除走隔离 + 身份复核：检查到删除之间被外部换掉的文件不再被误删
+                // （同 Rust F6）。force = 用户确认删掉被编辑过的产物：内容复核放行，
+                // 但隔离认领与占位身份复核保留。
+                if force {
+                    if let detail = OriginalRetirement.retireConfirmed(file: output) {
+                        throw RestoreError.io(detail)
+                    }
+                } else {
+                    guard case .success(let identity) = SourceIdentity.read(output) else {
+                        throw RestoreError.io("读不出压缩结果的当前状态，已保留该文件")
+                    }
+                    var baseline = identity
+                    baseline.sha256 = entry.outputSha256
+                    if let detail = OriginalRetirement.retire(file: output, baseline: baseline) {
+                        throw RestoreError.io(detail)
+                    }
                 }
             }
             try removeIds([entry.id])
             return RestoreResult(historyIds: [entry.id], warning: nil)
+        }
+        // §46 幂等（与 Rust 同条）：当前源位置已经是原图指纹 —— 上次写回成功、
+        // 状态没落盘。直接收敛，不再要求 force，也不把原图误判成外部修改。
+        if let recorded = entry.sourceSha256,
+           case .success(let current) = sha256OfFile(entry.sourcePath),
+           current == recorded {
+            let shared = siblingsSharingBackup(entry)
+            let ids = shared.isEmpty ? [entry.id] : shared
+            guard markRestored(ids) else {
+                throw RestoreError.io("原图已经在原位，但历史记录状态保存失败")
+            }
+            // 上次的清理可能也没做完：孤儿产物/备份尽力收掉，失败不影响这次收敛。
+            let warning = Self.removeGeneratedOutput(entry)
+            if let dir = entry.backupPath.flatMap(Self.backupDir(ofBackupPath:)) {
+                _ = removeDirectory(dir)
+            }
+            return RestoreResult(historyIds: ids, warning: warning, alreadyRestored: true)
         }
         if !force && Self.hasConflict(entry) { throw RestoreError.conflict }
         guard let backup = entry.backupPath, fileExists(at: backup) else {
@@ -1282,9 +1387,51 @@ final class HistoryStore: @unchecked Sendable {
         case .unreadable:
             throw RestoreError.io("原图备份读不出来，已停止恢复")
         }
+        // §5 R1（与 Rust 同条）：跨格式提交后原图位应当腾空 —— 位置上放着别的文件
+        // 就是拒绝，绝不 rename 盖掉用户的字节。同格式且源位在：走"交换+验产物"
+        // 的提交原语；源位已空（用户删掉了产物）按空位装回。
+        //
+        // 唯一例外：源位上的字节**证明得了**是本次产物（老版本跨格式残留的副本，
+        // 哈希 == 记录里的产物指纹）。那是我们自己写出去的字节，不是用户的文件，
+        // 允许走交换+复核换掉 —— 否则老记录会永远恢复不了。
+        var crossFormatResidueBaseline: String?
+        if crossFormat, fileExists(at: entry.sourcePath) {
+            if let recorded = entry.outputSha256,
+               case .success(let current) = sha256OfFile(entry.sourcePath),
+               current == recorded {
+                crossFormatResidueBaseline = recorded
+            } else {
+                throw RestoreError.io(
+                    "原位置已存在其他文件（\(entry.sourcePath)），恢复拒绝覆盖；请先确认那个文件的去留")
+            }
+        }
         let ids = siblingsSharingBackup(entry)
         let backupDirectory = entry.backupPath.flatMap(Self.backupDir(ofBackupPath:))
-        try Self.writeBackupBack(to: entry.sourcePath, backup: backup)
+        if let residue = crossFormatResidueBaseline {
+            try Self.writeBackupVerifyingProduct(
+                backup: backup, target: entry.sourcePath, baseline: residue)
+        } else if crossFormat || !fileExists(at: entry.sourcePath) {
+            try Self.installBackupAtVacatedPath(backup: backup, target: entry.sourcePath)
+        } else {
+            // 预期产物身份：force = 用户确认覆盖当前位置的内容，内容复核放行，
+            // 但"交换窗口里被替换"照样拒绝（身份门保留）。非 force 用记录里的
+            // 产物指纹；老记录没有指纹时钉住"提交这一刻它是什么"（与 Rust 一致）。
+            let baseline: String
+            if force {
+                guard case .success(let current) = sha256OfFile(entry.sourcePath) else {
+                    throw RestoreError.io("读不出当前文件的当前状态，已停止恢复")
+                }
+                baseline = current
+            } else if let recorded = entry.outputSha256 {
+                baseline = recorded
+            } else if case .success(let current) = sha256OfFile(entry.sourcePath) {
+                baseline = current
+            } else {
+                throw RestoreError.io("读不出当前文件的当前状态，已停止恢复")
+            }
+            try Self.writeBackupVerifyingProduct(
+                backup: backup, target: entry.sourcePath, baseline: baseline)
+        }
         guard markRestored(ids) else {
             // 文件已经回到原图，但状态没落盘：备份必须留着，用户重试即可收敛。
             throw RestoreError.io("文件已恢复，但历史记录状态保存失败，原图备份已保留")
@@ -1449,12 +1596,13 @@ enum HistoryConflict {
 /// 两边都有自检钉住（`scripts/test_swift_history.sh` / `tests/history-view.cjs`）。
 func historyCanRestore(_ entry: HistoryEntry) -> Bool {
     if entry.status == .recoveryAvailable {
-        return entry.backupExists && entry.sourceExists
+        // 备份还在就够：源位置空着（被外部删掉）正是最该写回的场景。
+        return entry.backupExists
     }
-    return entry.status == .compressed
-        && entry.outputMode == "replace"
-        && entry.backupExists
-        && entry.sourceExists
+    // §76 恢复只取决于「原图备份还在不在」：后端把"源位置不存在"的 compressed
+    // 装饰成 missing，那说的是同一个事实 —— 产物没了、备份还在，恢复照给。
+    guard entry.outputMode == "replace", entry.backupExists else { return false }
+    return entry.status == .compressed || entry.status == .missing
 }
 
 enum HistoryRowAction: Hashable {

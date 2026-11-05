@@ -211,6 +211,18 @@ const actionsOf = row => row.querySelector('.media-actions').children
   // 但覆盖模式不一样：产物被删了，原图备份还在 → 恢复必须照给，那才是这条记录的意义。
   assert.ok(actionsOf(context.historyRow(entry({ outputExists: false }))).includes('restore'),
     '压缩结果被删不影响"换回原图"');
+  // 后端在"源位置不存在"时会把 compressed 读时装饰成 missing（history.rs decorate）：
+  // 那说的是同一个事实 —— 产物没了、备份还在，恢复入口不许因此被收走。
+  assert.ok(
+    actionsOf(context.historyRow(entry({
+      status: 'missing', sourceExists: false, outputExists: false,
+    }))).includes('restore'),
+    '源位置被外部删掉（missing）时，备份还在就必须保留恢复入口');
+  assert.ok(
+    !actionsOf(context.historyRow(entry({
+      status: 'missing', sourceExists: false, outputExists: false, backupExists: false,
+    }))).includes('restore'),
+    'missing 且备份也没了：恢复入口收起');
   // 备份被清掉：恢复不许继续挂在页面上骗人，也不能退化成删源文件。
   assert.deepEqual(
     actionsOf(context.historyRow(entry({ backupExists: false }))),

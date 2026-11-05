@@ -39,6 +39,10 @@ enum OutputWriteError {
     /// §24 连"这份文件是什么"都读不出来（stat 失败 / 内容指纹读不动）。
     /// 编码前就走到这里的话，原图一个字节都没被碰过。
     case sourceUnreadable(String)
+    /// 用户在提交之前取消了这一项（清空队列 / 移出队列 / 取消）：
+    /// 本次自己的临时文件与占位名收回，原图一个字节都没动，历史一条都不记。
+    /// 一旦进入原子提交就不再接受取消 —— 那之后只能等收尾（与 Rust commit 闸同语义）。
+    case cancelled
 
     var userMessage: String {
         switch self {
@@ -61,6 +65,8 @@ enum OutputWriteError {
             return "这个文件在压缩期间被改动过，已放弃覆盖，你现在的版本保持原样（\(detail)）"
         case .sourceUnreadable(let detail):
             return "读不出这个文件的当前状态，已跳过覆盖（\(detail)）"
+        case .cancelled:
+            return "已取消，原图未改动"
         }
     }
 
@@ -76,6 +82,7 @@ enum OutputWriteError {
         case .collision: return .outputCollision
         case .sourceChanged: return .sourceChanged
         case .sourceUnreadable: return .sourceReadFailed
+        case .cancelled: return .cancelled
         }
     }
 }
@@ -526,6 +533,13 @@ struct StagedWrite {
         return true
     }
 
+    /// 从已有文件整份复制进已独占的临时名并 fsync（恢复原图用：备份可能有几百 MB，
+    /// 由内核完成复制、不整份进内存，与 Rust `copy_staged` 同一职责）。
+    func copySynced(from source: String) -> Bool {
+        guard copyFileOverwriting(from: source, to: temp) else { return false }
+        return syncFile(at: temp)
+    }
+
     /// 写满 + fsync + 记录候选指纹（discard 身份门用）。
     mutating func writeSyncedRecording(_ bytes: Data) -> Bool {
         guard writeSynced(bytes) else { return false }
@@ -640,27 +654,32 @@ struct StagedWrite {
         to target: String, baselineSha256: String
     ) -> PublishOutcome {
         let tempPath = self.temp
-        guard let quarantine = OriginalRetirement.claimQuarantineName(for: target) else {
+        guard let quarantine = OriginalRetirement.claimQuarantine(for: target) else {
             discard()
             return .refused
         }
-        guard Darwin.rename(target, quarantine) == 0 else {
-            _ = Darwin.unlink(quarantine)
+        guard quarantine.isStillOurs else {
+            // 隔离占位在认领之后被外部换成自己的文件：往这个名字上改名就是覆盖。
             discard()
             return .refused
         }
-        guard case .success(let moved) = sha256OfFile(quarantine), moved == baselineSha256 else {
-            _ = OriginalRetirement.restoreQuarantined(quarantine, to: target)
+        guard Darwin.rename(target, quarantine.path) == 0 else {
+            _ = Darwin.unlink(quarantine.path)
+            discard()
+            return .refused
+        }
+        guard case .success(let moved) = sha256OfFile(quarantine.path), moved == baselineSha256 else {
+            _ = OriginalRetirement.restoreQuarantined(quarantine.path, to: target)
             discard()
             return .refused
         }
         guard OutputTransactionStore.installNoClobber(tempPath, to: target) else {
-            _ = OriginalRetirement.restoreQuarantined(quarantine, to: target)
+            _ = OriginalRetirement.restoreQuarantined(quarantine.path, to: target)
             discard()
             return .refused
         }
         // 被换出的原图：前面已经复验过，备份里还有一份可信副本，这份可以收走。
-        _ = Darwin.unlink(quarantine)
+        _ = Darwin.unlink(quarantine.path)
         return syncDirectory(at: (target as NSString).deletingLastPathComponent)
             ? .published : .publishedButNotDurable
     }
@@ -679,9 +698,14 @@ struct StagedWrite {
     func publishIfPlaceholderMatches(
         to target: String, placeholderIdentity: (device: Int64, inode: UInt64)?
     ) -> PublishOutcome {
-        guard let expected = placeholderIdentity else {
-            return publish(to: target) ? .published : .refused
+        guard placeholderIdentity != nil else {
+            // 无凭证 = 证明不了占位归属。以前这里退化成普通 rename（可覆盖任何
+            // 此刻躺在目标位上的文件）；现在按失败关闭拒绝提交（与 Rust
+            // `publish_claimed` 同一裁决）。同格式覆盖不受影响：它走 baseline 哈希。
+            discard()
+            return .refused
         }
+        let expected = placeholderIdentity!
         // 候选必须已经写满并 fsync（writeSynced），这里只负责原子顶替。
         let swap = { () -> Bool in
             OutputTransactionStore.atomicSwap(self.temp, target)
@@ -721,28 +745,32 @@ struct StagedWrite {
     private func publishPlaceholderViaQuarantine(
         to target: String, placeholderIdentity expected: (device: Int64, inode: UInt64)
     ) -> PublishOutcome {
-        guard let quarantine = OriginalRetirement.claimQuarantineName(for: target) else {
+        guard let quarantine = OriginalRetirement.claimQuarantine(for: target) else {
             discard()
             return .refused
         }
-        guard Darwin.rename(target, quarantine) == 0 else {
-            _ = Darwin.unlink(quarantine)
+        guard quarantine.isStillOurs else {
             discard()
             return .refused
         }
-        guard let moved = OutputTransactionStore.fileIdentity(quarantine),
+        guard Darwin.rename(target, quarantine.path) == 0 else {
+            _ = Darwin.unlink(quarantine.path)
+            discard()
+            return .refused
+        }
+        guard let moved = OutputTransactionStore.fileIdentity(quarantine.path),
               moved.device == expected.device, moved.inode == expected.inode else {
-            _ = OutputTransactionStore.restoreQuarantine(quarantine, to: target)
+            _ = OutputTransactionStore.restoreQuarantine(quarantine.path, to: target)
             discard()
             return .refused
         }
         guard OutputTransactionStore.installNoClobber(self.temp, to: target) else {
-            _ = OutputTransactionStore.restoreQuarantine(quarantine, to: target)
+            _ = OutputTransactionStore.restoreQuarantine(quarantine.path, to: target)
             discard()
             return .refused
         }
         // 换出来的就是我们那个 0 字节占位：提交成立，收走隔离名。
-        _ = Darwin.unlink(quarantine)
+        _ = Darwin.unlink(quarantine.path)
         return syncDirectory(at: (target as NSString).deletingLastPathComponent)
             ? .published : .publishedButNotDurable
     }
@@ -770,20 +798,51 @@ struct StagedWrite {
 ///      原位被外部占了就用原子交换顶回来。
 /// 任何一条路走不通，结果都是"字节还在磁盘上" + 一句说实话的警告。
 enum OriginalRetirement {
-    /// 在同目录独占认领一个隔离名（O_EXCL）：改名过去不可能盖掉任何人的文件。
-    static func claimQuarantineName(for file: String) -> String? {
+    /// 一次隔离名认领：路径 + 占位的 `(dev,ino)` 凭证（从还开着的句柄上取）。
+    struct QuarantineClaim {
+        let path: String
+        let identity: (device: Int64, inode: UInt64)?
+
+        /// 占位还是我们的吗？对不上 = O_EXCL 占位被外部换成自己的文件，
+        /// 此时改名过去就是覆盖 —— 必须拒绝（与 Rust `quarantined_still_ours` 同条）。
+        var isStillOurs: Bool {
+            guard let expected = identity,
+                  let actual = OutputTransactionStore.fileIdentity(path) else {
+                // 证明不了归属：不碰。
+                return false
+            }
+            return actual.device == expected.device && actual.inode == expected.inode
+        }
+    }
+
+    /// 在同目录独占认领一个隔离名（O_EXCL）：改名过去不可能盖掉任何人的文件 ——
+    /// 前提是动手之前核得出这个名字还在我们手里。凭证从**还开着的句柄**取：
+    /// 关掉句柄再按路径 stat，两步之间路径就可能换一个 inode。
+    static func claimQuarantine(for file: String) -> QuarantineClaim? {
         let directory = (file as NSString).deletingLastPathComponent
         for _ in 0..<16 {
             let candidate = (directory as NSString).appendingPathComponent(
                 ".sizqo-retire-\(UUID().uuidString.lowercased()).keep")
             let handle = Darwin.open(candidate, O_WRONLY | O_CREAT | O_EXCL, 0o600)
             if handle >= 0 {
+                var info = stat()
+                let identity: (device: Int64, inode: UInt64)?
+                if fstat(handle, &info) == 0 {
+                    identity = (device: Int64(info.st_dev), inode: UInt64(info.st_ino))
+                } else {
+                    identity = nil
+                }
                 Darwin.close(handle)
-                return candidate
+                return QuarantineClaim(path: candidate, identity: identity)
             }
             if errno != EEXIST { return nil }
         }
         return nil
+    }
+
+    /// 只要路径的形态（给测试与不需要凭证的调用方）。
+    static func claimQuarantineName(for file: String) -> String? {
+        claimQuarantine(for: file)?.path
     }
 
     /// 隔离后的字节回到原位的结果，三种现场各有各的实话。
@@ -833,30 +892,56 @@ enum OriginalRetirement {
         if case .changed(let detail) = baseline.fingerprintIntact(at: file) {
             return "原文件在提交窗口内被外部修改（\(detail)），已保留"
         }
-        guard let quarantine = claimQuarantineName(for: file) else {
+        guard let quarantine = claimQuarantine(for: file) else {
             return "无法在原图旁边独占一个隔离名（\(errorText())），原图已保留"
         }
-        guard Darwin.rename(file, quarantine) == 0 else {
+        guard quarantine.isStillOurs else {
+            return "隔离名上的占位已不是本次认领的那个，放弃覆盖以保护它，原图已保留"
+        }
+        guard Darwin.rename(file, quarantine.path) == 0 else {
             let detail = errorText()
-            try? FileManager.default.removeItem(atPath: quarantine)
+            try? FileManager.default.removeItem(atPath: quarantine.path)
             return "原图改名隔离失败（\(detail)），已保留"
         }
         // ③ 复验：改名之后这条路径归我们独占，此刻的字节就是即将被删的字节。
         //    这里必须是完整 verify —— 快速门看不出"同大小、同时间戳"的原地改写。
-        if case .changed(let detail) = baseline.verify(at: quarantine) {
-            return restoredMessage(restoreQuarantined(quarantine, to: file), detail: detail)
+        if case .changed(let detail) = baseline.verify(at: quarantine.path) {
+            return restoredMessage(restoreQuarantined(quarantine.path, to: file), detail: detail)
         }
         // ④ 删除前再看一眼体积：改名不会让外部**已经持有**的文件句柄失效，复验通过
         //    之后那支 fd 仍能往同一个 inode 里追加。这一眼拦得住"又长了字节"的那一类；
         //    同长度原地改写的兜底是覆盖前就做好的原图备份，不是这里。
-        let current = fileLength(quarantine)
+        let current = fileLength(quarantine.path)
         if current != baseline.size {
-            return restoredMessage(restoreQuarantined(quarantine, to: file),
+            return restoredMessage(restoreQuarantined(quarantine.path, to: file),
                                    detail: "体积 \(baseline.size) → \(current)")
         }
-        guard (try? FileManager.default.removeItem(atPath: quarantine)) != nil else {
-            return restoredMessage(restoreQuarantined(quarantine, to: file),
+        guard (try? FileManager.default.removeItem(atPath: quarantine.path)) != nil else {
+            return restoredMessage(restoreQuarantined(quarantine.path, to: file),
                                    detail: errorText(), action: "原图删除失败")
+        }
+        return nil
+    }
+
+    /// 用户**明确确认**要删的文件走这条路（后缀撤销 + force）：跳过内容复核，
+    /// 但隔离认领与提交前身份复核一样不少 —— 确认的是"这份产物可以删"，
+    /// 不是"路径上随便什么都可以删"（与 Rust `retire_confirmed` 同条）。
+    /// `nil` = 已删除；非 nil = 保留，返回值给用户看。
+    static func retireConfirmed(file: String) -> String? {
+        guard let quarantine = claimQuarantine(for: file) else {
+            return "无法在文件旁边独占一个隔离名（\(errorText())），文件已保留"
+        }
+        guard quarantine.isStillOurs else {
+            return "隔离名上的占位已不是本次认领的那个，放弃覆盖以保护它，文件已保留"
+        }
+        guard Darwin.rename(file, quarantine.path) == 0 else {
+            let detail = errorText()
+            try? FileManager.default.removeItem(atPath: quarantine.path)
+            return "文件改名隔离失败（\(detail)），已保留"
+        }
+        guard (try? FileManager.default.removeItem(atPath: quarantine.path)) != nil else {
+            return restoredMessage(restoreQuarantined(quarantine.path, to: file),
+                                   detail: errorText(), action: "文件删除失败")
         }
         return nil
     }
@@ -1036,8 +1121,35 @@ final class OutputTransactionStore: @unchecked Sendable {
             }
             let restore: () -> String? = {
                 if let error = verifyBackupVoucher(txn) { return error }
-                do { try HistoryStore.writeBackupBack(to: txn.sourcePath, backup: txn.backupPath) }
-                catch let error as RestoreError { return error.detail }
+                // §5 R1 同 Rust：写回走带身份复核的提交原语，不再无条件 rename。
+                // 目标应当是空位（源文件已不在原位）→ 三级台阶装进去，被占就拒绝。
+                if !fileExists(at: txn.sourcePath) {
+                    do {
+                        try HistoryStore.installBackupAtVacatedPath(
+                            backup: txn.backupPath, target: txn.sourcePath)
+                    } catch let error as RestoreError { return error.detail }
+                    catch { return error.localizedDescription }
+                    removeGeneratedOutput(txn)
+                    return nil
+                }
+                // 源位上就是本次产物 → 先交换、再验被换出的字节正是它。
+                if case .failure = SourceIdentity.read(txn.sourcePath) {
+                    return "源位置身份读不出来，不自动覆盖；备份与事务日志保留在原处"
+                }
+                let baseline: String
+                if let recorded = txn.outputSha256 {
+                    baseline = recorded
+                } else if case .success(let current) = sha256OfFile(txn.sourcePath) {
+                    // 老日志没有产物指纹：钉住"提交这一刻它是什么"，至少拦得住
+                    // 交换窗口里的替换（与 Rust 同一处置）。
+                    baseline = current
+                } else {
+                    return "读不出当前源文件，不自动覆盖；备份与事务日志保留在原处"
+                }
+                do {
+                    try HistoryStore.writeBackupVerifyingProduct(
+                        backup: txn.backupPath, target: txn.sourcePath, baseline: baseline)
+                } catch let error as RestoreError { return error.detail }
                 catch { return error.localizedDescription }
                 removeGeneratedOutput(txn)
                 return nil

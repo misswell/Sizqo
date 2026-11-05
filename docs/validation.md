@@ -2542,12 +2542,30 @@ Windows 那一格第一次是红的：`restoring_a_quarantined_file_never_overwr
 Windows 分支（`identity_of_open` 的 `GetFileInformationByHandle` 支、`MoveFileExW`
 支）本机仍只能类型检查，取证要靠 `windows-tests`。
 
-### 尚未做（R2–R5，见路线图）
+### R2 已落地（Swift 任务生命周期 + 恢复入口 + 内存预算）
 
-Swift 取消链（compressOneStatic 零检查点）、Swift restore 幂等/指纹门、
-`canRestoreHistory` 的 Missing 入口、Swift 内存预算、EXIF orientation、
-Swift 动画拒绝、视频帧数/逐流元数据校验、probe 取消、FLAC 预算、
-视频输出占名、每文件来源根、导入诊断、UI 阶段呈现、macOS 真实矩阵。
+| 缺口 | 修法 | 守门测试 |
+| --- | --- | --- |
+| Swift 清空队列不拦提交（F9）：`compressOneStatic` 零取消检查点，编码照跑完、备份+覆盖+历史照写 | 取消令牌贯穿执行链：编码后闸、动手前闸、**提交前闸**（`writeOutputStatic` ⑤b，镜像 Rust `commit_output` 首行）；被取消时 withdraw 收回临时文件/占位/日志，结果按 `.cancelled` 发布。`removeItem` 只在真正移出时记取消；`cancelFile` 只对 pending/running 记录 | §46 幂等/隔离凭证 + 全源 typecheck；行为链靠 Rust 同源契约 |
+| Swift restore 缺 already_restored（F8） | `sha256(源位) == sourceSha256` → 直接收敛（`RestoreResult.alreadyRestored`），不再误判外部修改 | `[46] 已恢复的原图必须识别为 alreadyRestored` |
+| Swift restore 写回无身份复核、删产物无指纹门（F8/F5/F6） | `writeBackupVerifyingProduct`（交换+验被换出产物，交换不可用走隔离路线）、`installBackupAtVacatedPath`（空位三级台阶，被占拒绝）；删产物改 `OriginalRetirement.retire`（指纹门），force 走 `retireConfirmed`；rollback 同步换新原语；跨格式源位被外来文件占住时拒绝（旧版本残留副本按哈希放行） | `[46] 源位被外部文件占住时恢复必须拒绝` 等 5 条 |
+| Swift 隔离名认领不留凭证、`publishIfPlaceholderMatches(nil)` 退化为裸 rename（F2/F4） | `QuarantineClaim{path,identity}`（句柄 fstat 取凭证）+ `isStillOurs` 复核；凭证缺失 = `.refused`，删除降级分支。既有自检 41b 的 nil→published 断言按新裁决改为 refused | `[46] 隔离占位被换成外来文件后凭证必须对不上`；41b |
+| 前端/Swift 历史页把 `missing` 排除在恢复之外（F7） | 后端 `decorate` 把"源位不存在"装饰成 missing，前端 `canRestoreHistory` 与 Swift `historyCanRestore` 都接受 missing（备份在即可恢复）；`recoveryAvailable` 只要求备份存在 | `tests/history-view.cjs` 新增两条 missing 用例 |
+| Swift 调度器只按 CPU 数并发（F10） | `ImageMemory`（宽×高×通道×3，溢出饱和；预算=物理内存/4 夹 256 MiB…2 GiB）+ 调度器三档闸门（超大图独占 / 总账不超预算 / 空闸门永远放行） | `[46]` 内存估算 5 条 + 超大图独占/唤醒 2 条 |
+
+### R2 本机读数（2026-11-05）
+
+| 命令 | 结果 |
+| --- | --- |
+| `bash scripts/test_swift_history.sh` | 全绿；新增 §46 共 17 条断言；契约向量 32 条不缩水 |
+| `swiftc -typecheck`（全源 25 文件，含 AppState） | exit 0，0 error |
+| `npm run test:frontend` | 29 套全 PASS（exit 0） |
+| `cargo test --lib` | 289 passed / 0 failed |
+
+行为变化（有意）：Swift `publishIfPlaceholderMatches` 无凭证不再退化为普通 rename；
+自检 41b 的旧断言随之改为 `.refused`（并断言外来内容原样）。
+
+### 尚未做（R3–R5，见路线图）
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 

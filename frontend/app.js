@@ -4480,7 +4480,9 @@ function canRestoreHistory(entry) {
   }
   // §76 恢复只取决于「原图备份还在不在」：产物（覆盖模式下就是源位置）
   // 被外部删掉之后，备份正是把它写回去的唯一依据，不能因此把恢复入口收走。
-  return entry.status === 'compressed'
+  // `missing` 是后端在"源位置不存在"时对 compressed 的读时装饰（history.rs
+  // decorate），它说的是**同一个事实**：产物没了、备份还在 —— 恢复照给。
+  return (entry.status === 'compressed' || entry.status === 'missing')
     && entry.outputMode === 'replace'
     && !!entry.backupExists;
 }

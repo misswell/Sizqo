@@ -741,18 +741,23 @@ final class AppState: ObservableObject {
 
     /// 移除队列中的一行（等待中/压缩中的用「移除」，已完成的不再显示移除按钮）
     func removeItem(path: String) {
-        cancelBox.insert(path)
-        // 堵在闸门上的 worker 得被叫醒才会发现"自己要处理的文件已经不在队列里"。
-        scheduler.wakeWaiters()
         if let idx = items.firstIndex(where: { $0.path == path }) {
             guard items[idx].status == .pending else {
                 // §7.3 运行中禁止移除：压缩引擎仍会执行完并落盘，"从队列隐藏"
                 // 会把 UI 状态和真实执行状态撕开。前端同款语义（pending 才显示移除）。
+                // §5.4：这里**不**记取消 —— 提示说"无法移除"，就不能同时把
+                // 提交前的取消闸打开（那正是"界面说 A、后台做 B"）。
                 if items[idx].status == .running {
                     showToast("当前文件正在压缩，无法移除")
                 }
                 return
             }
+        }
+        // 真正移出队列（pending）才记取消：堵在闸门上的 worker 被叫醒后看见自己
+        // 已被取消就退出；万一它已经过了闸，编码后/提交前的两道取消闸也会拦下它。
+        cancelBox.insert(path)
+        scheduler.wakeWaiters()
+        if let idx = items.firstIndex(where: { $0.path == path }) {
             items[idx].status = .removed
         }
     }
@@ -851,16 +856,23 @@ final class AppState: ObservableObject {
         let store = history
         let journal = transactions
         let retention = retentionDays
+        // 取消账本的捕获：worker 线程读它不必碰 @MainActor 的 self。
+        let cancels = cancelBox
 
         for (path, itemID, relativePath) in targets {
             group.enter()
             queue.async { [self] in
                 // 每条出口都必须 leave 一次，否则被取消的文件会把整批吊住。
                 defer { group.leave() }
-                // 暂停中或 CPU 名额已满就堵在这里；拿到名额的一刻闸门一定是开着的。
+                // 暂停中或 CPU 名额已满、或这批图的解码内存已经吃满预算，就堵在这里；
+                // 拿到名额的一刻闸门一定是开着的。
                 // 已经在跑的文件会正常完成（不 kill、不 SIGSTOP）。
                 // 被取消的文件在闸门**之前**就自己退出，不需要谁替它开门。
-                switch gate.acquireOutcome(cancelled: { [self] in self.isCancelled(path) }) {
+                let estimatedMemory = ImageMemory.estimate(path: path)
+                switch gate.acquireOutcome(
+                    cancelled: { [self] in self.isCancelled(path) },
+                    memoryBytes: estimatedMemory
+                ) {
                 case .cancelled:
                     // 用户明确把它移出了队列：它本轮到此为止，不回到 pending。
                     DispatchQueue.main.async { self.updateStatus(path, itemID: itemID, revision: revision, sessionID: sessionID, .removed) }
@@ -889,7 +901,10 @@ final class AppState: ObservableObject {
                     }
                     let result = Self.compressOneStatic(
                         path: path, relativePath: relativePath, options: opts, useSmart: useSmart,
-                        history: store, transactions: journal, retentionDays: retention
+                        history: store, transactions: journal, retentionDays: retention,
+                        // §5.4 取消令牌：整个执行链（编码后 / 动手前 / 提交前）都能看见
+                        // 用户在清空或移出队列时记下的意图。CancelBox 自带锁，跨线程安全。
+                        isCancelled: { cancels.contains(path) }
                     )
                     DispatchQueue.main.async { self.applyResult(path, itemID: itemID, revision: revision, sessionID: sessionID, result: result) }
                 }
@@ -993,11 +1008,13 @@ final class AppState: ObservableObject {
     }
 
     func cancelFile(path: String) {
+        // 只有真的在等 / 在跑的文件才记取消：已完成的行上记一笔会一直留到
+        // 下一轮开工（那里才 removeAll），而它再也不会被任何 worker 读到 ——
+        // 账本里躺着一条谁也解释不了的"取消"。
+        guard let idx = items.firstIndex(where: { $0.path == path }),
+              items[idx].status == .running || items[idx].status == .pending else { return }
         cancelBox.insert(path)
-        if let idx = items.firstIndex(where: { $0.path == path }),
-           items[idx].status == .running || items[idx].status == .pending {
-            items[idx].status = .removed
-        }
+        items[idx].status = .removed
         scheduler.wakeWaiters()
     }
 
@@ -1029,7 +1046,8 @@ final class AppState: ObservableObject {
 
     nonisolated private static func compressOneStatic(
         path: String, relativePath: String, options: CompressOptions, useSmart: Bool,
-        history: HistoryStore, transactions: OutputTransactionStore, retentionDays: Int
+        history: HistoryStore, transactions: OutputTransactionStore, retentionDays: Int,
+        isCancelled: () -> Bool
     ) -> CompressResult {
         let originalSize = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
         // §24 §25 覆盖模式的原图快照必须在**编码之前**落好：编码要跑几秒到几十秒，
@@ -1056,6 +1074,19 @@ final class AppState: ObservableObject {
             result.warnings.append("EXIF / GPS 等元数据不会带入输出（需保留请用系统转换）")
         }
 
+        // §5.4 取消闸（编码后）：用户在编码期间清空了队列 / 移出了这一项 ——
+        // 这些字节一个都不许落盘。原图没被动过，历史不记账，结果按「已取消」发布。
+        // 这与 Rust 侧 commit_output 首行的取消闸同语义：取消只在提交之前有效。
+        if isCancelled() {
+            result.outcome = .cancelled
+            result.reasonCode = .cancelled
+            result.outputPath = nil
+            result.backupPath = nil
+            result.compressedSize = originalSize
+            result.savings = 0
+            return publish(result, mediaKind: "image")
+        }
+
         // §10 §11 「这些字节值不值得落盘」只在这里回答一次， writer 不再自己猜。
         let evaluation = Evaluation.evaluate(
             verdict: engineResult.verdict,
@@ -1080,12 +1111,20 @@ final class AppState: ObservableObject {
         if let failure = writeOutputStatic(
             &result, compressed: engineResult.compressed, relativePath: relativePath, options: options,
             history: history, transactions: transactions, retentionDays: retentionDays,
-            baseline: baseline
+            baseline: baseline, isCancelled: isCancelled
         ) {
             // 落盘没成就是没成：UI 绝不许显示「压缩完成」。
             result.outputPath = nil
             result.backupPath = nil
             result.error = failure.userMessage
+            // 取消不是失败：用户在提交前撤回的意愿不该在界面里变成一句红字。
+            if case .cancelled = failure {
+                result.outcome = .cancelled
+                result.reasonCode = .cancelled
+                result.compressedSize = originalSize
+                result.savings = 0
+                return publish(result, mediaKind: "image")
+            }
             result.outcome = .failed
             result.reasonCode = failure.reasonCode
             return publish(result, mediaKind: "image")
@@ -1135,10 +1174,15 @@ final class AppState: ObservableObject {
     nonisolated private static func writeOutputStatic(
         _ result: inout CompressResult, compressed: Data, relativePath: String, options: CompressOptions,
         history: HistoryStore, transactions: OutputTransactionStore, retentionDays: Int,
-        baseline: ReplaceBaseline
+        baseline: ReplaceBaseline, isCancelled: () -> Bool
     ) -> OutputWriteError? {
         if compressed.isEmpty {
             return .outputWriteFailed("要写出的字节是空的")
+        }
+        // §5.4 取消闸（动手前）：编码刚结束就发现已被取消 —— 连占位名与事务日志
+        // 都不该产生。与 Rust「commit 之前最后一道取消闸」同一位置、同一语义。
+        if isCancelled() {
+            return .cancelled
         }
         let fm = FileManager.default
         let path = result.file
@@ -1321,6 +1365,14 @@ final class AppState: ObservableObject {
             if let detail = history.backupIsFaithful(backup) {
                 return withdraw(.backupFailed(detail))
             }
+        }
+
+        // ⑤b 提交前最后一道取消闸（§5.4）：到这一步为止用户文件一个字节都没动，
+        //    取消的代价只是收回我们自己的临时文件、占位名和事务日志 —— 全部由
+        //    withdraw 按既有纪律处理。跨过这一行进入原子提交之后，取消不再生效，
+        //    只能等提交或回滚收尾（绝不许"界面说取消了、后台还在覆盖"）。
+        if isCancelled() {
+            return withdraw(.cancelled)
         }
 
         // ⑥ 原子发布。同格式覆盖用基线哈希走原子交换（验证被换出的字节）；
