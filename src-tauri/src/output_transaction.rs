@@ -162,6 +162,14 @@ pub fn file_identity(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
+/// 还开着的句柄上的 `(dev,ino)`：一次 `fstat` / `GetFileInformationByHandle`，
+/// 不重开路径。占位凭证一律从这里取 —— 本轮加固（docs/HARDENING_ROADMAP_2026-11.md
+/// F1）把"关掉句柄再按路径 stat"定为违规：两步之间路径就可能换一个 inode，
+/// 凭证从根上就不可信。
+fn identity_of_open(file: &fs::File) -> Option<(u64, u64)> {
+    crate::source_identity::fd_identity(file).ok().and_then(|id| id.identity)
+}
+
 pub const TRANSACTIONS_DIR: &str = "transactions";
 
 #[derive(Debug, Default)]
@@ -479,8 +487,9 @@ pub fn rollback(txn: &ReplaceTransaction) -> Result<(), String> {
                     return Err(format!("{ROLLBACK_NEEDS_REVIEW}备份未经真实性验证（老版本记录），源文件又不在原位；不自动写回，请在人工恢复界面确认"));
                 }
                 // 源文件已经不在原位：按"提交没完成"对待，把原图写回去。
+                // 写回目标应当是空位：三级台阶装进去，位置被外部占了就拒绝。
                 verify_backup_voucher(txn, &backup)?;
-                HistoryStore::write_backup_back_to_source(&backup, &source)?;
+                write_back_to_vacated_path(&backup, &source)?;
                 remove_generated_output(txn);
                 return Ok(());
             }
@@ -498,9 +507,22 @@ pub fn rollback(txn: &ReplaceTransaction) -> Result<(), String> {
                     // 自动回滚等于把未经确认的内容当原图写回 —— 转人工。
                     return Err(format!("{ROLLBACK_NEEDS_REVIEW}备份未经真实性验证（老版本记录），不自动写回；原图备份与事务日志都保留在原处，请在人工恢复界面确认"));
                 }
-                // 源位置上就是这次写出的字节：安全回滚。
+                // 源位置上就是这次写出的字节：安全回滚。写回走带产物身份复核的
+                // 提交原语 —— 复核到改名之间被外部换掉的文件不再被盖掉（本轮 F5）。
                 verify_backup_voucher(txn, &backup)?;
-                HistoryStore::write_backup_back_to_source(&backup, &source)?;
+                let expected = match crate::source_identity::SourceIdentity::read(&source) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        return Err(format!(
+                            "源位置身份读不出来（{error}），不自动覆盖；备份与事务日志保留在原处"
+                        ))
+                    }
+                };
+                let expected = crate::source_identity::SourceIdentity {
+                    sha256: txn.output_sha256.clone(),
+                    ..expected
+                };
+                write_back_verified(&backup, &source, &expected)?;
                 remove_generated_output(txn);
                 return Ok(());
             }
@@ -768,12 +790,11 @@ pub fn publish_replace_if_identity_matches(
                 });
             }
             Err(swap_back) => {
-                let conflict = conflict_sibling(target);
-                let relocated = match fs::rename(staged, &conflict) {
-                    Ok(()) => conflict,
+                let relocated = match relocate_to_conflict_name(staged, target) {
+                    Some(conflict) => conflict,
                     // 迁移也失败：外部内容停在临时路径上。写保护标记 ——
                     // 事务清理（remove_temp）见到标记绝不删这条路径。
-                    Err(_) => {
+                    None => {
                         if let Err(detail) = write_protected_marker(staged) {
                             // 标记没写成也不能当作"没有外部内容"：临时路径的 inode
                             // 已经不是记账时认领的那个，remove_temp 的归属门照样拒绝删除。
@@ -799,10 +820,57 @@ pub fn publish_replace_if_identity_matches(
     Ok(())
 }
 
+/// 把已经 fsync 的备份副本写回源位置 —— 带**产物身份复核**的提交（本轮加固 F5）。
+///
+/// 恢复原图与事务回滚共用这一条：无条件 rename 的旧写法在"冲突检查 → 提交"之间
+/// 留着覆盖窗口，检查完到改名前被外部换掉的文件会被直接盖掉。现在与覆盖提交走
+/// 同一条纪律：先原子交换、再验证被换出来的那份的身份与内容指纹（`expected` =
+/// 检查时刻的产物身份），对不上换回撤销；交换不可用走隔离路线，绝不回到
+/// "看一眼再 rename"。装不进去/对不上都拒绝，原图备份原样保留。
+pub(crate) fn write_back_verified(
+    backup: &Path,
+    target: &Path,
+    expected: &crate::source_identity::SourceIdentity,
+) -> Result<(), String> {
+    let staged = StagedOutput::copy_staged(backup, target)?;
+    match publish_replace_if_identity_matches(&staged.temp, target, expected) {
+        Ok(()) => {
+            staged.settle();
+            let _ = crate::history::sync_dir(target.parent().unwrap_or_else(|| Path::new("/")));
+            Ok(())
+        }
+        Err(error) => {
+            staged.discard();
+            Err(error.detail)
+        }
+    }
+}
+
+/// 备份写回一个**应当是空位**的位置（跨格式替换后的原图位、或回滚时源文件已不在
+/// 原位）：三级台阶装进去，位置被人占了就拒绝 —— 那个位置上的字节不是我们承诺
+/// 要恢复的东西，无条件 rename 会把用户的文件盖掉（本轮加固 F5 同源问题）。
+pub(crate) fn write_back_to_vacated_path(backup: &Path, target: &Path) -> Result<(), String> {
+    let staged = StagedOutput::copy_staged(backup, target)?;
+    if let Err(error) = install_at_free_path(&staged.temp, target) {
+        staged.discard();
+        return Err(error);
+    }
+    staged.settle();
+    let _ = crate::history::sync_dir(target.parent().unwrap_or_else(|| Path::new("/")));
+    Ok(())
+}
+
 // MARK: - §28 跨格式替换：删掉原图时的归属证明
 
-/// 在同目录独占认领一个隔离名（O_EXCL）：改名过去不可能盖掉任何人的文件。
-fn claim_quarantine_name(file: &Path) -> Result<PathBuf, String> {
+/// 一次隔离名认领：路径 + 占位的 `(dev,ino)` 凭证（从还开着的句柄上取）。
+struct QuarantineClaim {
+    path: PathBuf,
+    identity: Option<(u64, u64)>,
+}
+
+/// 在同目录独占认领一个隔离名（O_EXCL）：改名过去不可能盖掉任何人的文件 ——
+/// 前提是动手之前核得出这个名字还在我们手里（本轮加固 F2）。
+fn claim_quarantine_name(file: &Path) -> Result<QuarantineClaim, String> {
     let directory = file
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -812,10 +880,25 @@ fn claim_quarantine_name(file: &Path) -> Result<PathBuf, String> {
         .suffix(".keep")
         .tempfile_in(directory)
         .map_err(|error| format!("无法认领隔离名（{error}）"))?;
-    named
+    let identity = identity_of_open(named.as_file());
+    let path = named
         .into_temp_path()
         .keep()
-        .map_err(|error| format!("隔离名落盘失败（{error}）"))
+        .map_err(|error| format!("隔离名落盘失败（{error}）"))?;
+    Ok(QuarantineClaim { path, identity })
+}
+
+/// 隔离占位还是我们的吗？对不上 = O_EXCL 占位被外部换成自己的文件，
+/// 此时往这个名字上 rename 就是覆盖 —— 拒绝，外来字节分文不动。
+fn quarantined_still_ours(claim: &QuarantineClaim) -> Result<(), String> {
+    if file_identity(&claim.path) == claim.identity {
+        Ok(())
+    } else {
+        Err(format!(
+            "隔离名上的占位已不是本次认领的那个（{}），放弃覆盖以保护它",
+            claim.path.display()
+        ))
+    }
 }
 
 /// 原子的「不覆盖改名」：目标已存在就失败，绝不替换任何人的文件。
@@ -920,18 +1003,23 @@ fn no_replace_unsupported(error: &std::io::Error) -> bool {
     }
 }
 
-/// 用 `O_EXCL` 把目标名独占下来，返回认领到的 `(dev,ino)` 供收尾时核对。
+/// 用 `O_EXCL` 把目标名独占下来，返回认领到的 `(dev,ino)` 供提交前核对。
 ///
 /// 这是各平台、各文件系统都原子的一步（`open(O_CREAT|O_EXCL)` / `CreateFileW` 的
 /// `CREATE_NEW`）：别人建不出这个名字，之后 rename 覆盖的只可能是我们刚建的那个
-/// 0 字节文件。
+/// 0 字节文件 —— 前提是提交前核得出"还是那个文件"。凭证从**还开着的句柄**上取
+/// （本轮加固 F1：句柄即弃、按路径重 stat 的旧写法，凭证本身就隔着一窗口）。
 fn claim_empty_placeholder(target: &Path) -> Result<Option<(u64, u64)>, String> {
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(target)
     {
-        Ok(_) => Ok(file_identity(target)),
+        Ok(file) => {
+            let identity = identity_of_open(&file);
+            drop(file);
+            Ok(identity)
+        }
         Err(error) => Err(format!("目标位置已被外部占用（{error}），放弃覆盖以保护它")),
     }
 }
@@ -983,6 +1071,17 @@ fn install_at_free_path(candidate: &Path, target: &Path) -> Result<(), String> {
     }
 
     let claimed = claim_empty_placeholder(target)?;
+    #[cfg(test)]
+    inject_placeholder_steal_fault(target);
+    // 本轮加固 F1：提交之前必须证明目标位上还是我们刚认领的那个占位。
+    // 占位被外部删掉再放自己的文件进来时，这里的 rename 就是覆盖别人 ——
+    // 身份对不上（或证明不了）就拒绝，绝不用覆盖式 rename 碰运气。
+    if file_identity(target) != claimed {
+        return Err(format!(
+            "目标位上的占位文件已不是本次认领的那个（{}），放弃覆盖以保护它",
+            target.display()
+        ));
+    }
     match fs::rename(candidate, target) {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -1068,20 +1167,23 @@ fn publish_via_quarantine(
     };
 
     let quarantine = match claim_quarantine_name(target) {
-        Ok(path) => path,
+        Ok(claim) => claim,
         Err(detail) => return Err(refused(format!("{detail}，未做任何覆盖"))),
     };
-    if let Err(error) = fs::rename(target, &quarantine) {
-        let _ = fs::remove_file(&quarantine);
+    if let Err(detail) = quarantined_still_ours(&quarantine) {
+        return Err(refused(format!("{detail}，未做任何覆盖")));
+    }
+    if let Err(error) = fs::rename(target, &quarantine.path) {
+        let _ = fs::remove_file(&quarantine.path);
         return Err(refused(format!(
             "无法把目标移入隔离名（{error}），放弃覆盖以保护当前位置的字节"
         )));
     }
 
-    if let Some(detail) = verify(&quarantine) {
+    if let Some(detail) = verify(&quarantine.path) {
         return Err(SwapPublishError {
             swapped: false,
-            detail: match restore_quarantined(&quarantine, target) {
+            detail: match restore_quarantined(&quarantine.path, target) {
                 Restored::InPlace => format!(
                     "{detail}；已放回原位，本次提交已撤销"
                 ),
@@ -1104,7 +1206,7 @@ fn publish_via_quarantine(
     if let Err(detail) = install_at_free_path(staged, target) {
         return Err(SwapPublishError {
             swapped: false,
-            detail: match restore_quarantined(&quarantine, target) {
+            detail: match restore_quarantined(&quarantine.path, target) {
                 Restored::InPlace => format!("{detail}；原图已放回原位，本次提交已撤销"),
                 Restored::InPlaceForeignKept(kept) => format!(
                     "{detail}；原图已回到原位，外部那份保留在 {}，未删除",
@@ -1119,7 +1221,7 @@ fn publish_via_quarantine(
     }
 
     // 覆盖已经成立：隔离名上的就是被换出的原图（刚复验过，备份里还有一份可信副本）。
-    if let Err(error) = fs::remove_file(&quarantine) {
+    if let Err(error) = fs::remove_file(&quarantine.path) {
         log::warn!("提交后被换出的旧文件删除失败（原图备份仍在）: {error}");
     }
     Ok(())
@@ -1163,14 +1265,15 @@ fn publish_claimed_via_quarantine(
 /// 绝不删这条路径）。两条都没走通也绝不删 —— 临时路径的 inode 已不是记账时认领的
 /// 那个，`remove_temp` 的归属门照样拒绝清理。
 fn protect_foreign_bytes(staged: &Path, target: &Path) -> PathBuf {
-    let conflict = conflict_sibling(target);
-    if fs::rename(staged, &conflict).is_ok() {
-        return conflict;
+    match relocate_to_conflict_name(staged, target) {
+        Some(conflict) => conflict,
+        None => {
+            if let Err(detail) = write_protected_marker(staged) {
+                log::error!("保护标记写入失败（归属门仍会拒绝清理）: {detail}");
+            }
+            staged.to_path_buf()
+        }
     }
-    if let Err(detail) = write_protected_marker(staged) {
-        log::error!("保护标记写入失败（归属门仍会拒绝清理）: {detail}");
-    }
-    staged.to_path_buf()
 }
 
 /// 隔离后的字节回到原位的结果，三种现场各有各的实话。
@@ -1212,17 +1315,20 @@ pub fn retire_original(
     // ② 独占认领隔离名：O_EXCL 保证这个名字在我们手里，改名过去不会盖掉任何人。
     let quarantine =
         claim_quarantine_name(file).map_err(|detail| format!("{detail}，原图已保留"))?;
+    if let Err(detail) = quarantined_still_ours(&quarantine) {
+        return Err(format!("{detail}，原图已保留"));
+    }
 
-    if let Err(error) = fs::rename(file, &quarantine) {
-        let _ = fs::remove_file(&quarantine);
+    if let Err(error) = fs::rename(file, &quarantine.path) {
+        let _ = fs::remove_file(&quarantine.path);
         return Err(format!("原图改名隔离失败（{error}），已保留"));
     }
 
-    // ③ 复验：改名之后这条路径归我们独占，此刻的字节就是即将被删的字节。
+    // ③ 复验：改名之后这条路径归我们独占，此刻的字节就是即将被删除的字节。
     #[cfg(test)]
-    inject_retire_fault(&quarantine, file);
-    if let SourceCheck::Changed(detail) = identity.verify(&quarantine) {
-        return Err(match restore_quarantined(&quarantine, file) {
+    inject_retire_fault(&quarantine.path, file);
+    if let SourceCheck::Changed(detail) = identity.verify(&quarantine.path) {
+        return Err(match restore_quarantined(&quarantine.path, file) {
             Restored::InPlace => format!(
                 "原文件在隔离窗口内被外部修改（{detail}），新版本是磁盘上的那份，已放回原位并保留"
             ),
@@ -1238,13 +1344,13 @@ pub fn retire_original(
     }
 
     #[cfg(test)]
-    inject_retire_post_verify_fault(&quarantine);
+    inject_retire_post_verify_fault(&quarantine.path);
     // ④ 删除前再看一眼体积：改名不会让外部**已经持有的文件句柄**失效，验证通过之后
     //    那支 fd 仍能往同一个 inode 里追加。这一眼拦得住"又长了字节"的那一类；
     //    同长度原地改写拦不住 —— 那一小段的兜底是覆盖前就做好的原图备份，不是这里。
-    if let Ok(meta) = fs::metadata(&quarantine) {
+    if let Ok(meta) = fs::metadata(&quarantine.path) {
         if meta.len() != identity.size {
-            return Err(match restore_quarantined(&quarantine, file) {
+            return Err(match restore_quarantined(&quarantine.path, file) {
                 Restored::InPlace => format!(
                     "原文件在复验之后仍被外部写入（{} → {} 字节），已放回原位并保留",
                     identity.size,
@@ -1265,9 +1371,9 @@ pub fn retire_original(
             });
         }
     }
-    match fs::remove_file(&quarantine) {
+    match fs::remove_file(&quarantine.path) {
         Ok(()) => Ok(()),
-        Err(error) => Err(match restore_quarantined(&quarantine, file) {
+        Err(error) => Err(match restore_quarantined(&quarantine.path, file) {
             Restored::InPlace => format!("原图删除失败（{error}），已放回原位"),
             Restored::InPlaceForeignKept(kept) => format!(
                 "原图删除失败（{error}），已放回原位；外部那份保留在 {}，未删除",
@@ -1277,6 +1383,32 @@ pub fn retire_original(
                 "原图删除失败（{error}），字节仍在 {}，请人工确认",
                 kept.display()
             ),
+        }),
+    }
+}
+
+/// 用户**明确确认**要删的文件走这条路（后缀撤销 + force）：跳过内容复核，
+/// 但隔离认领与提交前身份复核一样不少 —— 确认的是"这份产物可以删"，
+/// 不是"路径上随便什么都可以删"。
+pub fn retire_confirmed(file: &Path) -> Result<(), String> {
+    let quarantine =
+        claim_quarantine_name(file).map_err(|detail| format!("{detail}，文件已保留"))?;
+    if let Err(detail) = quarantined_still_ours(&quarantine) {
+        return Err(format!("{detail}，文件已保留"));
+    }
+    if let Err(error) = fs::rename(file, &quarantine.path) {
+        let _ = fs::remove_file(&quarantine.path);
+        return Err(format!("文件改名隔离失败（{error}），已保留"));
+    }
+    match fs::remove_file(&quarantine.path) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(match restore_quarantined(&quarantine.path, file) {
+            Restored::InPlace => format!("文件删除失败（{error}），已放回原位"),
+            Restored::InPlaceForeignKept(kept) => format!(
+                "文件删除失败（{error}），已放回原位；外部那份保留在 {}，未删除",
+                kept.display()
+            ),
+            Restored::Kept(kept) => format!("文件删除失败（{error}），字节仍在 {}，请人工确认", kept.display()),
         }),
     }
 }
@@ -1322,6 +1454,7 @@ thread_local! {
         = const { std::cell::Cell::new(0) };
     /// 目标位空出来之后、候选放进去之前：外部把这份空位占了。
     /// 旧写法（复核指纹 + `fs::rename`）正是在这里把 rename 盖到别人身上（上一轮 P1-4）。
+    /// 1 = install 窗口直接占位；2 = 认领 O_EXCL 占位后把它偷换成外来文件（本轮 F1）。
     pub(crate) static TEST_FAULT_IN_INSTALL_WINDOW: std::cell::Cell<u8>
         = const { std::cell::Cell::new(0) };
 }
@@ -1379,20 +1512,72 @@ fn inject_install_fault(target: &Path) {
     }
 }
 
-/// 与目标同目录、用户看得见的冲突保留名。
-fn conflict_sibling(target: &Path) -> PathBuf {
+/// 测试用：O_EXCL 占位认领之后、提交之前，外部把占位删掉换成自己的文件 ——
+/// 本轮加固 F1 的现场。旧写法在这里会把 rename 盖到外来文件上。
+#[cfg(test)]
+fn inject_placeholder_steal_fault(target: &Path) {
+    if TEST_FAULT_IN_INSTALL_WINDOW.with(std::cell::Cell::get) == 2 {
+        let _ = fs::remove_file(target);
+        let _ = fs::write(target, b"external-stolen-placeholder");
+    }
+}
+
+/// 把停在临时路径上的外来字节迁到用户看得见的冲突保留名 —— 选名与占用原子地
+/// 一步完成：直接用「不覆盖改名」去抢 `.sizqo-conflict-N`，被占就换下一个号
+/// （本轮加固 F3：旧写法 `exists()` 选名 + rename，两步之间被占的名字会被盖掉）。
+/// 无覆盖改名不可用时退到与 `install_at_free_path` 同一条最底级台阶。
+/// 全部装不进去返回 None，调用方走保护标记兜底 —— 绝不 rename 覆盖。
+fn relocate_to_conflict_name(staged: &Path, target: &Path) -> Option<PathBuf> {
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     let name = target
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("file");
+        .unwrap_or("file")
+        .to_string();
     for index in 0..1000u32 {
         let candidate = dir.join(format!("{name}.sizqo-conflict-{index}"));
-        if !candidate.exists() {
-            return candidate;
+        match rename_no_replace(staged, &candidate) {
+            Ok(()) => return Some(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if no_replace_unsupported(&error) => {
+                match relocate_via_exclusive_placeholder(staged, &candidate) {
+                    RelocateStep::Placed(path) => return Some(path),
+                    RelocateStep::Occupied => continue,
+                    RelocateStep::Failed => return None,
+                }
+            }
+            Err(_) => return None,
         }
     }
-    dir.join(format!("{name}.sizqo-conflict-{}", std::process::id()))
+    None
+}
+
+/// 迁移外来字节的单步结果。
+enum RelocateStep {
+    Placed(PathBuf),
+    /// 这个号被别人占着：换下一个号，别人的字节分文不动。
+    Occupied,
+    /// 真失败（IO 错误、或占位被换成外来文件证明不了归属）：不再换号。
+    Failed,
+}
+
+/// 无覆盖改名不可用时的最后一级迁移：O_EXCL 占位 + 提交前身份复核，
+/// 与 `install_at_free_path` 台阶③同一套纪律（本轮加固 F1 同款守卫）。
+fn relocate_via_exclusive_placeholder(staged: &Path, candidate: &Path) -> RelocateStep {
+    let claimed = match claim_empty_placeholder(candidate) {
+        Ok(claimed) => claimed,
+        Err(_) => return RelocateStep::Occupied,
+    };
+    if file_identity(candidate) != claimed {
+        return RelocateStep::Failed;
+    }
+    if fs::rename(staged, candidate).is_ok() {
+        return RelocateStep::Placed(candidate.to_path_buf());
+    }
+    if file_identity(candidate) == claimed {
+        let _ = fs::remove_file(candidate);
+    }
+    RelocateStep::Failed
 }
 
 /// 这块文件系统/内核不支持原子交换吗？支持失败按真错误处理，绝不静默降级。
@@ -1584,9 +1769,11 @@ impl OutputNameAllocator {
                 .open(&path)
             {
                 // 句柄在这里就丢掉：我们要的只是"这个名字已经名花有主"这件事。
-                // 顺手记下占位的 (dev,ino)：它就是"这个路径上是谁的文件"的凭证。
-                Ok(_) => {
-                    let identity = file_identity(&path);
+                // 占位的 (dev,ino) 从**还开着的句柄**上取（本轮加固 F1）：
+                // 它就是提交时"这个路径上是谁的文件"的凭证。
+                Ok(file) => {
+                    let identity = identity_of_open(&file);
+                    drop(file);
                     return Ok(ClaimedOutput { path, identity });
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
@@ -1601,6 +1788,21 @@ impl OutputNameAllocator {
             MAX_NAME_CONFLICTS
         ))
     }
+}
+
+/// 分块把一个文件复制进已经打开的临时文件：视频的原图可能有几个 GB，整份进内存不行。
+fn copy_file_into(file: &mut fs::File, source: &Path) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let mut reader = fs::File::open(source).map_err(|e| e.to_string())?;
+    let mut buffer = [0u8; 256 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// 压缩结果的落盘：同目录独占临时文件 → flush + fsync → rename 覆盖目标。
@@ -1634,18 +1836,20 @@ impl StagedOutput {
     /// 分块读写而不是整份进内存：视频的原图可能有几个 GB。
     pub fn copy_from(source: &Path, target: &Path) -> Result<Self, String> {
         Self::stage(target, ".sizqo-copy-", None, |file| {
-            use std::io::{Read, Write};
-            let mut reader = fs::File::open(source).map_err(|e| e.to_string())?;
-            let mut buffer = [0u8; 256 * 1024];
-            loop {
-                let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
-                if read == 0 {
-                    break;
-                }
-                file.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
-            }
-            Ok(())
+            copy_file_into(file, source)
         })
+    }
+
+    /// 整份复制到同目录临时名但**不改名**：恢复原图这类"提交前还要凭证核验"的
+    /// 落盘，由调用方拿着 staged 走带身份复核的提交原语（本轮加固 F5）。
+    /// 写失败时自己收走临时文件；临时名与 copy_from 同一套独占分配。
+    pub fn copy_staged(source: &Path, target: &Path) -> Result<Self, String> {
+        let staged = Self::claim(target, ".sizqo-copy-")?;
+        if let Err(error) = staged.fill(|file| copy_file_into(file, source)) {
+            staged.discard();
+            return Err(error);
+        }
+        Ok(staged)
     }
 
     /// §30 全程序只有这一处产生临时文件名：和目标同目录、O_EXCL、随机后缀。
@@ -1727,14 +1931,18 @@ impl StagedOutput {
     /// 复核与 rename 之间那段仍然是空的（上一轮的 P1-c）：这里和同格式覆盖走同一条
     /// 顺序 —— **先交换、再验证被换出来的那份**，验证与提交压成一次系统调用。
     /// 交换不可用时退回隔离路径（`publish_claimed_via_quarantine`），绝不"看一眼再
-    /// 无条件 rename"。凭证不可用（取不到 inode）时才退化为普通 rename。
+    /// 无条件 rename"。凭证缺失时**拒绝提交**（本轮加固 F4）：证明不了占位归属还
+    /// 照样 rename，就是在"无法确认安全性"时覆盖文件 —— 失败关闭，不许降级。
     pub fn publish_claimed(
         &self,
         target: &Path,
         identity: Option<(u64, u64)>,
     ) -> Result<(), String> {
         let Some(expected) = identity else {
-            return self.publish(target);
+            return Err(format!(
+                "无法取得输出占位的身份凭证（{}），放弃提交以保护目标位置的字节",
+                target.display()
+            ));
         };
         match atomic_swap(&self.temp, target) {
             Ok(()) => {
@@ -3069,6 +3277,166 @@ mod tests {
         assert!(
             bytes.starts_with(b"original-bytes") && bytes.ends_with(b"-late-write"),
             "原图与外部追加的字节都要在磁盘上: {bytes:?}"
+        );
+    }
+
+    // MARK: - 本轮加固（docs/HARDENING_ROADMAP_2026-11.md F1-F6）的守门测试
+
+    /// F1：O_EXCL 占位认领之后、提交之前，外部把占位删掉换成自己的文件 ——
+    /// 旧写法在这里会把 rename 盖到外来文件上。现在提交前必须核出
+    /// "目标位还是我们认领的那个占位"，核不出就拒绝。
+    #[test]
+    fn a_stolen_placeholder_refuses_the_final_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("candidate.tmp");
+        let target = dir.path().join("photo.png");
+        fs::write(&candidate, b"compressed-bytes").unwrap();
+
+        set_forced_unsupported(ForcePrimitive::NoReplaceRename, true);
+        set_forced_unsupported(ForcePrimitive::HardLink, true);
+        set_fault_in_install_window(2);
+        let outcome = install_at_free_path(&candidate, &target);
+        set_fault_in_install_window(0);
+        set_forced_unsupported(ForcePrimitive::NoReplaceRename, false);
+        set_forced_unsupported(ForcePrimitive::HardLink, false);
+
+        let error = outcome.expect_err("占位被偷换后必须拒绝提交");
+        assert!(error.contains("占位"), "拒绝理由要说明是占位被换: {error}");
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"external-stolen-placeholder",
+            "外来字节一个都不许动"
+        );
+        assert_eq!(fs::read(&candidate).unwrap(), b"compressed-bytes", "候选原样留给调用方");
+    }
+
+    /// F2：隔离名占位被外部换成自己的文件时，改名过去就是覆盖 —— 凭证复核必须拦住。
+    #[test]
+    fn a_replaced_quarantine_placeholder_blocks_the_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("photo.png");
+        fs::write(&file, b"original").unwrap();
+
+        let claim = claim_quarantine_name(&file).unwrap();
+        // 外部把占位删掉、在同一个名字上放了自己的文件。
+        fs::remove_file(&claim.path).unwrap();
+        fs::write(&claim.path, b"external-took-the-retire-name").unwrap();
+
+        assert!(
+            quarantined_still_ours(&claim).is_err(),
+            "凭证对不上必须是拒绝"
+        );
+        assert_eq!(
+            fs::read(&claim.path).unwrap(),
+            b"external-took-the-retire-name",
+            "外来字节原样"
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"original", "原图不因隔离名被占而受影响");
+        // 测试现场是外来字节，收尾直接清掉；产品路径上这里走的是拒绝分支，不碰它。
+        fs::remove_file(&claim.path).unwrap();
+    }
+
+    /// F3：冲突保留名的选名与占用必须原子 —— 0 号被别人占着就跳到 1 号，
+    /// 别人的字节分文不动（旧写法 exists() 选名 + rename 会盖掉窗口里被占的名字）。
+    #[test]
+    fn conflict_relocation_picks_the_next_free_name_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("photo.png");
+        let conflict0 = dir.path().join("photo.png.sizqo-conflict-0");
+        let staged = dir.path().join(".sizqo-staged-foreign");
+        fs::write(&conflict0, b"somebody-else-first").unwrap();
+        fs::write(&staged, b"foreign-bytes-on-temp").unwrap();
+
+        let relocated =
+            relocate_to_conflict_name(&staged, &target).expect("必须找到下一个空位");
+        assert!(
+            relocated.ends_with("photo.png.sizqo-conflict-1"),
+            "被占的 0 号要跳过: {relocated:?}"
+        );
+        assert_eq!(fs::read(&conflict0).unwrap(), b"somebody-else-first", "先来的人的字节原样");
+        assert!(!staged.exists(), "外来字节整体迁走，不是复制");
+        assert_eq!(fs::read(&relocated).unwrap(), b"foreign-bytes-on-temp");
+    }
+
+    /// F3 的最底级台阶：无覆盖改名不可用时，O_EXCL 占位 + 提交前身份复核
+    /// 同样要跳过被占的名字装进下一个空位。
+    #[test]
+    fn conflict_relocation_without_no_replace_still_skips_taken_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("photo.png");
+        let conflict0 = dir.path().join("photo.png.sizqo-conflict-0");
+        let staged = dir.path().join(".sizqo-staged-foreign");
+        fs::write(&conflict0, b"somebody-else-first").unwrap();
+        fs::write(&staged, b"foreign-bytes-on-temp").unwrap();
+
+        set_forced_unsupported(ForcePrimitive::NoReplaceRename, true);
+        let relocated = relocate_to_conflict_name(&staged, &target);
+        set_forced_unsupported(ForcePrimitive::NoReplaceRename, false);
+
+        let relocated = relocated.expect("台阶③也要接得住");
+        assert!(relocated.ends_with("photo.png.sizqo-conflict-1"), "被占的 0 号要跳过: {relocated:?}");
+        assert_eq!(fs::read(&conflict0).unwrap(), b"somebody-else-first");
+        assert_eq!(fs::read(&relocated).unwrap(), b"foreign-bytes-on-temp");
+    }
+
+    /// F4：占位凭证缺失时不许退化成普通 rename —— 拒绝提交，目标位原样。
+    #[test]
+    fn publish_claimed_without_credentials_refuses_instead_of_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = dir.path().join("backup.png");
+        fs::write(&backup, b"staged-bytes").unwrap();
+        let target = dir.path().join("photo.png");
+
+        let staged = StagedOutput::copy_staged(&backup, &target).unwrap();
+        let outcome = staged.publish_claimed(&target, None);
+        assert!(outcome.is_err(), "凭证缺失只能是拒绝: {outcome:?}");
+        assert!(!target.exists(), "拒绝后目标位不许出现任何东西");
+        staged.discard();
+    }
+
+    /// F5：恢复写回的提交原语 —— 检查时刻的产物在提交前被"同大小同时间戳"
+    /// 地换掉时，只有内容指纹拦得住；拒绝后外部那份字节与备份都必须原样。
+    #[test]
+    fn restore_write_back_refuses_a_product_replaced_after_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("photo.png");
+        fs::write(&target, b"compressed-product-18").unwrap();
+        let backup = dir.path().join("backup");
+        fs::write(&backup, b"true-original").unwrap();
+
+        let expected = crate::source_identity::SourceIdentity::read_with_hash(&target).unwrap();
+        // 检查之后、提交之前：同长度原地换内容，再把时间戳钉回去。
+        fs::write(&target, b"compressed-product-XX").unwrap();
+        crate::source_identity::SourceIdentity::freeze_mtime_to(&target, expected.modified.unwrap())
+            .unwrap();
+
+        let outcome = write_back_verified(&backup, &target, &expected);
+        let error = outcome.expect_err("被换掉的产物必须拒绝写回");
+        assert!(error.contains("外部修改"), "拒绝理由要对得上现场: {error}");
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"compressed-product-XX",
+            "外部换上去的那份字节原样"
+        );
+        assert_eq!(fs::read(&backup).unwrap(), b"true-original", "备份原样");
+    }
+
+    /// force 撤销走 `retire_confirmed`：内容复核跳过，但隔离认领照旧，
+    /// 删除只删得到那一处路径。
+    #[test]
+    fn retire_confirmed_deletes_without_content_review_but_not_without_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("photo_compressed.jpg");
+        fs::write(&file, b"anything-user-confirmed-to-delete").unwrap();
+
+        retire_confirmed(&file).unwrap();
+        assert!(!file.exists(), "确认过的产物删除成立");
+        assert!(
+            !dir
+                .path()
+                .join("photo_compressed.jpg.sizqo-conflict-0")
+                .exists(),
+            "正常删除不产生冲突迁移现场"
         );
     }
 }

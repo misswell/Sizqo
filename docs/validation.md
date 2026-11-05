@@ -2498,6 +2498,57 @@ Windows 那一格第一次是红的：`restoring_a_quarantined_file_never_overwr
   （以及对应的 GPL 对应源码义务），不是把闸门放宽。
 - Windows / Linux 产物仍未签名（无对应签名链），正式版门禁照旧不通。
 
+## 第六轮：外部审查 19 项回证 + 文件安全 R1（2026-11-05）
+
+外部静态审查（19 项）与《全仓库可靠性重构方案》已逐条对照 `8ef5a73`（rc.9）
+回证，路线图落在 [HARDENING_ROADMAP_2026-11.md](HARDENING_ROADMAP_2026-11.md)。
+回证结论：19 项里有 4 项需要修正审查措辞（来源根问题图片侧同病；预检期
+暂停/停止按钮本就隐藏；导入静默遗漏两侧都有；分阶段执行是
+[core/media-task-protocol.md](../core/media-task-protocol.md) 的成文决定），
+其余属实；rc.9 已修掉的部分不重复做。
+
+### R1 已落地（Rust 文件安全）
+
+| 缺口 | 修法 | 守门测试 |
+| --- | --- | --- |
+| 台阶③占位凭证来自关闭句柄后的路径 stat，提交前不复核（F1） | `claim_empty_placeholder` 从还开着的句柄取 `(dev,ino)`（`identity_of_open`/`fd_identity`），`install_at_free_path` 提交前复核目标位身份，不符即拒绝 | `a_stolen_placeholder_refuses_the_final_rename` |
+| 隔离名占位凭证未留存、后续裸 rename（F2） | `QuarantineClaim{path,identity}` + `quarantined_still_ours()`，`publish_via_quarantine`/`retire_original` 改名前后复核 | `a_replaced_quarantine_placeholder_blocks_the_rename` |
+| `conflict_sibling` 的 `exists()+rename`（F3） | `relocate_to_conflict_name`：直接用 `rename_no_replace` 抢名，被占换号；退到 O_EXCL 占位 + 身份复核 | `conflict_relocation_picks_the_next_free_name_without_overwriting`、`conflict_relocation_without_no_replace_still_skips_taken_names` |
+| `publish_claimed` 凭证缺失退化裸 publish（F4） | 凭证缺失 = 拒绝提交并报告，删除降级分支 | `publish_claimed_without_credentials_refuses_instead_of_overwriting` |
+| restore/rollback 检查到 rename 之间无身份复核（F5） | `write_back_verified`（先交换、再验被换出内容的身份+指纹，不符换回撤销；交换不可用走隔离路线）、`write_back_to_vacated_path`（空位装回，被占拒绝）；`history::restore` 跨格式分支加"源位有外来文件即拒绝"、幂等收敛分支 | `restore_write_back_refuses_a_product_replaced_after_the_check`、`history::tests::restore_refuses_when_the_vacated_source_slot_holds_a_foreign_file`、`restoring_a_cross_format_entry_whose_original_already_sits_in_place_converges` |
+| 后缀撤销 SHA 检查后裸 `remove_file`（F6） | 改走 `retire_original`（指纹门 + 隔离删除）；force 走 `retire_confirmed`（跳过内容复核但不跳过隔离） | `retire_confirmed_deletes_without_content_review_but_not_without_isolation`、`suffix_undo_deletes_through_the_fingerprint_gated_retire`、`suffix_undo_with_force_deletes_the_confirmed_product_only` |
+
+行为变化（有意，写在这里免得当成回归）：
+1. **跨格式恢复在源位上有外来文件时改为拒绝**。旧行为是 rename 盖掉它。
+   源位已腾空（提交后的真实状态）时照常恢复；源位上已经放着原图本身时
+   直接收敛。此前两条测试把"源位留着转换前的产物副本"当作现场，已按真实
+   提交后状态改为源位空。
+2. **凭证缺失不再有"普通 rename"兜底**。`file_identity` 在 unix/Windows
+   都可用，只在真拿不到身份时触发；此时按失败关闭拒绝提交。
+3. `manual_restore`（用户确认覆盖的人工通道）保持原语义，仍走
+   `write_backup_back_to_source`；该函数只剩这一个调用方。
+
+### 本机读数（2026-11-05）
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo test --lib` | 289 passed / 0 failed / 2 ignored |
+| `cargo test --features inproc-backends` | lib 288 passed / 0 failed；集成 6 + 5 passed |
+| `cargo test --no-default-features --features inproc-backends` | lib 288 passed / 0 failed；集成 6 + 5 passed |
+| `npm run test:frontend` | 29 套全 PASS（含 1k/5k/10k 队列基准） |
+| `bash scripts/test_swift_history.sh` | 全绿，契约向量 32 条不缩水 |
+
+11 条新增测试在两个 Rust 变体里都注册并运行（`--list` 各 11 条）。
+Windows 分支（`identity_of_open` 的 `GetFileInformationByHandle` 支、`MoveFileExW`
+支）本机仍只能类型检查，取证要靠 `windows-tests`。
+
+### 尚未做（R2–R5，见路线图）
+
+Swift 取消链（compressOneStatic 零检查点）、Swift restore 幂等/指纹门、
+`canRestoreHistory` 的 Missing 入口、Swift 内存预算、EXIF orientation、
+Swift 动画拒绝、视频帧数/逐流元数据校验、probe 取消、FLAC 预算、
+视频输出占名、每文件来源根、导入诊断、UI 阶段呈现、macOS 真实矩阵。
+
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
 Before any tag/Release: full three-track build, signed Direct runtime check,

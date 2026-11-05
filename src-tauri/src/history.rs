@@ -1408,7 +1408,10 @@ impl HistoryStore {
 
     /// 把一份备份原子地写回目标位置：同目录临时文件 → fsync → rename。
     ///
-    /// `restore` 和事务回滚共用这一个实现 —— 恢复原图这件事绝不允许有两套写法。
+    /// 只剩**人工恢复**（`manual_restore`）这一处调用：用户看过现场、明确确认
+    /// 覆盖之后的有意覆盖。自动恢复（`restore`）与事务回滚已改走带产物身份
+    /// 复核的提交原语（`write_back_verified` / `write_back_to_vacated_path`，
+    /// 本轮加固 F5）——检查到提交之间被外部换掉的文件不再被盖掉。
     pub fn write_backup_back_to_source(backup: &Path, target: &Path) -> Result<(), String> {
         // §30 随机临时名：恢复全部 / 事务回滚可能同时在多个文件上写回原图。
         // 写坏时 StagedOutput 自己收走临时文件，覆盖失败绝不动用户当前的目标文件。
@@ -1542,8 +1545,48 @@ impl HistoryStore {
             let _guard = access
                 .acquire(&parent, reauth)
                 .ok_or(RestoreError::AccessDenied)?;
-            Self::write_backup_back_to_source(&backup, &target)
-                .map_err(RestoreError::Io)?;
+            // 本轮加固 F5：写回也走提交原语，不再无条件 rename。
+            // - 跨格式：源位置在提交时已腾空 —— 三级台阶装进去；位置上已经放着
+            //   原图本身（上次恢复的残留）就无需写回，直接收敛；放着**别的**文件
+            //   就拒绝 —— 那不是我们承诺要恢复的位置，盖掉的就是用户的字节。
+            // - 同格式且源位在：先原子交换、再验证被换出来的身份与内容指纹
+            //   （对不上换回撤销）。force = 用户确认覆盖被改过的产物，内容指纹
+            //   放行，但 inode/大小/时间戳门保留 —— 第三方文件顶进来照样拒绝。
+            // - 同格式且源位已空（用户删掉了产物）：按空位装回，恢复入口照常。
+            let cross_format = entry
+                .output_path
+                .as_deref()
+                .is_some_and(|output| !same_file(Path::new(output), &target));
+            let original_already_in_place = cross_format
+                && target.exists()
+                && matches!(
+                    (
+                        entry.source_sha256.as_deref(),
+                        crate::source_identity::sha256_of(&target)
+                    ),
+                    (Some(recorded), Ok(current)) if recorded == current
+                );
+            if cross_format && target.exists() && !original_already_in_place {
+                return Err(RestoreError::Io(format!(
+                    "原位置已存在其他文件（{}），恢复拒绝覆盖；请先确认那个文件的去留",
+                    target.display()
+                )));
+            }
+            if !original_already_in_place {
+                if cross_format || !target.exists() {
+                    crate::output_transaction::write_back_to_vacated_path(&backup, &target)
+                        .map_err(RestoreError::Io)?;
+                } else {
+                    let expected = crate::source_identity::SourceIdentity::read(&target)
+                        .map_err(|error| RestoreError::Io(error.to_string()))?;
+                    let expected = crate::source_identity::SourceIdentity {
+                        sha256: if force { None } else { entry.output_sha256.clone() },
+                        ..expected
+                    };
+                    crate::output_transaction::write_back_verified(&backup, &target, &expected)
+                        .map_err(RestoreError::Io)?;
+                }
+            }
             // §48 产物清理失败 = 原图恢复成功 + 告警，不是失败。
             let warning = Self::remove_generated_output(entry).err();
             drop(_guard);
@@ -1580,7 +1623,23 @@ impl HistoryStore {
                     let _guard = access
                         .acquire(&dir, reauth)
                         .ok_or(RestoreError::AccessDenied)?;
-                    fs::remove_file(path).map_err(|e| RestoreError::Io(e.to_string()))?;
+                    // 本轮加固 F6：删除也走"隔离 + 身份复核"的 retire 原语 ——
+                    // 冲突检查到删除之间被外部换掉的文件不再被误删。force =
+                    // 用户确认删掉被编辑过的产物：内容指纹放行，但隔离认领与
+                    // 占位身份复核保留（确认的是"这份产物可以删"，不是
+                    // "这条路径上随便什么都可以删"）。
+                    let identity = crate::source_identity::SourceIdentity::read(path)
+                        .map_err(|error| RestoreError::Io(error.to_string()))?;
+                    let identity = crate::source_identity::SourceIdentity {
+                        sha256: if force { None } else { entry.output_sha256.clone() },
+                        ..identity
+                    };
+                    let retired = if force {
+                        crate::output_transaction::retire_confirmed(path)
+                    } else {
+                        crate::output_transaction::retire_original(path, &identity)
+                    };
+                    retired.map_err(RestoreError::Io)?;
                 } else {
                     // §46 上次删除可能成功、只是记录没删掉：再点一次照样收敛。
                     already_restored = true;
@@ -2114,12 +2173,116 @@ mod tests {
         entry.output_modified_at = file_mtime_millis(&output);
         entry.output_path = Some(output.to_string_lossy().into_owned());
         entry.output_sha256 = crate::source_identity::sha256_of(&output).ok();
-        fs::write(&source, b"converted").unwrap();
+        // 跨格式提交后的真实状态：原图位已腾空（原图被 retire）。本轮加固 F5 起，
+        // 源位上有别的文件时恢复是拒绝而不是覆盖 —— 见
+        // restore_refuses_when_the_vacated_source_slot_holds_a_foreign_file。
+        fs::remove_file(&source).unwrap();
         store.add(entry.clone()).unwrap();
 
         store.restore(&entry, false, false, open_access().as_ref(), &mut || false).unwrap();
         assert_eq!(fs::read(&source).unwrap(), b"true-original");
         assert!(!output.exists());
+    }
+
+    /// 本轮加固 F5：跨格式提交腾出来的原图位被外部放进了自己的文件 ——
+    /// 恢复必须拒绝，别人的字节一个都不许盖，产物也先留着。
+    #[test]
+    fn restore_refuses_when_the_vacated_source_slot_holds_a_foreign_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let source = sample_source(dir.path(), "photo.png", b"true-original");
+        let backup = store.ensure_backup(&source).unwrap();
+        let output = dir.path().canonicalize().unwrap().join("photo.jpg");
+        fs::write(&output, b"converted").unwrap();
+
+        let mut entry = entry_for(&source, &backup, now_millis());
+        entry.compressed_size = fs::metadata(&output).unwrap().len();
+        entry.output_modified_at = file_mtime_millis(&output);
+        entry.output_path = Some(output.to_string_lossy().into_owned());
+        entry.output_sha256 = crate::source_identity::sha256_of(&output).ok();
+        store.add(entry.clone()).unwrap();
+
+        fs::write(&source, b"someone-else-moved-in").unwrap();
+        let outcome = store.restore(&entry, false, false, open_access().as_ref(), &mut || false);
+        assert!(outcome.is_err(), "源位被外部占用只能是拒绝: {outcome:?}");
+        assert_eq!(fs::read(&source).unwrap(), b"someone-else-moved-in");
+        assert!(output.exists(), "产物还没到该删的时候");
+        assert!(dir_of_backup(&backup).exists(), "备份原样保留");
+    }
+
+    /// 跨格式恢复写回原图之后历史没落盘（崩溃残留）：原位上已经是原图本身，
+    /// 再点一次直接收敛 —— 清产物、标 restored，不误判成外部占用。
+    #[test]
+    fn restoring_a_cross_format_entry_whose_original_already_sits_in_place_converges() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let source = sample_source(dir.path(), "photo.png", b"true-original");
+        let backup = store.ensure_backup(&source).unwrap();
+        let output = dir.path().canonicalize().unwrap().join("photo.jpg");
+        fs::write(&output, b"converted").unwrap();
+
+        let mut entry = entry_for(&source, &backup, now_millis());
+        entry.compressed_size = fs::metadata(&output).unwrap().len();
+        entry.output_modified_at = file_mtime_millis(&output);
+        entry.output_path = Some(output.to_string_lossy().into_owned());
+        entry.output_sha256 = crate::source_identity::sha256_of(&output).ok();
+        store.add(entry.clone()).unwrap();
+
+        let restored = store.restore(&entry, false, false, open_access().as_ref(), &mut || false).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"true-original", "原图位上的原图不许被动过");
+        assert!(!output.exists(), "产物照常清掉");
+        assert_eq!(store.list()[0].status, HistoryStatus::Restored);
+        let _ = restored;
+    }
+
+    /// 本轮加固 F6：后缀撤销的删除走"隔离 + 身份复核"的 retire 原语 ——
+    /// 检查通过的正常删除照常成立，原图分文不动。
+    #[test]
+    fn suffix_undo_deletes_through_the_fingerprint_gated_retire() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let source = sample_source(dir.path(), "photo.png", b"original-never-touched");
+        let output = dir.path().canonicalize().unwrap().join("photo_compressed.jpg");
+        fs::write(&output, b"compressed-bytes").unwrap();
+
+        let mut entry = entry_for(&source, &dir.path().join("unused-backup"), now_millis());
+        entry.output_mode = "suffix".into();
+        entry.output_path = Some(output.to_string_lossy().into_owned());
+        entry.compressed_size = fs::metadata(&output).unwrap().len();
+        entry.output_modified_at = file_mtime_millis(&output);
+        entry.output_sha256 = crate::source_identity::sha256_of(&output).ok();
+        entry.source_sha256 = crate::source_identity::sha256_of(&source).ok();
+        entry.backup_path = None;
+        store.add(entry.clone()).unwrap();
+
+        store.restore(&entry, false, false, open_access().as_ref(), &mut || false).unwrap();
+        assert!(!output.exists(), "产物已按指纹对账后删除");
+        assert_eq!(fs::read(&source).unwrap(), b"original-never-touched", "原图分文不动");
+    }
+
+    /// 后缀撤销 + force：用户确认删掉被编辑过的产物 —— 内容复核放行，
+    /// 但删除依旧只删得到那一处路径，原图照旧不动。
+    #[test]
+    fn suffix_undo_with_force_deletes_the_confirmed_product_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let source = sample_source(dir.path(), "photo.png", b"original-never-touched");
+        let output = dir.path().canonicalize().unwrap().join("photo_compressed.jpg");
+        fs::write(&output, b"photoshop-edited-this").unwrap();
+
+        let mut entry = entry_for(&source, &dir.path().join("unused-backup"), now_millis());
+        entry.output_mode = "suffix".into();
+        entry.output_path = Some(output.to_string_lossy().into_owned());
+        entry.compressed_size = 16;
+        entry.output_sha256 = Some("sha-of-the-recorded-product".into());
+        entry.source_sha256 = crate::source_identity::sha256_of(&source).ok();
+        entry.backup_path = None;
+        store.add(entry.clone()).unwrap();
+
+        assert!(HistoryStore::has_conflict(&entry), "被编辑的产物必须先判成冲突");
+        store.restore(&entry, true, false, open_access().as_ref(), &mut || false).unwrap();
+        assert!(!output.exists(), "确认过的产物删除照常成立");
+        assert_eq!(fs::read(&source).unwrap(), b"original-never-touched");
     }
 
     #[test]
@@ -2632,7 +2795,9 @@ mod tests {
         entry.compressed_size = fs::metadata(&output).unwrap().len();
         entry.output_modified_at = file_mtime_millis(&output);
         entry.output_sha256 = crate::source_identity::sha256_of(&output).ok();
-        fs::write(&source, b"converted").unwrap();
+        // 跨格式提交后的真实状态：原图位已腾空（本轮加固 F5 起，源位上躺着
+        // 别的文件时恢复是拒绝而不是覆盖）。
+        fs::remove_file(&source).unwrap();
         store.add(entry.clone()).unwrap();
         (store, entry, source, output, out_dir)
     }

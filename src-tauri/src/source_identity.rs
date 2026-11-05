@@ -160,7 +160,7 @@ pub fn sha256_of(path: &Path) -> Result<String, SourceError> {
 }
 
 /// 已经打开的文件上的身份：一次 `fstat`，不重开路径。
-fn fd_identity(file: &fs::File) -> Result<SourceIdentity, SourceError> {
+pub(crate) fn fd_identity(file: &fs::File) -> Result<SourceIdentity, SourceError> {
     let meta = file
         .metadata()
         .map_err(|error| SourceError::Unreadable(error.to_string()))?;
