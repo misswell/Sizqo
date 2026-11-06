@@ -170,6 +170,40 @@ fn identity_of_open(file: &fs::File) -> Option<(u64, u64)> {
     crate::source_identity::fd_identity(file).ok().and_then(|id| id.identity)
 }
 
+/// 一个**开着句柄**的占位文件：提交前靠它证明"目标位上还是我们建的那个"。
+///
+/// 只比 `(dev,ino)` 是不够的：ext4 等文件系统在 unlink 之后会立刻复用 inode，
+/// 外部"删掉占位 → 在同路径建自己的文件"能恰好拿到同一个 inode，凭证就被骗过了
+/// （CI 的 ubuntu 作业实测抓到了这一条）。所以句柄必须一直开着：
+/// - unix：`nlink == 0` 说明我们那个名字已经被 unlink，哪怕 inode 被复用也认得出；
+/// - Windows：文件 ID 在**任一打开的句柄存在期间**不会被复用，`(volume,index)`
+///   这一层就足以证明；再加路径 stat 对一次。
+struct ClaimedPlaceholder {
+    path: PathBuf,
+    file: fs::File,
+    identity: (u64, u64),
+}
+
+impl ClaimedPlaceholder {
+    /// 目标位上的名字还是我们建的那个占位吗？
+    fn still_ours(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match self.file.metadata() {
+                // 名字被 unlink 掉了：我们那个 inode 还有一份打开句柄，但已经没有
+                // 目录项指向它。此时同路径上的任何文件都不是我们的。
+                Ok(meta) if meta.nlink() == 0 => return false,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        // 路径当前解析到的必须是同一份文件。Windows 上这条路同时挡住
+        // "句柄被关掉之后 ID 才可能被复用"的那类。
+        file_identity(&self.path) == Some(self.identity)
+    }
+}
+
 pub const TRANSACTIONS_DIR: &str = "transactions";
 
 #[derive(Debug, Default)]
@@ -862,10 +896,12 @@ pub(crate) fn write_back_to_vacated_path(backup: &Path, target: &Path) -> Result
 
 // MARK: - §28 跨格式替换：删掉原图时的归属证明
 
-/// 一次隔离名认领：路径 + 占位的 `(dev,ino)` 凭证（从还开着的句柄上取）。
+/// 一次隔离名认领：路径 + 占位的 `(dev,ino)` 凭证 + **还开着的句柄**。
 struct QuarantineClaim {
     path: PathBuf,
     identity: Option<(u64, u64)>,
+    /// 句柄必须开到改名完成：只比 `(dev,ino)` 挡不住 inode 复用。
+    handle: Option<fs::File>,
 }
 
 /// 在同目录独占认领一个隔离名（O_EXCL）：改名过去不可能盖掉任何人的文件 ——
@@ -880,18 +916,42 @@ fn claim_quarantine_name(file: &Path) -> Result<QuarantineClaim, String> {
         .suffix(".keep")
         .tempfile_in(directory)
         .map_err(|error| format!("无法认领隔离名（{error}）"))?;
-    let identity = identity_of_open(named.as_file());
-    let path = named
-        .into_temp_path()
+    let (handle, path) = named
         .keep()
         .map_err(|error| format!("隔离名落盘失败（{error}）"))?;
-    Ok(QuarantineClaim { path, identity })
+    let identity = identity_of_open(&handle);
+    Ok(QuarantineClaim {
+        path,
+        identity,
+        handle: Some(handle),
+    })
 }
 
 /// 隔离占位还是我们的吗？对不上 = O_EXCL 占位被外部换成自己的文件，
 /// 此时往这个名字上 rename 就是覆盖 —— 拒绝，外来字节分文不动。
 fn quarantined_still_ours(claim: &QuarantineClaim) -> Result<(), String> {
-    if file_identity(&claim.path) == claim.identity {
+    let intact = match (&claim.handle, claim.identity) {
+        (Some(handle), Some(expected)) => {
+            // 与 ClaimedPlaceholder 同一套判据：先看句柄还有没有目录项（unix nlink），
+            // 再看路径解析到的还是不是同一份文件。
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                match handle.metadata() {
+                    Ok(meta) if meta.nlink() == 0 => false,
+                    Ok(_) => file_identity(&claim.path) == Some(expected),
+                    Err(_) => false,
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                file_identity(&claim.path) == Some(expected)
+            }
+        }
+        // 取不到凭证/句柄：证明不了归属，按拒绝处理。
+        _ => false,
+    };
+    if intact {
         Ok(())
     } else {
         Err(format!(
@@ -900,6 +960,9 @@ fn quarantined_still_ours(claim: &QuarantineClaim) -> Result<(), String> {
         ))
     }
 }
+
+// 句柄随 `QuarantineClaim` 一起随作用域释放 —— 故意不在改名之前提前 drop：
+// 早了就等于把"这个名字还是我们的"的唯一证据丢掉。
 
 /// 原子的「不覆盖改名」：目标已存在就失败，绝不替换任何人的文件。
 ///
@@ -1003,22 +1066,33 @@ fn no_replace_unsupported(error: &std::io::Error) -> bool {
     }
 }
 
-/// 用 `O_EXCL` 把目标名独占下来，返回认领到的 `(dev,ino)` 供提交前核对。
+/// 用 `O_EXCL` 把目标名独占下来，句柄**一直开着**到提交完成。
 ///
 /// 这是各平台、各文件系统都原子的一步（`open(O_CREAT|O_EXCL)` / `CreateFileW` 的
-/// `CREATE_NEW`）：别人建不出这个名字，之后 rename 覆盖的只可能是我们刚建的那个
-/// 0 字节文件 —— 前提是提交前核得出"还是那个文件"。凭证从**还开着的句柄**上取
-/// （本轮加固 F1：句柄即弃、按路径重 stat 的旧写法，凭证本身就隔着一窗口）。
-fn claim_empty_placeholder(target: &Path) -> Result<Option<(u64, u64)>, String> {
+/// `CREATE_NEW`）：别人建不出这个名字。但"之后 rename 覆盖的只可能是我们那个
+/// 0 字节文件"这句话，只有在提交前核得出"还是那个文件"时才成立 —— 所以凭证
+/// 从**还开着的句柄**上取，且句柄不许提前关（`ClaimedPlaceholder::still_ours`）。
+fn claim_placeholder(target: &Path) -> Result<ClaimedPlaceholder, String> {
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(target)
     {
         Ok(file) => {
-            let identity = identity_of_open(&file);
-            drop(file);
-            Ok(identity)
+            let Some(identity) = identity_of_open(&file) else {
+                // 拿不到身份就证明不了归属：占位收回去，拒绝提交。
+                drop(file);
+                let _ = fs::remove_file(target);
+                return Err(format!(
+                    "无法取得占位文件的身份（{}），放弃覆盖以保护它",
+                    target.display()
+                ));
+            };
+            Ok(ClaimedPlaceholder {
+                path: target.to_path_buf(),
+                file,
+                identity,
+            })
         }
         Err(error) => Err(format!("目标位置已被外部占用（{error}），放弃覆盖以保护它")),
     }
@@ -1070,31 +1144,28 @@ fn install_at_free_path(candidate: &Path, target: &Path) -> Result<(), String> {
         }
     }
 
-    let claimed = claim_empty_placeholder(target)?;
+    let claimed = claim_placeholder(target)?;
     #[cfg(test)]
     inject_placeholder_steal_fault(target);
     // 本轮加固 F1：提交之前必须证明目标位上还是我们刚认领的那个占位。
     // 占位被外部删掉再放自己的文件进来时，这里的 rename 就是覆盖别人 ——
     // 身份对不上（或证明不了）就拒绝，绝不用覆盖式 rename 碰运气。
-    if file_identity(target) != claimed {
+    if !claimed.still_ours() {
         return Err(format!(
             "目标位上的占位文件已不是本次认领的那个（{}），放弃覆盖以保护它",
             target.display()
         ));
     }
-    match fs::rename(candidate, target) {
+    let outcome = fs::rename(candidate, target);
+    // 认领句柄到这一刻才松手：早了就等于把凭证提前丢掉。
+    drop(claimed);
+    match outcome {
         Ok(()) => Ok(()),
-        Err(error) => {
-            // 只收走证明得了归属的占位：仍是刚才认领的那个 inode。
-            if claimed.is_some() && file_identity(target) == claimed {
-                let _ = fs::remove_file(target);
-            }
-            Err(format!(
-                "{} → {}: {error}",
-                candidate.display(),
-                target.display()
-            ))
-        }
+        Err(error) => Err(format!(
+            "{} → {}: {error}",
+            candidate.display(),
+            target.display()
+        )),
     }
 }
 
@@ -1564,18 +1635,17 @@ enum RelocateStep {
 /// 无覆盖改名不可用时的最后一级迁移：O_EXCL 占位 + 提交前身份复核，
 /// 与 `install_at_free_path` 台阶③同一套纪律（本轮加固 F1 同款守卫）。
 fn relocate_via_exclusive_placeholder(staged: &Path, candidate: &Path) -> RelocateStep {
-    let claimed = match claim_empty_placeholder(candidate) {
+    let claimed = match claim_placeholder(candidate) {
         Ok(claimed) => claimed,
         Err(_) => return RelocateStep::Occupied,
     };
-    if file_identity(candidate) != claimed {
+    if !claimed.still_ours() {
         return RelocateStep::Failed;
     }
-    if fs::rename(staged, candidate).is_ok() {
+    let outcome = fs::rename(staged, candidate);
+    drop(claimed);
+    if outcome.is_ok() {
         return RelocateStep::Placed(candidate.to_path_buf());
-    }
-    if file_identity(candidate) == claimed {
-        let _ = fs::remove_file(candidate);
     }
     RelocateStep::Failed
 }
