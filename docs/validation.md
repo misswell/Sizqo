@@ -2567,6 +2567,20 @@ Windows 分支（`identity_of_open` 的 `GetFileInformationByHandle` 支、`Move
 
 ### 尚未做（R3–R5，见路线图）
 
+## 0.3.6-rc.10（2026-11-06）：R1+R2 加固收口
+
+| 项目 | 读数 |
+| --- | --- |
+| CI run | [42221134520](https://github.com/misswell/Sizqo/actions/runs/42221134520) 六作业全绿（rust-tests / rust-tests-macos / windows-tests / appstore-tests / frontend-tests / swift-checks） |
+| 本机 | `cargo test --lib` 289 passed；Swift 自检全绿（§46 17 条 + 契约向量 32 条）；全源 typecheck exit 0；前端 29 套 PASS |
+| 关键修复 | 占位身份改为"持有打开句柄 + unix nlink 判 unlink"：CI ubuntu 实测抓到 inode 复用会骗过 `(dev,ino)` 相等，旧写法在 Linux 上红、macOS 上绿；修复后六作业全绿 |
+
+内容 = R1 文件安全六项（占位/隔离/冲突占名/凭证缺失拒绝/恢复写回复核/删除指纹门）
++ R2 Swift 取消链、恢复幂等与身份复核、`missing` 恢复入口、内存预算。
+
+**仍未通过正式发布门禁**：签名/公证/装订、装包内视频引擎、验收矩阵、
+macOS 真实媒体矩阵、R3–R5 未实施。本次只发预发布（pre-release）。
+
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
 Before any tag/Release: full three-track build, signed Direct runtime check,
