@@ -2700,7 +2700,7 @@ macOS 真实媒体矩阵、R3–R5 未实施。本次只发预发布（pre-relea
 
 T14（章节/program 隐私标签）的**清理器语义**由预检拒绝实现（plan.rs，FFmpeg 无法逐键清理这两个作用域），真实章节标签夹具需要 mkv 工具链（mkvmerge 等）——单测以合成 probe 覆盖共享作用域定义，如实记录这一限制。
 
-rc.15 CI 首跑再抓两处平台差异并当轮修复（随 rc.15 重推）：
+rc.15 CI 首跑再抓两处平台差异，当轮修复随 rc.16 落地（rc.15 tag 的 Tests 有两项平台性红，标记为中间态）：
 1. **Windows 附件 filename 标签 = 完整路径**（反斜杠不被 ffmpeg 当分隔符裁剪）——
    对账层新增 `attachment_base_name` 归一（两种分隔符都裁），测试断言同步。
 2. **Ubuntu（ffmpeg 4.4）VFR 夹具的 setpts 单引号包裹不稳**——改为 filtergraph
