@@ -2646,7 +2646,7 @@ macOS 真实媒体矩阵、R3–R5 未实施。本次只发预发布（pre-relea
 - `CompressionEngine.swift`：多帧统一检测 + 方向烘焙替换四处裸解码。
 - `HistoryStore.swift`：3 处 `StagedTemp.claim` 调用点同步（内核整份复制路径，句柄使命到认领为止）。
 
-### Windows CI 首轮抓到的 4 处平台差异（rc.11 tag 后立即修复，随 rc.12）
+### Windows CI 抓到的平台差异（rc.11 tag 后两轮修复：rc.12 四项 + rc.13 第五项）
 
 1. `publish_claimed_via_quarantine`（无原子交换平台的占位凭证路线）被统一接到
    "保留换出字节"的尾巴上——被换出的是**我们自己的 0 字节占位**，不是用户字节，
@@ -2660,6 +2660,12 @@ macOS 真实媒体矩阵、R3–R5 未实施。本次只发预发布（pre-relea
 4. T17 改为跨平台现场（占位凭证失效 + 计划位被外部占住 → 换号重试），另加
    "认领完好 → 产物落计划位"的正向用例；Windows 上持有句柄的占位本就抢不走
    名字，真实偷换路径由 T03 覆盖。
+5. （rc.13）视频 commit 的三处 `fs::File::open().sync_all()`（partial 落盘确认、
+   备份落盘确认）用**只读句柄**调 `FlushFileBuffers` —— Windows 一律
+   ACCESS_DENIED。视频线此前从没在 Windows 上真的跑过 commit（没有任何 Windows
+   测试走到这一步），T 系列跨平台回归第一次把它跑进 CI。修复为 `fsync_file`：
+   Windows 用 read+write + 全共享模式打开再 fsync，与 `history::sync_dir` 当年
+   修过的是同一类坑。
 
 ### 行为变化（有意，均如实呈现）
 

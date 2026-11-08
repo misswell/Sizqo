@@ -68,19 +68,36 @@ pub fn claim_output(source:&Path,o:&VideoOptions,roots:&[String],per_task_relati
 /// 目录项落盘：只有 `history::sync_dir` 一处按平台要求开句柄（Windows 需要 backup
 /// semantics + 写访问），视频线不许自带一份只读句柄的实现。
 pub fn sync_dir(path:&Path)->Result<(),String>{crate::history::sync_dir(path)}
+/// fsync 一个文件。**必须带写权限打开**：Windows 的 `FlushFileBuffers` 对只读句柄
+/// 一律返回 ACCESS_DENIED（与 `history::sync_dir` 修过的是同一类坑）——视频线此前
+/// 从没在 Windows 上真的跑过 commit，只读句柄的 fsync 一直是每条视频任务的
+/// 必败点，直到 T17 的跨平台回归第一次把它跑进 CI。
+pub fn fsync_file(path:&Path)->Result<(),String>{
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_ALL:u32=0x0000_0007;
+        fs::OpenOptions::new().read(true).write(true).share_mode(FILE_SHARE_ALL)
+            .open(path).and_then(|f|f.sync_all()).map_err(|e|format!("{}: {e}",path.display()))
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path).and_then(|f|f.sync_all()).map_err(|e|format!("{}: {e}",path.display()))
+    }
+}
 #[allow(clippy::too_many_arguments)]
 pub fn commit(source:&Path,partial:&Path,target:&Path,o:&VideoOptions,probe:&VideoProbe,result:&mut VideoResult,history:&HistoryStore,transactions:&TransactionStore,retention:u32,identity:&SourceIdentity,backup:Option<&Path>,claimed:&mut Option<crate::output_transaction::ClaimedOutput>)->Result<(),String>{
     // §25 覆盖前复核：这次编码所依据的那份字节，现在还是不是它。
     // replace 的 identity 带内容指纹（§3.2）：同大小同时间戳的原地改动也查得出。
     if let SourceCheck::Changed(detail)=identity.verify(source){return Err(format!("Source changed during encoding; original was not overwritten ({detail})"));}
     let size=fs::metadata(partial).map_err(|e|e.to_string())?.len();
-    fs::File::open(partial).and_then(|f|f.sync_all()).map_err(|e|e.to_string())?;
+    fsync_file(partial)?;
     let replace=o.output_mode=="replace";
     // §3.2 备份在编码之前就已备好（ffmpeg_backend）；一场长编码之后它必须重新过验：
     // 备份没了或字节变了，这次覆盖就没有可信的恢复依据。
     if replace&&backup.is_none(){return Err("Replace mode lost its pre-encode original backup".into());}
     if let Some(backup)=backup {
-        fs::File::open(backup).and_then(|f|f.sync_all()).map_err(|e|e.to_string())?;
+        fsync_file(backup)?;
         sync_dir(backup.parent().ok_or("Backup parent missing")?)?;
         if let Err(detail)=history.backup_is_faithful(backup){return Err(format!("Original backup failed verification before commit: {detail}"));}
     }
