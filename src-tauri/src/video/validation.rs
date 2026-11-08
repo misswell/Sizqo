@@ -649,7 +649,10 @@ mod tests {
             .iter()
             .find(|s| s.codec_type == "attachment")
             .expect("夹具必须真的带附件");
-        assert_eq!(source_attachment.tags["filename"], "manual.txt");
+        assert!(
+            attachment_base_name(source_attachment.tags["filename"].as_str().unwrap_or("")) == "manual.txt",
+            "夹具附件名字丢失: {:?}", source_attachment.tags["filename"]
+        );
 
         // 同一份文件对同一份文件：内容一致 → Ok。
         verify_attachments_content(&source_probe, &source_probe, &source, &source)
@@ -674,7 +677,7 @@ mod tests {
             .unwrap();
         let encoded_probe = crate::video::probe::probe(&encoded).unwrap();
         assert_eq!(
-            encoded_probe.streams.iter().find(|s| s.codec_type == "attachment").unwrap().tags["filename"],
+            attachment_base_name(encoded_probe.streams.iter().find(|s| s.codec_type == "attachment").unwrap().tags["filename"].as_str().unwrap_or("")),
             "manual.txt",
             "名字一致才能把差异逼到内容层"
         );
@@ -815,7 +818,7 @@ fn extract_attachment_digests(
     })?;
     let mut digests = std::collections::BTreeMap::new();
     for (position, stream) in attachments.iter().enumerate() {
-        let name = stream.tags["filename"].as_str().unwrap_or("").to_string();
+        let name = attachment_base_name(stream.tags["filename"].as_str().unwrap_or("")).to_string();
         if name.is_empty() {
             return Err(format!(
                 "{label} attachment stream #{} has no filename tag; its content cannot be verified",
@@ -856,6 +859,13 @@ fn extract_attachment_digests(
     Ok(digests)
 }
 
+/// 附件名字归一：Windows 上 ffmpeg/ffprobe 会把**完整路径**存进 filename 标签
+/// （反斜杠分隔符不被 ffmpeg 当作目录分隔裁剪——rc.15 首跑 CI 实证），
+/// 名字/内容对账必须按 basename 归一，两种分隔符都裁。
+fn attachment_base_name(tag: &str) -> &str {
+    tag.rsplit(['/', '\\']).next().unwrap_or(tag)
+}
+
 /// KeepAll 的附件对账：数量 + 名字（内容指纹由紧随其后的
 /// `verify_attachments_content` 在有媒体路径时补齐 —— 解包文件才算得出，
 /// ffprobe 不提供字节视图）。
@@ -877,7 +887,7 @@ fn keep_all_attachments_match(source: &VideoProbe, output: &VideoProbe) -> Resul
         s.tags["filename"].as_str().unwrap_or("")
     }
     for (index, (expected, carried)) in source_att.iter().zip(output_att.iter()).enumerate() {
-        if attachment_name(expected) != attachment_name(carried) {
+        if attachment_base_name(attachment_name(expected)) != attachment_base_name(attachment_name(carried)) {
             return Err(format!(
                 "Encoded output changed attachment #{index} ({} → {})",
                 attachment_name(expected),

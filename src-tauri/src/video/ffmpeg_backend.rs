@@ -413,7 +413,9 @@ mod tests {
         // 帧数不变（120）—— 真正的 VFR 材料，不是丢帧。
         let vfr=make_fixture(root,"vfr-source.mkv",&[
             "-f","lavfi","-i","testsrc2=duration=4:size=160x120:rate=30",
-            "-vf","setpts='if(gt(N,59), PTS*2, PTS)'",timing.as_str(),"vfr",
+            // 转义逗号而非单引号包裹：filtergraph 的标准转义写法，老版本 ffmpeg
+// （ubuntu 22.04 的 4.4）同样成立——rc.15 首跑在 CI 上实证过引号路径不稳。
+            "-vf","setpts=if(gt(N\\,59)\\,PTS*2\\,PTS)",timing.as_str(),"vfr",
             "-c:v","libx264","-preset","ultrafast","-pix_fmt","yuv420p"]);
         let source_pts=frame_pts(&vfr);
         assert!(pts_holds_a_doubled_gap(&source_pts),"夹具时间戳必须真的有变间隔（前 70 帧内同时存在 ~33ms 与 ≥67ms 间隔）");
@@ -493,7 +495,10 @@ mod tests {
         assert_eq!(out_ac3.tags["title"],"Secondary","标题 tag 丢了");
         assert_eq!(out.chapters[0]["tags"]["title"],"Intro","章节标题丢了");
         let out_att=out.streams.iter().find(|s|s.codec_type=="attachment").unwrap();
-        assert_eq!(out_att.tags["filename"],"credits.txt","附件名字丢了");
+        // Windows 上 ffmpeg 把完整路径存进 filename 标签（rc.15 首跑实证）：
+        // 按 basename 归一后比对，与 validation 层的归一规则一致。
+        let out_name=out_att.tags["filename"].as_str().unwrap_or("");
+        assert!(out_name.ends_with("credits.txt"),"附件名字丢了: {out_name}");
         // encode 内部的 KeepAll validate 已带路径跑过内容 SHA256 对账；
         // 这里把两侧真实文件再显式对一次，作为独立证据。
         validation::verify_attachments_content(&source_probe,&out,&multi,&output)
