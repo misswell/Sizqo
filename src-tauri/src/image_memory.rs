@@ -21,6 +21,14 @@ pub const UNKNOWN_ESTIMATE_BYTES: usize = 512 * 1024 * 1024;
 
 const MIN_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const MAX_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// 单任务内存硬上限（本轮加固 P2-15 / T20）。与并发预算是两回事：
+/// 预算决定几张图能一起跑，硬上限决定**任何**任务能不能开跑 ——
+/// 估算确认（读出了真实尺寸）超过这条线的解码矩阵，连空场放行都不许：
+/// 开始处理就是确定性的失败，明确拒绝比 OOM 拖垮整个应用诚实。
+/// 读不出尺寸（`known == false`）的任务不在此列：512 MiB 的兜底估算
+/// 是"不知道"，不是"知道很大"，把未知全部拒掉等于拒绝所有异格式输入。
+pub const MAX_SINGLE_TASK_BYTES: usize = 4 * 1024 * 1024 * 1024;
 /// `ispe` 盒通常在 `meta` 里、位于 `mdat` 之前；只读文件头，不碰像素。
 const BMFF_HEADER_SCAN_BYTES: u64 = 4 * 1024 * 1024;
 

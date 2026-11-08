@@ -3,16 +3,6 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-// MARK: - Cancel tracking (thread-safe, nonisolated)
-
-final class CancelBox: @unchecked Sendable {
-    private var paths: Set<String> = []
-    private let lock = NSLock()
-    func insert(_ p: String) { lock.lock(); paths.insert(p); lock.unlock() }
-    func contains(_ p: String) -> Bool { lock.lock(); defer { lock.unlock() }; return paths.contains(p) }
-    func removeAll() { lock.lock(); paths.removeAll(); lock.unlock() }
-}
-
 // MARK: - Theme
 
 enum AppTheme: String, CaseIterable {
@@ -869,9 +859,22 @@ final class AppState: ObservableObject {
                 // 已经在跑的文件会正常完成（不 kill、不 SIGSTOP）。
                 // 被取消的文件在闸门**之前**就自己退出，不需要谁替它开门。
                 let estimatedMemory = ImageMemory.estimate(path: path)
+                // P2-15 / T20：单任务内存硬上限在**进入调度器之前**判断。
+                // 估算确认（读出了真实尺寸）且超过 maxSingleTaskBytes 的任务，
+                // 连空场放行都不许 —— 开始处理就是确定性的失败。明确拒绝并照实报因，
+                // 绝不假装"再等等就能跑"。`active == 0 永远放行` 的空场逻辑仍归
+                // 调度器的预算闸管，这条硬上限是它之前的一道独立门。
+                if estimatedMemory.known, estimatedMemory.bytes > ImageMemory.maxSingleTaskBytes {
+                    DispatchQueue.main.async {
+                        self.applyResourceLimited(
+                            path: path, itemID: itemID, revision: revision,
+                            sessionID: sessionID, estimatedBytes: estimatedMemory.bytes)
+                    }
+                    return
+                }
                 switch gate.acquireOutcome(
                     cancelled: { [self] in self.isCancelled(path) },
-                    memoryBytes: estimatedMemory
+                    memoryBytes: estimatedMemory.bytes
                 ) {
                 case .cancelled:
                     // 用户明确把它移出了队列：它本轮到此为止，不回到 pending。
@@ -902,6 +905,7 @@ final class AppState: ObservableObject {
                     let result = Self.compressOneStatic(
                         path: path, relativePath: relativePath, options: opts, useSmart: useSmart,
                         history: store, transactions: journal, retentionDays: retention,
+                        cancelBox: cancels,
                         // §5.4 取消令牌：整个执行链（编码后 / 动手前 / 提交前）都能看见
                         // 用户在清空或移出队列时记下的意图。CancelBox 自带锁，跨线程安全。
                         isCancelled: { cancels.contains(path) }
@@ -996,10 +1000,12 @@ final class AppState: ObservableObject {
 
     /// 取消全部：把还在等 / 正在跑的行都移出队列（与 Tauri 的 removed 一致）。
     /// 这是**文件级**的破坏性操作，与「停止」不同 —— 停止是保留剩余任务的。
+    /// P2-14 / T08：正在提交的项取消被拒 —— 那一行保持原状，等提交完成事件
+    /// 把它收口成 done（绝不让 UI 宣称取消成功、后台却仍在发布文件）。
     func cancelAll() {
         for i in items.indices {
             if items[i].status == .pending || items[i].status == .running {
-                cancelBox.insert(items[i].path)
+                guard cancelBox.requestCancel(items[i].path) else { continue }
                 items[i].status = .removed
             }
         }
@@ -1007,15 +1013,23 @@ final class AppState: ObservableObject {
         scheduler.wakeWaiters()
     }
 
-    func cancelFile(path: String) {
+    /// 取消单个文件。返回 false = 该项正在提交、取消被拒（P2-14 / T08：
+    /// 跨过提交闸之后只能等提交或回滚收尾），行保持原样没被标成 removed，
+    /// 调用方负责把"正在提交，无法取消"呈现给用户。
+    @discardableResult
+    func cancelFile(path: String) -> Bool {
         // 只有真的在等 / 在跑的文件才记取消：已完成的行上记一笔会一直留到
         // 下一轮开工（那里才 removeAll），而它再也不会被任何 worker 读到 ——
         // 账本里躺着一条谁也解释不了的"取消"。
         guard let idx = items.firstIndex(where: { $0.path == path }),
-              items[idx].status == .running || items[idx].status == .pending else { return }
-        cancelBox.insert(path)
+              items[idx].status == .running || items[idx].status == .pending else { return false }
+        guard cancelBox.requestCancel(path) else {
+            showToast("正在提交，无法取消：\(items[idx].fileName)")
+            return false
+        }
         items[idx].status = .removed
         scheduler.wakeWaiters()
+        return true
     }
 
     nonisolated private func isCancelled(_ path: String) -> Bool {
@@ -1031,7 +1045,16 @@ final class AppState: ObservableObject {
 
     private func applyResult(_ path: String, itemID: UUID, revision: Int, sessionID: UUID, result: CompressResult) {
         guard queueRevision == revision, activeSessionID == sessionID,
-              let idx = items.firstIndex(where: { $0.id == itemID && $0.path == path && $0.status == .running }) else { return }
+              let idx = items.firstIndex(where: { $0.id == itemID && $0.path == path }) else { return }
+        // P2-14 / T08：提交期间取消被拒后任务会照常完成。行若在此期间被标成了
+        // removed（cancelAll 等路径），完成事件绝不能丢 —— 磁盘有产物而队列看不见，
+        // 正是"UI 宣称取消成功、后台仍发布文件"的另一半。带产物的结论照常接受并
+        // 恢复显示；取消/失败这类没有产物的结论不复活已移除的行。
+        if items[idx].status == .removed {
+            guard result.hasProduct else { return }
+        } else {
+            guard items[idx].status == .running else { return }
+        }
         items[idx].result = result
         // §2 §67 生命周期由结论派生：跳过、取消、未达目标都是"这一轮处理完了"（done），
         // 只有 outcome=failed 才是 Failed。
@@ -1042,12 +1065,38 @@ final class AppState: ObservableObject {
         if items[idx].attemptCount == 0 { items[idx].attemptCount = 1 }
     }
 
+    /// P2-15 / T20：单任务内存硬上限的失败结论。
+    /// 任务在进调度器之前就被拒绝（没有开工、没有候选、没碰用户文件），
+    /// 直接按 failed 收场并照实报因；进度账本照常记它（它确实走完了生命周期）。
+    private func applyResourceLimited(
+        path: String, itemID: UUID, revision: Int, sessionID: UUID, estimatedBytes: Int
+    ) {
+        guard queueRevision == revision, activeSessionID == sessionID,
+              let idx = items.firstIndex(where: { $0.id == itemID && $0.path == path }),
+              items[idx].status == .pending || items[idx].status == .running else { return }
+        let engineResult = EngineResult(
+            success: false, compressed: Data(), outType: "unknown", algorithm: "none",
+            error: "解码内存估算 \(estimatedBytes) 字节，超过单任务硬上限 "
+                + "\(CompressResult.formatBytes(Int64(ImageMemory.maxSingleTaskBytes)))；"
+                + "解码内存估算超上限，已拒绝，未动用任何资源",
+            verdict: .rejected, reason: .decodeFailed
+        )
+        var limited = CompressResult(engine: engineResult, file: path,
+                                     originalSize: items[idx].fileSize)
+        limited.outcome = .failed
+        limited.reasonCode = .decodeFailed
+        items[idx].result = limited
+        items[idx].status = .failed
+        items[idx].everProcessed = true
+        if items[idx].attemptCount == 0 { items[idx].attemptCount = 1 }
+    }
+
     // MARK: - Single compress
 
     nonisolated private static func compressOneStatic(
         path: String, relativePath: String, options: CompressOptions, useSmart: Bool,
         history: HistoryStore, transactions: OutputTransactionStore, retentionDays: Int,
-        isCancelled: () -> Bool
+        cancelBox: CancelBox, isCancelled: () -> Bool
     ) -> CompressResult {
         let originalSize = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0
         // §24 §25 覆盖模式的原图快照必须在**编码之前**落好：编码要跑几秒到几十秒，
@@ -1111,7 +1160,7 @@ final class AppState: ObservableObject {
         if let failure = writeOutputStatic(
             &result, compressed: engineResult.compressed, relativePath: relativePath, options: options,
             history: history, transactions: transactions, retentionDays: retentionDays,
-            baseline: baseline, isCancelled: isCancelled
+            baseline: baseline, cancelBox: cancelBox, isCancelled: isCancelled
         ) {
             // 落盘没成就是没成：UI 绝不许显示「压缩完成」。
             result.outputPath = nil
@@ -1174,7 +1223,7 @@ final class AppState: ObservableObject {
     nonisolated private static func writeOutputStatic(
         _ result: inout CompressResult, compressed: Data, relativePath: String, options: CompressOptions,
         history: HistoryStore, transactions: OutputTransactionStore, retentionDays: Int,
-        baseline: ReplaceBaseline, isCancelled: () -> Bool
+        baseline: ReplaceBaseline, cancelBox: CancelBox, isCancelled: () -> Bool
     ) -> OutputWriteError? {
         if compressed.isEmpty {
             return .outputWriteFailed("要写出的字节是空的")
@@ -1193,6 +1242,8 @@ final class AppState: ObservableObject {
         var replaceIdentity: SourceIdentity?
         let target: String
         let placement: OutputPlacement
+        // P1-2：独占申请到的占位（跨格式 / 新建模式才有）。凭证从认领句柄上取。
+        var claimed: ClaimedOutput?
 
         // §29 先定落盘模式，再由这一个决定派生"要不要备份""名字怎么来""事务算哪一类"。
         // 拿到手的目标名已经是独占申请到的（同格式覆盖除外：它的目标本来就是用户那个文件）。
@@ -1227,18 +1278,19 @@ final class AppState: ObservableObject {
             } else {
                 // 跨格式转换的产物是新文件，但名字照样要独占申请：photo.webp 可能是
                 // 邻居的成品，"转换"把它盖掉就不是转换而是毁掉别人的东西（§28）。
-                guard let claimed = OutputNameAllocator.claim(
+                guard let claimedOutput = OutputNameAllocator.claim(
                     in: outputDirectory(of: path),
                     .converted(stem: fileStem(of: path), extension: outType)
                 ) else {
                     return .collision(outputDirectory(of: path))
                 }
-                target = claimed.path
+                claimed = claimedOutput
+                target = claimedOutput.path
                 placement = .replaceExisting(crossFormat: true)
             }
 
         case .suffix:
-            guard let claimed = OutputNameAllocator.claim(
+            guard let claimedOutput = OutputNameAllocator.claim(
                 in: outputDirectory(of: path),
                 .withSuffix(stem: fileStem(of: path),
                             suffix: normalizedOutputSuffix(options.outputSuffix),
@@ -1246,7 +1298,8 @@ final class AppState: ObservableObject {
             ) else {
                 return .collision(outputDirectory(of: path))
             }
-            target = claimed.path
+            claimed = claimedOutput
+            target = claimedOutput.path
             placement = .createNew
 
         case .folder:
@@ -1267,23 +1320,29 @@ final class AppState: ObservableObject {
                 return .outputWriteFailed("\(dir): \(error.localizedDescription)")
             }
             let stem = ((rel as NSString).deletingPathExtension as NSString).lastPathComponent
-            guard let claimed = OutputNameAllocator.claim(
+            guard let claimedOutput = OutputNameAllocator.claim(
                 in: dir, .withSuffix(stem: stem, suffix: "", extension: outType)
             ) else {
                 return .collision(dir)
             }
-            target = claimed.path
+            claimed = claimedOutput
+            target = claimedOutput.path
             placement = .createNew
         }
         let crossFormat = placement.crossFormat
         // §3.1 占位凭证：独占申请来的 0 字节占位的 (dev,ino)。崩溃恢复时
         // "这个空文件是我们的占位"全靠它证明，没有凭证的空文件一律不删。
+        // P1-2 / F1：凭证从**还开着的认领句柄**上 fstat 取，不再按路径重开 stat
+        // —— 关掉句柄再 stat 的两步之间，路径就可能换一个 inode。
         let placeholderIdentity: (device: Int64, inode: UInt64)?
         if placement.crossFormat || placement.transactionMode == .createNew {
-            placeholderIdentity = OutputTransactionStore.fileIdentity(target)
+            placeholderIdentity = claimed?.identity ?? OutputTransactionStore.fileIdentity(target)
         } else {
             placeholderIdentity = nil
         }
+        // 凭证已经拿到手、即将落进事务日志：句柄的使命到此为止（deinit 之前显式放掉，
+        // 不让它开到提交结束）。占位文件本身照常留在磁盘上等 rename 顶替。
+        claimed = nil
         // §3.3 审查修复：同格式覆盖也有身份门 —— 用基线哈希走原子交换，
         // 验证被换出来的还是编码前钉下的那份字节，不再直接 rename。
         let baselineSha256: String? = (placement.transactionMode == .replaceExisting && !crossFormat)
@@ -1367,13 +1426,16 @@ final class AppState: ObservableObject {
             }
         }
 
-        // ⑤b 提交前最后一道取消闸（§5.4）：到这一步为止用户文件一个字节都没动，
-        //    取消的代价只是收回我们自己的临时文件、占位名和事务日志 —— 全部由
-        //    withdraw 按既有纪律处理。跨过这一行进入原子提交之后，取消不再生效，
-        //    只能等提交或回滚收尾（绝不许"界面说取消了、后台还在覆盖"）。
-        if isCancelled() {
+        // ⑤b 提交前最后一道取消闸（§5.4 + P2-14 / T08）：取消与提交竞争同一个
+        //    状态位。tryBeginCommit 赢了 = 进入提交，取消从此被拒（cancelAll /
+        //    cancelFile 对 committing 的项都拿不到取消）；取消先到 = 登记失败，
+        //    走 withdraw 收回我们自己的临时文件、占位名和事务日志。
+        //    defer endCommit 保证提交链的**所有**出口（成功 publish、失败
+        //    withdraw/rollback）都销账，committing 账不会泄到这个文件之外。
+        if !cancelBox.tryBeginCommit(path) {
             return withdraw(.cancelled)
         }
+        defer { cancelBox.endCommit(path) }
 
         // ⑥ 原子发布。同格式覆盖用基线哈希走原子交换（验证被换出的字节）；
         // 占位凭证在场时验证认领的 inode。四态：refused = 目标没动（withdraw）；

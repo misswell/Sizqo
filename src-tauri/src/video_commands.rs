@@ -5,9 +5,34 @@ use tauri::{AppHandle,State,Manager,Emitter};
 use crate::{commands::{AppState,AcquireOutcome},video::{self,VideoOptions,VideoResult,probe::VideoProbe,progress::VideoProgress}};
 #[derive(Default)]pub struct VideoRuntime {pub cancellations:Mutex<HashMap<(String,String),Arc<AtomicBool>>>}
 #[derive(Debug,Clone,Deserialize)]#[serde(rename_all="camelCase")]
-pub struct VideoTask {pub task_id:String,pub path:String}
+pub struct VideoTask {
+    pub task_id:String,pub path:String,
+    /// 本轮加固（P2-11 / T18）：导入时冻结的来源根与相对路径。给齐时**只用
+    /// 这一份**（relativePath 合法性照验：不是绝对路径、不含 `..`），批级
+    /// `sourceRoots` 的"最深根胜出"猜测不再参与决策 —— 重叠来源根的批次
+    /// 不会再因换批执行而改变输出目录结构。
+    #[serde(default)]pub source_root:Option<String>,
+    #[serde(default)]pub relative_path:Option<String>,
+}
 #[derive(Serialize)]#[serde(rename_all="camelCase")]
 pub struct ImportedMedia {path:String,name:String,size:u64,media_kind:String,video_probe:Option<VideoProbe>,warning:Option<String>,source_root:String,relative_path:String}
+/// 本轮加固（P2-13 / T19）：导入不再静默遗漏。扫描阶段的每一次失败都记账：
+/// 权限不足、目录读不了、路径解析不了、文件消失 —— 前端按这份报告呈现
+/// "实际进来了多少、谁没进来、为什么"。
+#[derive(Serialize,Default,Debug)]#[serde(rename_all="camelCase")]
+pub struct ImportReport {
+    pub scanned:usize,
+    pub imported:usize,
+    pub skipped:usize,
+    pub unsupported:usize,
+    pub permission_denied:usize,
+    pub canonicalize_failed:usize,
+    pub read_directory_failed:usize,
+    pub probe_failed:usize,
+    pub disappeared:usize,
+}
+#[derive(Serialize)]#[serde(rename_all="camelCase")]
+pub struct ImportedMediaBatch {pub media:Vec<ImportedMedia>,pub report:ImportReport}
 /// 内容级图片识别（魔数嗅探）：导入分类（probe_media）和会话收集
 /// （commands::collect_image_files）共用这一份判据，不许两套标准。
 pub(crate) fn image_header(path:&Path)->bool {
@@ -19,16 +44,32 @@ pub(crate) fn image_header(path:&Path)->bool {
 ///
 /// `root` 是这次导入的一个来源根：目录导入就是那个目录，单文件导入就是它的父目录。
 /// 之后队列项、重试、续跑、导出都只读这两个值，不再每批重新猜。
-fn collect(root:&Path,path:&Path,seen:&mut HashSet<PathBuf>,out:&mut Vec<(PathBuf,PathBuf,PathBuf)>){
+fn collect(root:&Path,path:&Path,seen:&mut HashSet<PathBuf>,out:&mut Vec<(PathBuf,PathBuf,PathBuf)>,report:&mut ImportReport){
     // 根和文件都走同一次 canonicalize：macOS 的 /var → /private/var 这类软链
     // 会让"明明是子路径"的两个字符串对不上，相对路径就退化成文件名。
-    let Ok(root)=root.canonicalize()else{return};
-    let Ok(real)=path.canonicalize()else{return};if !seen.insert(real.clone()){return;}
+    let Ok(root)=root.canonicalize()else{report.canonicalize_failed+=1;return};
+    let Ok(real)=path.canonicalize()else{report.canonicalize_failed+=1;report.disappeared+=1;return};
+    if !seen.insert(real.clone()){return;}
     // §8.1 默认不跟随指向根目录之外的符号链接：软链指去别的盘/别的目录时，
     // 导入的就成了链接目标而不是用户点开的那份树。目录循环本身由 seen 集合
     // （规范路径去重）兜住，这里再补一道"不许越界"。
-    if real.starts_with(&root)==false {return;}
-    if real.is_dir(){if let Ok(children)=std::fs::read_dir(&real){let mut children:Vec<_>=children.flatten().map(|e|e.path()).collect();children.sort();for p in children{collect(&root,&p,seen,out);}}}else if real.is_file(){
+    if real.starts_with(&root)==false {report.skipped+=1;return;}
+    if real.is_dir(){
+        report.scanned+=1;
+        match std::fs::read_dir(&real){
+            Ok(children)=>{
+                let mut children:Vec<_>=children.flatten().map(|e|e.path()).collect();
+                children.sort();
+                for p in children{collect(&root,&p,seen,out,report);}
+            }
+            // 本轮加固（P2-13）：子目录读不了不再让整个子树静默消失。
+            Err(error)=>{
+                if error.kind()==std::io::ErrorKind::PermissionDenied{report.permission_denied+=1;}
+                else{report.read_directory_failed+=1;}
+            }
+        }
+    }else if real.is_file(){
+        report.scanned+=1;
         let rel=real.strip_prefix(&root).map(Path::to_path_buf).unwrap_or_else(|_|PathBuf::from(real.file_name().unwrap_or_default()));
         out.push((real,root,rel));
     }
@@ -49,15 +90,15 @@ fn plausible_video_header(path:&Path)->bool{
 /// 是否值得为它起一次 ffprobe：明确的视频扩展名，或嗅探出了媒体容器特征。
 fn probe_candidate(path:&Path)->bool{video::is_video_extension(path)||plausible_video_header(path)}
 #[tauri::command]
-pub async fn probe_media(paths:Vec<String>,state:State<'_,AppState>)->Result<Vec<ImportedMedia>,String>{
+pub async fn probe_media(paths:Vec<String>,state:State<'_,AppState>)->Result<ImportedMediaBatch,String>{
     state.access.remember_all(&paths);let access=state.access.clone();
     tauri::async_runtime::spawn_blocking(move||{
         let mut guards=vec![];for path in &paths{guards.push(access.acquire(Path::new(path),&mut||false).ok_or_else(||format!("Select the folder again to grant access: {path}"))?);}
-        let mut files=vec![];let mut seen=HashSet::new();
-        for p in paths {
-            let Ok(real)=Path::new(&p).canonicalize()else{continue};
+        let mut files=vec![];let mut seen=HashSet::new();let mut report=ImportReport::default();
+        for p in &paths {
+            let real=match Path::new(p).canonicalize(){Ok(r)=>r,Err(_)=>{report.canonicalize_failed+=1;report.disappeared+=1;continue}};
             let root=if real.is_dir(){real.clone()}else{real.parent().map(Path::to_path_buf).unwrap_or_else(||real.clone())};
-            collect(&root,Path::new(&p),&mut seen,&mut files);
+            collect(&root,Path::new(p),&mut seen,&mut files,&mut report);
         }
         // §6.4：图片当场分类（魔数嗅探只读 64 字节，很便宜）；视频候选按槽位记录、
         // 有界并发探测；其余文件既不是图片也没有任何媒体特征，不再为它们白付 ffprobe。
@@ -115,7 +156,13 @@ pub async fn probe_media(paths:Vec<String>,state:State<'_,AppState>)->Result<Vec
         }else{
             for candidate in candidates{let (index,entry)=probe_video(candidate.index,&candidate.path,candidate.name,candidate.source_root,candidate.relative,candidate.size);slots[index]=entry;}
         }
-        Ok::<_,String>(slots.into_iter().flatten().collect())
+        // 本轮加固（P2-13）：进口名单确定后的分类对账 —— 前端按这份报告呈现
+        // 实际导入结果，"看起来全进来了"必须由后端的数字背书。
+        let media:Vec<ImportedMedia>=slots.into_iter().flatten().collect();
+        report.imported=media.len();
+        report.probe_failed=media.iter().filter(|m|m.media_kind=="video"&&m.video_probe.is_none()).count();
+        report.unsupported=report.scanned.saturating_sub(files.len());
+        Ok::<_,String>(ImportedMediaBatch{media,report})
     }).await.map_err(|e|e.to_string())?
 }
 #[tauri::command]
@@ -241,7 +288,7 @@ async fn video_batch_inner(app:&AppHandle,state:&AppState,tasks:Vec<VideoTask>,o
     for (task,path,cancel) in tokens {
         let emit=|event|{let _=app.emit("video-progress",event);};
         emit(VideoProgress::new(&task.task_id,session,revision,"queued"));
-        let permit=match state.compression.acquire(||cancel.load(Ordering::Acquire)||state.cancel_queue.lock().unwrap().contains(&task.path)).await{
+        let permit=match state.compression.acquire(||cancel.load(Ordering::Acquire)||state.task_ledger.lock().unwrap().is_cancelled(&task.path)).await{
             AcquireOutcome::Acquired(p)=>p,
             AcquireOutcome::Stopped=>{emit(VideoProgress::new(&task.task_id,session,revision,"deferred"));runtime.cancellations.lock().unwrap().remove(&(session.to_string(),task.task_id.clone()));continue;},
             AcquireOutcome::Cancelled=>{emit(VideoProgress::new(&task.task_id,session,revision,"cancelled"));runtime.cancellations.lock().unwrap().remove(&(session.to_string(),task.task_id.clone()));continue;},
@@ -250,7 +297,12 @@ async fn video_batch_inner(app:&AppHandle,state:&AppState,tasks:Vec<VideoTask>,o
         #[cfg(not(feature="inproc-backends"))]
         let result={
             let history=state.history_store.clone();let transactions=state.transactions.clone();let retention=state.settings_store.load().original_retention_days;let budget=state.compression.max_parallelism();
-            let logs=app.path().app_data_dir().map_err(|e|e.to_string())?.join("video-logs");let options=options.clone();let caps=caps.clone();let session=session.to_string();let roots=roots.clone();let app=app.clone();let task_id=task.task_id.clone();let access=state.access.clone();
+            let logs=app.path().app_data_dir().map_err(|e|e.to_string())?.join("video-logs");let options=options.clone();let caps=caps.clone();let session=session.to_string();
+            // 本轮加固（P2-11 / T18）：每个任务用自己的冻结来源根 / 相对路径；
+            // 缺省才退化到批级来源根集合。
+            let roots_for_task:Vec<String>=task.source_root.clone().filter(|r|!r.is_empty()).map(|r|vec![r]).unwrap_or_else(||roots.clone());
+            let relative_for_task:Option<String>=task.relative_path.clone().filter(|r|!r.is_empty());
+            let app=app.clone();let task_id=task.task_id.clone();let access=state.access.clone();
             tauri::async_runtime::spawn_blocking(move||{
                 // 守卫拿不到授权就立刻失败：把拒绝前置，而不是让 ffmpeg 在半路
                 // 以 IO 错误的姿势撞上沙盒（AGENTS 规则 12：守卫必须覆盖编码全程）。
@@ -265,7 +317,7 @@ async fn video_batch_inner(app:&AppHandle,state:&AppState,tasks:Vec<VideoTask>,o
                         return r;
                     }
                 };
-                video::ffmpeg_backend::encode(&task_id,&path,&options,&caps,&session,revision,&roots,&history,&transactions,retention,budget,&logs,cancel,&|event|{let _=app.emit("video-progress",event);})
+                video::ffmpeg_backend::encode(&task_id,&path,&options,&caps,&session,revision,&roots_for_task,relative_for_task.as_deref(),&history,&transactions,retention,budget,&logs,cancel,&|event|{let _=app.emit("video-progress",event);})
             }).await.map_err(|e|e.to_string())?
         };
         #[cfg(feature="inproc-backends")]
@@ -286,7 +338,11 @@ pub struct MediaSessionResult {session_id:String,image_results:Vec<crate::engine
 pub async fn start_media_session(app:AppHandle,state:State<'_,AppState>,images:Vec<String>,video_tasks:Vec<VideoTask>,image_options:crate::engine::CompressOptions,video_options:VideoOptions,session_id:String,queue_revision:u64,source_roots:Vec<String>,use_smart:bool)->Result<MediaSessionResult,String>{
     let _access=crate::commands::prepare_compression_access(&app,state.inner(),&images,&image_options)?;
     let session=SessionGuard::begin(&app,state.inner())?;
+    // 本轮加固（R4 / F21 呈现项）：图片先于视频是成文决定（core/media-task-protocol.md，
+    // 避免 CPU 超订），UI 必须让用户看见现在处于哪个阶段 —— 每次阶段切换播报一次。
+    let _=app.emit("media-phase",serde_json::json!({"sessionId":session_id,"phase":"images"}));
     let image_results=if images.is_empty(){vec![]}else{crate::commands::compress_batch(&app,state.inner(),&session,session_id.clone(),queue_revision,images,image_options,use_smart).await.results};
+    let _=app.emit("media-phase",serde_json::json!({"sessionId":session_id,"phase":"videos"}));
     let video_results=video_batch(&app,state.inner(),video_tasks,video_options,session_id.clone(),queue_revision,source_roots).await?;
     Ok(MediaSessionResult{session_id,image_results,video_results})
 }
@@ -325,6 +381,37 @@ mod import_tests {
     use super::*;
     use std::fs;
 
+    /// T19（本轮加固 P2-13）：子目录读不了不再让子树静默消失 —— 报告逐项记账。
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_subdirectory_is_reported_not_silently_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let secret = nested.join("secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("inner.png"), b"png").unwrap();
+        let loose = temp.path().join("loose.png");
+        std::fs::write(&loose, b"png").unwrap();
+        // 没有 root 权限的运行环境里 chmod 可能失败：失败就跳过这条测试。
+        if std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).is_err() {
+            return;
+        }
+        let mut seen = HashSet::new();
+        let mut files = vec![];
+        let mut report = ImportReport::default();
+        collect(temp.path(), &nested, &mut seen, &mut files, &mut report);
+        collect(temp.path(), &loose, &mut seen, &mut files, &mut report);
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o755)).ok();
+        assert_eq!(report.permission_denied, 1, "无权限子目录必须出现在报告里");
+        let canonical_loose = loose.canonicalize().unwrap();
+        assert!(
+            files.iter().any(|(p, _, _)| p == &canonical_loose),
+            "能读的文件照常收集（collect 内部做 canonicalize，比较也用它）"
+        );
+    }
+
     /// §39 §40：来源根与相对路径在导入时定死，目录导入保住层级，单文件导入落在父目录。
     #[test]
     fn an_imported_file_carries_its_root_and_relative_path() {
@@ -339,14 +426,14 @@ mod import_tests {
 
         let mut seen = HashSet::new();
         let mut files = vec![];
-        collect(&root, &root, &mut seen, &mut files);
+        collect(&root, &root, &mut seen, &mut files, &mut ImportReport::default());
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].1, root.canonicalize().unwrap(), "目录导入的来源根就是被选中的目录");
         assert_eq!(files[0].2, PathBuf::from("2026/a.jpg"), "相对路径保住目录层级");
 
         let mut seen = HashSet::new();
         let mut files = vec![];
-        collect(temp.path(), &loose, &mut seen, &mut files);
+        collect(temp.path(), &loose, &mut seen, &mut files, &mut ImportReport::default());
         assert_eq!(files[0].1, temp.path().canonicalize().unwrap(), "单文件导入的来源根是它的父目录");
         assert_eq!(files[0].2, PathBuf::from("loose.jpg"));
     }
@@ -363,8 +450,8 @@ mod import_tests {
 
         let mut seen = HashSet::new();
         let mut files = vec![];
-        collect(&root, &root, &mut seen, &mut files);
-        collect(&nested, &nested, &mut seen, &mut files);
+        collect(&root, &root, &mut seen, &mut files, &mut ImportReport::default());
+        collect(&nested, &nested, &mut seen, &mut files, &mut ImportReport::default());
         assert_eq!(files.len(), 1, "同一个文件不能在队列里出现两次");
         assert_eq!(files[0].1, root.canonicalize().unwrap(), "先被哪个根收下，就按哪个根算相对路径");
         assert_eq!(files[0].2, PathBuf::from("2026/a.jpg"));
@@ -378,9 +465,9 @@ mod import_tests {
         let good = temp.path().join("good.mp4");
         fs::write(&good, b"not-really-a-video").unwrap();
         let tasks = vec![
-            VideoTask { task_id: "t1".into(), path: good.to_string_lossy().into_owned() },
-            VideoTask { task_id: "t2".into(), path: temp.path().join("missing.mp4").to_string_lossy().into_owned() },
-            VideoTask { task_id: "t3".into(), path: good.to_string_lossy().into_owned() },
+            VideoTask { task_id: "t1".into(), path: good.to_string_lossy().into_owned(), source_root: None, relative_path: None },
+            VideoTask { task_id: "t2".into(), path: temp.path().join("missing.mp4").to_string_lossy().into_owned(), source_root: None, relative_path: None },
+            VideoTask { task_id: "t3".into(), path: good.to_string_lossy().into_owned(), source_root: None, relative_path: None },
         ];
         let (ready, failed) = resolve_video_tasks(tasks, &VideoOptions::default());
         assert_eq!(ready.len(), 1, "有效任务必须照常进入执行名单");

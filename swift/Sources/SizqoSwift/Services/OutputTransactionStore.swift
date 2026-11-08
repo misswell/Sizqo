@@ -340,11 +340,37 @@ enum OutputNaming {
 }
 
 /// 拿到就等于**已经占住**了这个名字：磁盘上多了一个我们建的 0 字节文件。
-struct ClaimedOutput {
+///
+/// P1-2 归属门：占位凭证 (dev,ino) 从**还开着的句柄**上 fstat 取，句柄随 claim 存活。
+/// `release()` 只删证明得了归属的占位：句柄 fstat 的 nlink > 0（我们的占位没被
+/// unlink —— inode 复用骗局下唯一认得出来的证据），且路径 stat 出的 (dev,ino)
+/// 等于凭证。两样都证明不了就保留现场并如实说明，绝不按路径盲删。
+final class ClaimedOutput {
     let path: String
+    /// 还开着的句柄：凭证来源 + nlink 判据（Rust `ClaimedPlaceholder` 同款）。
+    private let handle: StagedTempHandle
+    /// 认领那一刻的 (dev,ino)。
+    let identity: (device: Int64, inode: UInt64)?
+
+    fileprivate init(handle: StagedTempHandle) {
+        self.handle = handle
+        self.path = handle.path
+        self.identity = handle.claimedIdentity
+    }
+
+    deinit { handle.close() }
 
     /// 落盘前的某一步没做成：撤掉占位，别给用户留个空文件。
+    /// 证明不了归属就保留（日志说明），句柄照常收掉。
     func release() {
+        defer { handle.close() }
+        guard let status = handle.fdStatus, status.nlink > 0,
+              let expected = identity,
+              let actual = OutputTransactionStore.fileIdentity(path),
+              actual.device == expected.device && actual.inode == expected.inode else {
+            NSLog("Sizqo: 输出占位证明不了归属（可能已被外部替换），release 保留现场不删: %@", path)
+            return
+        }
         try? FileManager.default.removeItem(atPath: path)
     }
 }
@@ -362,10 +388,13 @@ enum OutputNameAllocator {
     static func claim(in directory: String, _ naming: OutputNaming) -> ClaimedOutput? {
         for index in 0..<maxNameConflicts {
             let path = (directory as NSString).appendingPathComponent(naming.candidate(index))
-            let handle = Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
-            if handle >= 0 {
-                Darwin.close(handle)
-                return ClaimedOutput(path: path)
+            let fd = Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL, 0o644)
+            if fd >= 0 {
+                guard let handle = StagedTempHandle(path: path, fd: fd) else {
+                    Darwin.close(fd)
+                    return nil
+                }
+                return ClaimedOutput(handle: handle)
             }
             // 名字已被占（EEXIST）就排下一个；别的错误（目录不存在、没权限）不是撞车，
             // 继续排下去只会把同一个毛病重复一万次。
@@ -377,22 +406,73 @@ enum OutputNameAllocator {
 
 // MARK: - 压缩结果的落盘：同目录临时文件 → fsync → rename
 
+/// P1-1：还开着的认领句柄 —— 路径 + fd + 认领那一刻从 fd 上 fstat 的 (dev,ino)。
+///
+/// "open 之后立刻 close、只留路径"的旧做法被本轮审查定为违规：认领与写入之间
+/// 路径就可能换一个 inode，"按路径重开再写"写进的可能根本不是我们独占认领的
+/// 那个文件。写入、fsync 一律走这里持有的 fd；凭证也从 fd 上 fstat 取，
+/// 不重开路径（与 Rust `identity_of_open` / `ClaimedPlaceholder` 同一条纪律）。
+/// fd 用 `closeOnDeinit:false` 包装，由本类显式 `close()`（幂等）并在 deinit 兜底，
+/// 不会被双重关闭。
+final class StagedTempHandle {
+    let path: String
+    let file: FileHandle
+    /// 认领那一刻的 (dev,ino)：一次 fstat，不经过路径。
+    let claimedIdentity: (device: Int64, inode: UInt64)?
+    private var closed = false
+
+    init?(path: String, fd: Int32) {
+        guard fd >= 0 else { return nil }
+        self.path = path
+        self.file = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        var info = stat()
+        if fstat(fd, &info) == 0 {
+            self.claimedIdentity = (device: Int64(info.st_dev), inode: UInt64(info.st_ino))
+        } else {
+            self.claimedIdentity = nil
+        }
+    }
+
+    deinit { close() }
+
+    /// 幂等关闭：发布 / 放弃之后的各调用点不必关心谁先谁后。
+    func close() {
+        guard !closed else { return }
+        closed = true
+        try? file.close()
+    }
+
+    /// 句柄 fd 上的 fstat：(dev, ino, nlink)。句柄已关或 fstat 失败时返回 nil ——
+    /// nlink == 0 说明我们的 inode 已经没有任何目录项（名字被外部 unlink），
+    /// 这是 inode 复用骗局下唯一认得出来的证据（Rust `ClaimedPlaceholder` 同款）。
+    var fdStatus: (device: Int64, inode: UInt64, nlink: UInt64)? {
+        guard !closed else { return nil }
+        var info = stat()
+        guard fstat(file.fileDescriptor, &info) == 0 else { return nil }
+        return (Int64(info.st_dev), UInt64(info.st_ino), UInt64(info.st_nlink))
+    }
+}
+
 /// §30 全应用只有一处产生临时文件名：和目标同目录、O_EXCL 认领、随机后缀。
 ///
 /// 毫秒/纳秒时间戳在同一条队列并发压几十张图时会撞名。撞上的两个任务算出同一个
 /// `.tmp`，后写的把前一个的半成品盖掉，rename 过去的就是别人的字节 —— 而压缩结果
 /// 恰好是那种"看起来成功了、内容却是另一张图"的事故。
 enum StagedTemp {
-    /// 认领到一个只属于本次写入的临时路径；失败返回 nil（调用方放弃这次落盘）。
-    static func claim(in directory: String, prefix: String) -> String? {
+    /// 认领一个只属于本次写入的临时文件：O_EXCL 独占创建，**句柄随结构返回**；
+    /// 失败返回 nil（调用方放弃这次落盘）。
+    static func claim(in directory: String, prefix: String) -> StagedTempHandle? {
         for _ in 0..<16 {
             let path = (directory as NSString).appendingPathComponent(
                 "\(prefix)-\(UUID().uuidString.lowercased()).tmp"
             )
-            let handle = Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
-            if handle >= 0 {
-                Darwin.close(handle)
-                return path
+            let fd = Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+            if fd >= 0 {
+                guard let handle = StagedTempHandle(path: path, fd: fd) else {
+                    Darwin.close(fd)
+                    return nil
+                }
+                return handle
             }
             if errno != EEXIST { return nil }
         }
@@ -483,16 +563,25 @@ enum TempOwnership {
 /// 临时文件必须和目标同目录，否则 rename 跨挂载点就不是原子操作了。
 struct StagedWrite {
     let temp: String
-    /// §28 审查修复：写满后记录候选指纹。discard 的身份门据此判断
-    /// "这条临时路径上是谁" —— 原子交换换回失败时，外部内容恰好停在这里，
-    /// 无凭证的 discard 会把用户的文件当半成品删掉。
+    /// P1-1：认领时拿到的句柄。写入、fsync、发布全程走它；发布/放弃的每个出口
+    /// 都会把它关掉（`StagedTempHandle.close` 幂等，谁先到都行）。
+    let handle: StagedTempHandle?
+    /// §28 审查修复：写满后记录候选指纹（= 经句柄写出的字节的 SHA-256）。
+    /// discard 的身份门与发布对账据此判断"这条路径上是谁/是不是我们写下的那份"
+    /// —— 原子交换换回失败时，外部内容恰好停在这里，无凭证的 discard 会把
+    /// 用户的文件当半成品删掉。
     private(set) var writtenSha256: String?
     /// §28 审查修复（P0-2）：独占认领那一刻的 `(dev,ino)` —— discard 的第一依据。
-    /// 零字节只说明"还没写"，不说明"这是我们的"。
+    /// P1-1 起从**还开着的句柄**上 fstat 取，不再按路径 stat（两步之间路径可能
+    /// 换一个 inode）。零字节只说明"还没写"，不说明"这是我们的"。
     private(set) var claimedIdentity: (device: Int64, inode: UInt64)?
 
-    fileprivate mutating func recordWritten() {
-        writtenSha256 = try? sha256OfFile(temp).get()
+    init(temp: String, handle: StagedTempHandle?, writtenSha256: String? = nil,
+         claimedIdentity: (device: Int64, inode: UInt64)?) {
+        self.temp = temp
+        self.handle = handle
+        self.writtenSha256 = writtenSha256
+        self.claimedIdentity = claimedIdentity
     }
 
     /// §31 只独占临时名，一个字节都不写。Commit 用这条：先把名字记进事务日志，
@@ -500,16 +589,15 @@ struct StagedWrite {
     /// 恰好没有任何记录知道它在场，用户目录里就永远多出一个孤儿。
     static func claim(target: String) -> StagedWrite? {
         let parent = (target as NSString).deletingLastPathComponent
-        guard let temp = StagedTemp.claim(in: parent, prefix: ".sizqo-write") else { return nil }
-        var staged = StagedWrite(temp: temp)
-        // 认领成功 = 这条路径此刻由我们独占：把它的身份钉下来当凭证。
-        staged.claimedIdentity = OutputTransactionStore.fileIdentity(temp)
-        return staged
+        guard let handle = StagedTemp.claim(in: parent, prefix: ".sizqo-write") else { return nil }
+        // 认领成功 = 这条路径此刻由我们独占：凭证直接从还开着的 fd 上钉下来。
+        return StagedWrite(temp: handle.path, handle: handle,
+                           claimedIdentity: handle.claimedIdentity)
     }
 
     /// 写满已独占的临时文件 → fsync → 原子改名到目标。
     /// false = 没写成；目标保持原样，半成品已清掉。
-    func writeAndPublish(_ bytes: Data, to target: String) -> Bool {
+    mutating func writeAndPublish(_ bytes: Data, to target: String) -> Bool {
         guard writeSynced(bytes) else {
             discard()
             return false
@@ -519,32 +607,46 @@ struct StagedWrite {
 
     /// 写满 → flush + fsync，但**还不改名**。
     ///
+    /// P1-1：写入一律走认领时持有的句柄 —— truncate 显式归零、seek 到头、写入、
+    /// fsync，再对**写出的字节**算 SHA-256 记进 writtenSha256（发布对账用）。
+    /// 绝不按路径重开（`Data.write(to:)` 那条路写进的可能是别人换上来的文件）；
+    /// 句柄不可用直接报失败，不许悄悄退化成路径写入。
+    ///
     /// 覆盖模式要在"候选已经落盘"和"用户的文件被盖掉"之间插一道复核（§31 的
     /// source identity + backup check），所以这两步必须能分开调用。
     /// false = 没写满；半成品由调用方收尾（`discard`）。
-    func writeSynced(_ bytes: Data) -> Bool {
+    @discardableResult
+    mutating func writeSynced(_ bytes: Data) -> Bool {
+        guard let handle else { return false }
         do {
-            try bytes.write(to: URL(fileURLWithPath: temp), options: [])
+            try handle.file.truncate(atOffset: 0)
+            try handle.file.seek(toOffset: 0)
+            try handle.file.write(contentsOf: bytes)
+            // 落盘确认：崩溃后 rename 过去的不能是个只在内核缓存里的文件。
+            try handle.file.synchronize()
         } catch {
             return false
         }
-        // 落盘确认：崩溃后 rename 过去的不能是个只在内核缓存里的文件。
-        guard syncFile(at: temp) else { return false }
+        writtenSha256 = sha256OfData(bytes)
         return true
     }
 
     /// 从已有文件整份复制进已独占的临时名并 fsync（恢复原图用：备份可能有几百 MB，
     /// 由内核完成复制、不整份进内存，与 Rust `copy_staged` 同一职责）。
+    ///
+    /// P1-1 注：这一支的写入是内核整份复制（`copyFileOverwriting` 会拆掉重放路径上
+    /// 的文件），不经句柄 —— 句柄的使命到认领为止，复制前先关。正因如此这条路
+    /// 不产生 writtenSha256，发布对账对它自动跳过（归属由交换验证的基线哈希把守）。
     func copySynced(from source: String) -> Bool {
+        handle?.close()
         guard copyFileOverwriting(from: source, to: temp) else { return false }
         return syncFile(at: temp)
     }
 
-    /// 写满 + fsync + 记录候选指纹（discard 身份门用）。
+    /// 写满 + fsync + 记录候选指纹（discard 身份门与发布对账用）。
+    @discardableResult
     mutating func writeSyncedRecording(_ bytes: Data) -> Bool {
-        guard writeSynced(bytes) else { return false }
-        recordWritten()
-        return true
+        writeSynced(bytes)
     }
 
     /// §28 审查修复（P0-2）身份门：只有**证明得了归属**才允许删。
@@ -554,6 +656,8 @@ struct StagedWrite {
     /// 以前的"零字节就删"是最危险的一支：外部把我们的占位删掉后放进自己的空文件，
     /// 在旧代码里和我们的占位长得一模一样，一个字节都不是我们的。
     func discard() {
+        // P1-1：无论清什么，句柄的使命都到此为止（幂等，重复调用安全）。
+        handle?.close()
         // 已经改名成目标了（正常提交）：无物可清，也不必假装这里有过别人的文件。
         guard fileExists(at: temp) else { return }
         if TempOwnership.isProtected(temp) {
@@ -572,6 +676,7 @@ struct StagedWrite {
     /// 把已经 fsync 的临时文件原子改名到目标。改名之前该核的都必须已经核过。
     /// false = 没改成；目标保持原样，半成品已清掉。
     func publish(to target: String) -> Bool {
+        defer { handle?.close() }
         guard Darwin.rename(temp, target) == 0 else {
             discard()
             return false
@@ -610,11 +715,39 @@ struct StagedWrite {
         return publishIfPlaceholderMatches(to: target, placeholderIdentity: placeholderIdentity)
     }
 
-    /// 同格式覆盖的原子交换：先交换、再验证被换出的字节哈希 == 编码前基线。
+    /// P1-1 候选内容对账：原子交换之后、宣布提交成立之前，重读目标位的内容指纹，
+    /// 必须正是我们经句柄写下的 writtenSha256。对不上就按 undo 换回撤销 ——
+    /// 绝不把对不上的字节当提交成功。换回也失败时覆盖已经发生且收不回：
+    /// 返回 swappedButUnrecovered（调用方按事务凭证回滚并保留现场）。
+    /// 返回 nil = 对账通过（或没有指纹可对），发布可以成立。
+    private func reconcileCandidateAtTarget(
+        target: String, undo: () -> Bool
+    ) -> PublishOutcome? {
+        // 没有候选指纹（copySynced 的内核复制路）就无可对账：归属由交换验证的
+        // 基线哈希把守，这里不装样子。
+        guard let expected = writtenSha256 else { return nil }
+        guard case .success(let actual) = sha256OfFile(target), actual == expected else {
+            if undo() {
+                discard()
+                NSLog("Sizqo: 发布对账失败（目标位字节与候选指纹不符），已换回撤销: %@", target)
+                return .refused
+            }
+            // 换回失败：覆盖已经发生，现场原样保留，交给事务回滚收拾。
+            let relocated = TempOwnership.protectForeignBytes(from: self.temp, nextTo: target)
+            NSLog("Sizqo: 发布对账失败且换回失败，现场已保护: %@", relocated)
+            return .swappedButUnrecovered(
+                "发布后内容对账失败（目标字节与候选指纹不符），交换回滚也失败；相关内容保留在 \(relocated)")
+        }
+        return nil
+    }
+
+    /// 同格式覆盖的原子交换：先交换、再验证被换出的字节哈希 == 编码前基线，
+    /// 最后对账目标位内容 == 写下的候选指纹（P1-1）。
     /// 验证失败换回原状；换回失败写 `.protected` 标记保留现场。
     mutating func publishReplaceIfIdentityMatches(
         to target: String, baselineSha256: String
     ) -> PublishOutcome {
+        defer { handle?.close() }
         // 非逃逸捕获：mutating self 不能进 @escaping 闭包，先用局部拷贝。
         let tempPath = self.temp
         let swap = { OutputTransactionStore.atomicSwap(tempPath, target) }
@@ -637,6 +770,10 @@ struct StagedWrite {
             NSLog("Sizqo: 交换回滚失败，外部内容已迁到保护位置: %@", relocated)
             return .swappedButUnrecovered(
                 "目标文件在提交前一刻被外部修改，交换回滚也失败；原内容保留在 \(relocated)")
+        }
+        // P1-1：覆盖发生之后、宣布成功之前，目标位上的字节必须正是我们写下的那份。
+        if let outcome = reconcileCandidateAtTarget(target: target, undo: swap) {
+            return outcome
         }
         try? FileManager.default.removeItem(atPath: self.temp)
         return syncDirectory(at: (target as NSString).deletingLastPathComponent)
@@ -678,6 +815,14 @@ struct StagedWrite {
             discard()
             return .refused
         }
+        // P1-1：装进去之后同样对账 —— 目标位字节必须正是我们写下的候选。
+        if reconcileCandidateAtTarget(target: target, undo: { false }) != nil {
+            // 隔离路线上没有"换回"可用，但原图还在隔离名上：把它装回原位就算
+            // 完整撤销（对不上的候选随交换退到隔离名，归属门会保住它）。
+            _ = OriginalRetirement.restoreQuarantined(quarantine.path, to: target)
+            discard()
+            return .refused
+        }
         // 被换出的原图：前面已经复验过，备份里还有一份可信副本，这份可以收走。
         _ = Darwin.unlink(quarantine.path)
         return syncDirectory(at: (target as NSString).deletingLastPathComponent)
@@ -698,6 +843,7 @@ struct StagedWrite {
     func publishIfPlaceholderMatches(
         to target: String, placeholderIdentity: (device: Int64, inode: UInt64)?
     ) -> PublishOutcome {
+        defer { handle?.close() }
         guard placeholderIdentity != nil else {
             // 无凭证 = 证明不了占位归属。以前这里退化成普通 rename（可覆盖任何
             // 此刻躺在目标位上的文件）；现在按失败关闭拒绝提交（与 Rust
@@ -714,6 +860,12 @@ struct StagedWrite {
             // 交换成功：temp 现在持有被换出来的"占位或外部内容"。
             if let actual = OutputTransactionStore.fileIdentity(self.temp),
                actual.device == expected.device && actual.inode == expected.inode {
+                // P1-1 候选内容对账：换出来的正是我们的占位还不够 —— 目标位上的
+                // 字节必须正是我们写下的那份；对不上就换回撤销，绝不把对不上的
+                // 字节当提交成功（临时路径被外部偷换的现场在这里现形）。
+                if let outcome = reconcileCandidateAtTarget(target: target, undo: swap) {
+                    return outcome
+                }
                 // 换出来的正是我们的占位：提交成立，占位清掉。
                 try? FileManager.default.removeItem(atPath: self.temp)
                 // §2.2 目录 fsync 失败 = 目录项没落盘，按 publishedButNotDurable。
@@ -769,6 +921,13 @@ struct StagedWrite {
             discard()
             return .refused
         }
+        // P1-1：装进去之后同样对账 —— 目标位字节必须正是我们写下的候选；
+        // 对不上就把占位装回原位（完整撤销），绝不把对不上的字节当提交成功。
+        if reconcileCandidateAtTarget(target: target, undo: { false }) != nil {
+            _ = OutputTransactionStore.restoreQuarantine(quarantine.path, to: target)
+            discard()
+            return .refused
+        }
         // 换出来的就是我们那个 0 字节占位：提交成立，收走隔离名。
         _ = Darwin.unlink(quarantine.path)
         return syncDirectory(at: (target as NSString).deletingLastPathComponent)
@@ -778,7 +937,7 @@ struct StagedWrite {
     /// 独占 + 写入 + 改名一条龙：调用方不需要在中途记任何东西时使用。
     /// nil = 没写成；目标文件保持原样，临时文件已清掉。
     static func write(target: String, bytes: Data) -> StagedWrite? {
-        guard let staged = claim(target: target) else { return nil }
+        guard var staged = claim(target: target) else { return nil }
         return staged.writeAndPublish(bytes, to: target) ? staged : nil
     }
 
@@ -798,42 +957,49 @@ struct StagedWrite {
 ///      原位被外部占了就用原子交换顶回来。
 /// 任何一条路走不通，结果都是"字节还在磁盘上" + 一句说实话的警告。
 enum OriginalRetirement {
-    /// 一次隔离名认领：路径 + 占位的 `(dev,ino)` 凭证（从还开着的句柄上取）。
+    /// 一次隔离名认领：路径 + 占位的 `(dev,ino)` 凭证 + **还开着的句柄**。
+    ///
+    /// P1-2 / F2：句柄随认领结构一起存活 —— 只比 (dev,ino) 挡不住 inode 复用，
+    /// fd 上 `nlink == 0` 才认得出"占位已被 unlink、路径上是谁的都不确定"
+    /// （Rust `QuarantineClaim` 同款：句柄故意开到改名完成，不提前丢证据）。
+    /// 结构离开作用域时句柄由 `StagedTempHandle.deinit` 兜底关闭。
     struct QuarantineClaim {
         let path: String
         let identity: (device: Int64, inode: UInt64)?
+        let handle: StagedTempHandle?
 
         /// 占位还是我们的吗？对不上 = O_EXCL 占位被外部换成自己的文件，
         /// 此时改名过去就是覆盖 —— 必须拒绝（与 Rust `quarantined_still_ours` 同条）。
         var isStillOurs: Bool {
-            guard let expected = identity,
-                  let actual = OutputTransactionStore.fileIdentity(path) else {
+            guard let expected = identity, let handle, let status = handle.fdStatus else {
                 // 证明不了归属：不碰。
                 return false
             }
+            // 句柄判据：fd 上的 inode 已经没有任何目录项（nlink == 0），
+            // 说明我们的占位被拆掉了 —— 同路径上不管是谁的字节都不是我们的。
+            guard status.nlink > 0 else { return false }
+            guard let actual = OutputTransactionStore.fileIdentity(path) else { return false }
             return actual.device == expected.device && actual.inode == expected.inode
         }
     }
 
     /// 在同目录独占认领一个隔离名（O_EXCL）：改名过去不可能盖掉任何人的文件 ——
-    /// 前提是动手之前核得出这个名字还在我们手里。凭证从**还开着的句柄**取：
+    /// 前提是动手之前核得出这个名字还在我们手里。凭证从**还开着的句柄**取，
+    /// 句柄存进返回的 claim 随作用域存活：后续验证与改名都在句柄存活期内，
     /// 关掉句柄再按路径 stat，两步之间路径就可能换一个 inode。
     static func claimQuarantine(for file: String) -> QuarantineClaim? {
         let directory = (file as NSString).deletingLastPathComponent
         for _ in 0..<16 {
             let candidate = (directory as NSString).appendingPathComponent(
                 ".sizqo-retire-\(UUID().uuidString.lowercased()).keep")
-            let handle = Darwin.open(candidate, O_WRONLY | O_CREAT | O_EXCL, 0o600)
-            if handle >= 0 {
-                var info = stat()
-                let identity: (device: Int64, inode: UInt64)?
-                if fstat(handle, &info) == 0 {
-                    identity = (device: Int64(info.st_dev), inode: UInt64(info.st_ino))
-                } else {
-                    identity = nil
+            let fd = Darwin.open(candidate, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+            if fd >= 0 {
+                guard let handle = StagedTempHandle(path: candidate, fd: fd) else {
+                    Darwin.close(fd)
+                    return nil
                 }
-                Darwin.close(handle)
-                return QuarantineClaim(path: candidate, identity: identity)
+                return QuarantineClaim(path: candidate,
+                                       identity: handle.claimedIdentity, handle: handle)
             }
             if errno != EEXIST { return nil }
         }
@@ -1202,17 +1368,18 @@ final class OutputTransactionStore: @unchecked Sendable {
 
     /// 删掉这次压缩产生的新文件与临时文件。同格式 replace 的输出就是源文件本身，绝不删。
     ///
-    /// 跨格式的输出文件只删"能证明是这次生成的"：新日志按内容指纹对账；
-    /// 老日志没有指纹，只删大小正好等于这次产出尺寸的文件 ——
-    /// 旧契约的"无条件清"会把用户在崩溃后放进这个路径的内容一并删掉。
+    /// 跨格式的输出文件只删"能证明是这次生成的"：按内容指纹对账。
+    /// P1-4 / T06：没有 outputSha256 的事务一律不删 —— 体积不构成所有权证明，
+    /// 旧契约的"大小正好等于这次的产出就删"会把崩溃后落进同一路径的外部文件
+    /// 当残骸清掉；宁可多留一个来历不明的文件，也不删别人的字节。
     static func removeGeneratedOutput(_ txn: ReplaceTransaction) {
         if txn.crossFormat || !sameFile(txn.outputPath, txn.sourcePath) {
             let ours: Bool
             if let expected = txn.outputSha256 {
                 ours = (try? sha256OfFile(txn.outputPath).get()) == expected
             } else {
-                ours = fileLength(txn.outputPath) == txn.expectedOutputSize
-                    && txn.expectedOutputSize > 0
+                // 体积不是凭证：证明不了归属就分文不动。
+                ours = false
             }
             if ours { try? FileManager.default.removeItem(atPath: txn.outputPath) }
         }

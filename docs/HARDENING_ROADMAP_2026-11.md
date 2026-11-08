@@ -119,3 +119,43 @@ rc.9 已完成（勿重复做）：三级无覆盖改名台阶（renamex_np(RENA
 
 发布门不变：验收矩阵、许可/签名/公证/装订、运行时核验齐全前不打正式 Release；
 每轮完成即推 main，工作态用 v0.3.6-rc.N 标记（编号不复用）。
+
+---
+
+## 六、实施记录
+
+### R1+R2 —— 0.3.6-rc.10（10b99a5，2026-11-06）
+按上文轮次完成，CI run 42221134520 六作业全绿。见 docs/validation.md rc.10 节。
+
+### R3+R4+R5 —— 0.3.6-rc.11（2026-11-08）
+外部审查（0.3.6-rc.10 报告）15 项 + 22 条强制回归测试以本轮为最终交付轮。
+逐项回证与测试读数见 docs/validation.md 的 0.3.6-rc.11 节，要点：
+
+- **P1-1/P1-2（本轮新增超出原 F1–F4 范围的部分）**：`StagedOutput`/`ClaimedOutput`
+  （Rust）与 `StagedWrite`/`StagedTemp`/`ClaimedOutput`/`claimQuarantine`（Swift）全部
+  句柄化——写入走句柄、truncate 显式归零、凭证从 fstat 取；发布双侧对账
+  （换出身份 + 目标位内容 SHA256），对不上换回撤销。
+- **P1-3（超出 F 系列的新决定）**：原图退休与同格式换出字节**保留不删**——
+  事务管理的 `.sizqo-retire-*.keep` 保留文件 + 历史新字段 `retiredOriginalPath`
+  + 清空历史时清理。原文档 F 系列没有这一条；外部审查的四项"绝不妥协"之一。
+- **P1-4**：`remove_generated_output`（journal 版 + HistoryEntry 版）与 Swift
+  `removeGeneratedOutput` 缺产物指纹一律不删，体积不再构成所有权证明。
+- **R3 媒体完整性**：EXIF 方向两侧高级路径烘焙（Rust orientation API / Swift
+  WithTransform）；Swift 高级路径统一多帧检测；`-count_frames` 帧数对账；KeepAll
+  逐流逐章节逐附件对账；StripPrivate 作用域共享定义 + 章节/program 隐私键预检
+  拒绝；FLAC 实测码率预算 + `VideoResult.target*` 三字段；`capture_cancellable`
+  接入探测取消链。
+- **R4 调度与路径**：视频编码前 `OutputNameAllocator::claim` 占名 + commit 换号
+  重试（partial 复用）；`VideoTask.sourceRoot/relativePath` 与图片
+  `perFileRelativePaths` 冻结值优先；`ImportReport` 两侧记账 + 前端呈现；混合
+  会话阶段播报（`media-phase` 事件 + 横幅）。
+- **R5 测试与 CI**：T01/T02/T03/T05/T16/T17/T18/T19/T20/T21/T22 新增落地
+  （T21 = `tests/dual_instance.rs` 双真实进程 O_EXCL 竞争）；T08 Swift CancelBox
+  三态账本并发断言；CI 增 dual-instance 作业步、macOS x86_64 交叉 check、
+  Swift 全源 typecheck（含 AppState）。
+- **P2-15**：`MAX_SINGLE_TASK_BYTES = 4 GiB` 两侧同值，超限任务按
+  `resource_limit_exceeded` 明确拒绝；估算未知不拒（"不知道"不是"知道很大"）。
+
+如实记录的未竟项（继续挡发布门禁）：T11 与 T12–T15 的真实媒体端到端用例
+（等 macOS 真实媒体矩阵轮）、附件内容 SHA（需解包）、FFmpeg GPL 对应源码义务、
+Direct Windows/Linux 随包引擎、签名/公证/装订。

@@ -3,8 +3,12 @@ use std::{fs,io::{Read,Write,BufRead,BufReader},path::Path,sync::{Arc,atomic::{A
 use super::{VideoOptions,VideoResult,capabilities::CapabilityMatrix,probe,plan,progress::{VideoProgress,ProgressParser},transaction};
 use crate::{history::HistoryStore,output_transaction::TransactionStore};
 use crate::result_model::{ReasonCode,ResultOutcome};
-pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMatrix,session:&str,revision:u64,roots:&[String],history:&HistoryStore,transactions:&TransactionStore,retention:u32,budget:usize,logs:&Path,cancel:Arc<AtomicBool>,emit:&(dyn Fn(VideoProgress)+Sync))->VideoResult{
+#[allow(clippy::too_many_arguments)]
+pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMatrix,session:&str,revision:u64,roots:&[String],per_task_relative:Option<&str>,history:&HistoryStore,transactions:&TransactionStore,retention:u32,budget:usize,logs:&Path,cancel:Arc<AtomicBool>,emit:&(dyn Fn(VideoProgress)+Sync))->VideoResult{
     let started=Instant::now();let mut result=VideoResult::pending(task_id,source,options);
+    // 占位认领在闭包里发生，但它的生命周期必须贯穿整个任务（成功收走、其余归还）：
+    // 声明提到闭包外。
+    let mut claimed_output:Option<crate::output_transaction::ClaimedOutput>=None;
     let outcome=(||->Result<(),String>{
         let source=source.canonicalize().map_err(|e|e.to_string())?;
         // §3.2 覆盖模式必须先算出内容指纹：事务凭证、崩溃恢复、备份复用
@@ -15,10 +19,16 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
         }else{
             transaction::SourceIdentity::read(&source).map_err(|e|e.to_string())?
         };
-        let source_probe=probe::probe(&source)?;
+        // 本轮加固（P2-10 / P2-7）：源探测可取消（45s 窗口里的取消立即生效）+
+        // `-count_frames` 实测帧数（帧数对账的输入）。大文件探测放宽到 300s，
+        // 与产物复探同一档 —— count_frames 要多解一遍全片。
+        let source_probe=probe::probe_cancellable(&source,Duration::from_secs(300),Some(&cancel),true)?;
         let plan=plan::build(options,&source_probe,caps,budget)?;
         result.encoder_actual=plan.encoder.clone();result.warnings=plan.warnings.clone();
-        let target=transaction::destination(&source,options,roots)?;
+        // 本轮加固（P2-12 / T17）：编码前独占认领输出名 —— 0 字节占位 + 句柄凭证
+        // 一直持有到提交。长编码期间外部程序再也没法"看见名字就建同名文件"。
+        claimed_output=transaction::claim_output(&source,options,roots,per_task_relative)?;
+        let target=claimed_output.as_ref().map(|c|c.path().to_path_buf()).unwrap_or_else(||source.clone());
         let parent=target.parent().ok_or("Output directory missing")?;
         let estimated=plan.bitrate_kbps.zip(source_probe.duration_us).map(|(b,t)|b.saturating_mul(1000).saturating_mul(t/1000000)/8).unwrap_or(source_probe.size_bytes);
         let needed=estimated.max(source_probe.size_bytes/4).saturating_mul(2).saturating_add(64*1024*1024);
@@ -53,7 +63,8 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
         }
         if cancel.load(Ordering::Acquire){return Err("Cancelled by user".into());}
         // 产物复探给足时间（编码刚完成，同一份大文件慢卷上不止 45 秒）。
-        let encoded=probe::probe_with_timeout(&partial,Duration::from_secs(300))?;
+        // 复探同样可取消 + count_frames：产物帧数与源帧数在 validate 里对账。
+        let encoded=probe::probe_cancellable(&partial,Duration::from_secs(300),Some(&cancel),true)?;
         super::validation::validate(&source_probe,&encoded,&plan)?;
         // Decode the entire output to null. Exit 0 and a progress=end record alone are insufficient.
         let mut verify=super::process::command("ffmpeg")?;
@@ -63,6 +74,23 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
         run_command(verify,&log_path,&cancel,|_|{})?;
         if cancel.load(Ordering::Acquire){return Err("Cancelled by user".into());}
         result.output_bytes=Some(encoded.size_bytes);result.savings=Some((1.0-encoded.size_bytes as f64/source_probe.size_bytes as f64)*100.0);
+        // 本轮加固（P2-9 / T15）：targetSize 模式的达成情况如实对账 ——
+        // 预算值、偏差百分比、是否达成（超出目标 5% 记未达成）。未达成
+        // 绝不许显示成达标，前端按这三个字段呈现。
+        if options.mode=="targetSize"{
+            if let Some(target_mib)=options.target_mi_b{
+                let target=target_mib*1024.0*1024.0;
+                if target>0.0{
+                    let deviation=((encoded.size_bytes as f64-target)/target)*100.0;
+                    result.target_bytes=Some(target);
+                    result.target_deviation=Some(deviation);
+                    result.target_met=Some(encoded.size_bytes as f64<=target*1.05);
+                    if encoded.size_bytes as f64>target*1.05{
+                        result.warnings.push(format!("Target size missed: {} bytes vs {} target ({:+.1}% over)",encoded.size_bytes,target.round() as u64,deviation));
+                    }
+                }
+            }
+        }
         if encoded.size_bytes>=source_probe.size_bytes&&!options.allow_larger_output{
             // §14 §70 有效但没变小 = 跳过，不是成功，也不是编码失败。判据说清是哪一种，
             // 但只有结论这一份：这一轮到此跑完（stage=completed），"没产物"由 outcome/reason_code
@@ -71,9 +99,13 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
         }
         if encoded.size_bytes>=source_probe.size_bytes{result.warnings.push("Larger output retained by explicit professional-mode choice".into());}
         result.elapsed_ms=started.elapsed().as_millis()as u64;
-        transaction::commit(&source,&partial,&target,options,&source_probe,&mut result,history,transactions,retention,&identity,backup.as_deref())?;
+        transaction::commit(&source,&partial,&target,options,&source_probe,&mut result,history,transactions,retention,&identity,backup.as_deref(),&mut claimed_output)?;
         result.success=true;result.stage="completed".into();result.outcome=Some(ResultOutcome::Committed);Ok(())
     })();
+    // 占位归还：只有 commit 成功那条路会收走 `ClaimedOutput`（commit 里 take）。
+    // 其余一切收场（有效未变小跳过 / 失败 / 取消）都到这里把名字还回去，
+    // 不给用户目录留 0 字节孤儿 —— 归属门保证被外部偷换的路径分文不动。
+    if let Some(claimed)=claimed_output.take(){claimed.release();}
     result.elapsed_ms=started.elapsed().as_millis()as u64;
     if let Err(error)=outcome {let cancelled=cancel.load(Ordering::Acquire);result.stage=if cancelled{"cancelled"}else{"failed"}.into();result.outcome=Some(if cancelled{ResultOutcome::Cancelled}else{ResultOutcome::Failed});result.reason_code=Some(if cancelled{ReasonCode::Cancelled}else{ReasonCode::Unknown});result.reason=Some(error);}
     result

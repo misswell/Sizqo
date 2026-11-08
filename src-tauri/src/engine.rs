@@ -151,6 +151,12 @@ pub struct CompressOptions {
     /// the frontend sends an already-expanded queue snapshot.
     #[serde(default)]
     pub source_roots: Vec<String>,
+    /// 本轮加固（P2-11 / T18）：每个文件**自己**冻结的相对路径（导入时定死）。
+    /// 键 = 文件绝对路径，值 = 冻结 relativePath。给齐时严格使用，批级
+    /// `sourceRoots` 的"最深根胜出"猜测不再参与决策 —— 重叠来源根的批次
+    /// 再也不会因为换一批执行就改变目录结构。空值/缺省 = 走旧的根解析。
+    #[serde(default)]
+    pub per_file_relative_paths: Option<std::collections::HashMap<String, String>>,
     /// 最长边上限（像素）。**只缩不放大**；缺省 / 0 / None = 不加尺寸约束。
     /// Direct 走 CLI 编码器之前、App Store 走进程内编码器之前，都在同一个
     /// `prepare_working_file()` 里兑现它（见下方）。
@@ -194,6 +200,7 @@ impl Default for CompressOptions {
             output_mode: "suffix".into(), output_suffix: "_compressed".into(),
             output_dir: None, source_roots: Vec::new(),
             max_dimension_px: None, max_output_bytes: None,
+            per_file_relative_paths: None,
         }
     }
 }

@@ -1,4 +1,4 @@
-use super::{plan::EncodePlan, probe::VideoProbe, MetadataPolicy};
+use super::{plan::EncodePlan, probe::VideoProbe, MetadataPolicy}; use super::probe::VideoStream;
 
 /// §56 输出必须重新探测后逐项核对，不能把 ffmpeg 退出码当成成功。
 pub fn validate(source: &VideoProbe, output: &VideoProbe, plan: &EncodePlan) -> Result<(), String> {
@@ -71,6 +71,31 @@ pub fn validate(source: &VideoProbe, output: &VideoProbe, plan: &EncodePlan) -> 
             return Err(format!(
                 "Output frame rate {actual:.2} differs from expected {expected:.2}"
             ));
+        }
+    }
+    // 本轮加固（P2-7 / T12）：帧数对账。编码期两侧探测都带 `-count_frames`，
+    // 实测解码帧数（nb_read_frames）才是"一帧都没丢"的证据 —— 只看时长和
+    // 平均帧率，"源 30000 帧 → 输出 29990 帧"那一类丢失是看不见的。
+    // 用户主动指定 CFR 时按目标帧率 × 时长校验，不强制等于源帧数。
+    if let (Some(src_frames), Some(out_frames)) = (
+        source.video().and_then(|s| s.nb_frames),
+        v.nb_frames,
+    ) {
+        let expected = match plan.options.frame_rate {
+            Some(rate) => source
+                .duration_us
+                .map(|d| ((d as f64 / 1e6) * rate).round() as u64),
+            None => Some(src_frames),
+        };
+        if let Some(expected) = expected {
+            // 容差：容器取整可能差最后一帧，按 0.1%（下限 2 帧）放行；
+            // 超出就是真的丢帧，如实失败。
+            let tolerance = ((expected as f64 * 0.001).ceil() as u64).max(2);
+            if out_frames.abs_diff(expected) > tolerance {
+                return Err(format!(
+                    "Encoded output is missing frames: expected ~{expected}, got {out_frames}"
+                ));
+            }
         }
     }
     // §5.4 色彩元数据：源里明确写了的传递函数 / 原色 / 色彩矩阵，输出必须
@@ -189,6 +214,14 @@ fn validate_metadata(
         MetadataPolicy::KeepAll | MetadataPolicy::StripPrivate => {
             if source.chapters.len() != output.chapters.len() {
                 return Err("Encoded output lost chapters".into());
+            }
+            // 本轮加固（P2-7 / T13）：KeepAll 从"只比数量"升级为逐项对账 ——
+            // 每条音轨/字幕的 codec、语言、标题、disposition，每个章节的起止
+            // 时间与标题，附件的名字与数量。数量相同但内容换掉的轨道再也藏不住。
+            if plan.metadata_policy == MetadataPolicy::KeepAll {
+                keep_all_streams_match(source, output)?;
+                keep_all_chapters_match(source, output)?;
+                keep_all_attachments_match(source, output)?;
             }
             if plan.metadata_policy == MetadataPolicy::StripPrivate {
                 // 隐私键要扫全部作用域：全局、每条流、每个章节、每个 program ——
@@ -550,4 +583,106 @@ mod tests {
         let clean = VideoProbe::parse(program_privacy, 1000).unwrap();
         assert!(validate(&source_clean, &clean, &plan(MetadataPolicy::StripPrivate)).is_ok());
     }
+}
+
+/// KeepAll 的逐流对账：源里第 N 条 audio/subtitle 必须在输出里仍是同一条
+/// （同 codec、同语言、同标题、同 disposition 语义位）。
+fn keep_all_streams_match(source: &VideoProbe, output: &VideoProbe) -> Result<(), String> {
+    for stream in source
+        .streams
+        .iter()
+        .filter(|s| matches!(s.codec_type.as_str(), "audio" | "subtitle"))
+    {
+        let Some(carried) = output.streams.iter().find(|s| s.index == stream.index) else {
+            return Err(format!(
+                "Encoded output lost the {} stream #{}",
+                stream.codec_type, stream.index
+            ));
+        };
+        if carried.codec_name != stream.codec_name {
+            return Err(format!(
+                "Encoded output changed {} stream #{} codec from {} to {}",
+                stream.codec_type, stream.index, stream.codec_name, carried.codec_name
+            ));
+        }
+        for key in ["language", "title"] {
+            let expected = stream.tags[key].as_str().unwrap_or("");
+            let actual = carried.tags[key].as_str().unwrap_or("");
+            if expected != actual {
+                return Err(format!(
+                    "Encoded output changed the {key} of stream #{} (\"{expected}\" → \"{actual}\")",
+                    stream.index
+                ));
+            }
+        }
+        for flag in ["default", "forced", "comment"] {
+            if stream.disposition[flag].as_u64().unwrap_or(0)
+                != carried.disposition[flag].as_u64().unwrap_or(0)
+            {
+                return Err(format!(
+                    "Encoded output changed the {flag} disposition of stream #{}",
+                    stream.index
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// KeepAll 的逐章节对账：起止时间与标题都要还在（只比数量是上一轮的缺口）。
+fn keep_all_chapters_match(source: &VideoProbe, output: &VideoProbe) -> Result<(), String> {
+    for (index, chapter) in source.chapters.iter().enumerate() {
+        let Some(carried) = output.chapters.get(index) else {
+            return Err("Encoded output lost chapters".into());
+        };
+        for key in ["start_time", "end_time"] {
+            let expected = chapter[key].as_str().unwrap_or("");
+            let actual = carried[key].as_str().unwrap_or("");
+            if expected != actual {
+                return Err(format!(
+                    "Encoded output changed chapter {index} {key} from {expected} to {actual}"
+                ));
+            }
+        }
+        let expected_title = chapter["tags"]["title"].as_str().unwrap_or("");
+        let actual_title = carried["tags"]["title"].as_str().unwrap_or("");
+        if expected_title != actual_title {
+            return Err(format!(
+                "Encoded output changed the title of chapter {index}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// KeepAll 的附件对账：数量 + 名字。附件内容指纹需要解包文件才算得出，
+/// ffprobe 不提供；这里如实以名字 + 数量为界，不装作验过内容
+/// （如实记录见 docs/HARDENING_ROADMAP_2026-11.md）。
+fn keep_all_attachments_match(source: &VideoProbe, output: &VideoProbe) -> Result<(), String> {
+    let source_att: Vec<&VideoStream> = source
+        .streams
+        .iter()
+        .filter(|s| s.codec_type == "attachment")
+        .collect();
+    let output_att: Vec<&VideoStream> = output
+        .streams
+        .iter()
+        .filter(|s| s.codec_type == "attachment")
+        .collect();
+    if source_att.len() != output_att.len() {
+        return Err("Encoded output lost attachments".into());
+    }
+    fn attachment_name(s: &VideoStream) -> &str {
+        s.tags["filename"].as_str().unwrap_or("")
+    }
+    for (index, (expected, carried)) in source_att.iter().zip(output_att.iter()).enumerate() {
+        if attachment_name(expected) != attachment_name(carried) {
+            return Err(format!(
+                "Encoded output changed attachment #{index} ({} → {})",
+                attachment_name(expected),
+                attachment_name(carried)
+            ));
+        }
+    }
+    Ok(())
 }

@@ -91,7 +91,7 @@ installQueueRowPainter(context);
 installSelection(context);
 installSessionModel(context);
 context.setCompressionState('idle', true);
-vm.runInContext(slice('async function startCompression(', '// ─── 运行条 + 详情列'), context);
+vm.runInContext(slice('function withPerFileRelativePaths(', '// ─── 运行条 + 详情列'), context);
 // 单文件重试：把那一行放回 pending 再开一轮只含它。
 vm.runInContext(slice('async function compressOneFile(', 'async function saveResult('), context);
 

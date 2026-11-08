@@ -140,6 +140,11 @@ pub struct HistoryEntry {
     pub output_sha256: Option<String>,
     #[serde(default)]
     pub backup_sha256: Option<String>,
+    /// 跨格式替换时被隔离保留的原文件（本轮加固 P1-3）：删除动作不再自动执行，
+    /// 文件留在 `.sizqo-retire-*.keep` 保留名下，路径记在这里；用户清空历史时
+    /// 一并清理。老记录没有该字段，读取时为 `None`。
+    #[serde(default)]
+    pub retired_original_path: Option<String>,
     /// 派生字段：读取时刷新，不落库使用。
     #[serde(default)]
     pub source_exists: bool,
@@ -206,6 +211,7 @@ impl HistoryEntry {
         Self {
             media_kind: "image".into(),
             video_metadata: None,
+            retired_original_path: None,
             id,
             created_at,
             // 「不保留」没有"几天后到期"这回事：这份备份的寿命就是这次运行。
@@ -656,6 +662,11 @@ impl HistoryStore {
             .iter()
             .filter_map(|entry| backup_key_of(entry.backup_path.as_deref()))
             .collect();
+        // 本轮加固 P1-3：跨格式替换隔离保留的原文件由用户清空历史这一动作明确清理。
+        let retired: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| entry.retired_original_path.clone())
+            .collect();
         // 先让历史不再引用任何备份，再动手删：中间崩溃只是留下孤儿，下次退出扫掉。
         self.store(Vec::new())?;
         let mut report = CleanupReport {
@@ -667,6 +678,13 @@ impl HistoryStore {
                 Ok(()) => report.removed_backups += 1,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => report.warnings.push(format!("{key}: {error}")),
+            }
+        }
+        for path in retired {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => report.warnings.push(format!("保留原图 {path}: {error}")),
             }
         }
         Ok(report)
@@ -1130,6 +1148,7 @@ impl HistoryStore {
             rebuilt.push(HistoryEntry {
                 media_kind: if crate::video::is_video_extension(source) { "video" } else { "image" }.into(),
                 video_metadata: None,
+                retired_original_path: None,
                 id: format!("recovery-{key}"),
                 created_at: meta.created_at,
                 expires_at: now,
@@ -1427,7 +1446,8 @@ impl HistoryStore {
     ///
     /// §4.1 审查修复：删除前必须证明这个文件**还是本次生成的产物** ——
     /// 有产物指纹按内容对账；对不上（用户改过）或读不出来时保留文件并提示。
-    /// 老记录没有指纹，只删大小正好等于承诺产出的文件（有界删除）。
+    /// 老记录没有指纹时一律保留（本轮加固 P1-4）：大小恰好等于承诺产出从来不
+    /// 构成所有权证据 —— 用户崩溃后放进同路径的自己的文件会被旧判据误删。
     /// 这道门同时护住普通恢复分支与 `already_restored` 幂等分支 ——
     /// 后者此前会无条件删除，用户编辑过的跨格式产物可能被静默清掉。
     ///
@@ -1444,11 +1464,8 @@ impl HistoryStore {
                         Ok(_) => false,
                         Err(_) => false,
                     },
-                    None => {
-                        fs::metadata(output).map(|meta| meta.len()).unwrap_or(0)
-                            == entry.compressed_size
-                            && entry.compressed_size > 0
-                    }
+                    // 老记录没有指纹：没有归属证明就不自动删（本轮 P1-4）。
+                    None => false,
                 };
                 if !ours {
                     return Ok(());
@@ -1637,7 +1654,7 @@ impl HistoryStore {
                     let retired = if force {
                         crate::output_transaction::retire_confirmed(path)
                     } else {
-                        crate::output_transaction::retire_original(path, &identity)
+                        crate::output_transaction::retire_verified(path, &identity)
                     };
                     retired.map_err(RestoreError::Io)?;
                 } else {
@@ -1779,6 +1796,7 @@ pub(crate) fn sample_entry(source: &Path, backup: &Path, id: &str) -> HistoryEnt
     HistoryEntry {
         media_kind: "image".into(),
         video_metadata: None,
+        retired_original_path: None,
         id: id.into(),
         created_at,
         expires_at: created_at + DAY_MILLIS * 3,
@@ -1830,6 +1848,7 @@ mod tests {
         HistoryEntry {
             media_kind: "image".into(),
             video_metadata: None,
+            retired_original_path: None,
             id: format!(
                 "{}-{}",
                 created_at,

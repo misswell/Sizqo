@@ -23,6 +23,14 @@ enum ImageMemory {
     static let minBudgetBytes = 256 * 1024 * 1024
     static let maxBudgetBytes = 2 * 1024 * 1024 * 1024
 
+    /// P2-15 / T20：单任务内存硬上限（与 Rust `image_memory::MAX_SINGLE_TASK_BYTES` 同值）。
+    /// 与并发预算是两回事：预算决定几张图能一起跑，硬上限决定**任何**任务能不能开跑 ——
+    /// 估算确认（known == true）且超过这条线的解码矩阵，连空场放行都不许：
+    /// 开始处理就是确定性的失败，明确拒绝比 OOM 拖垮整个应用诚实。
+    /// 读不出尺寸（known == false）的任务不在此列：512 MiB 的兜底估算是
+    /// "不知道"，不是"知道很大"，把未知全部拒掉等于拒绝所有异格式输入。
+    static let maxSingleTaskBytes = 4 * 1024 * 1024 * 1024
+
     /// 解码预算取物理内存的四分之一，夹在 256 MiB 与 2 GiB 之间。
     /// 系统其余部分、界面和用户别的应用都要内存；压缩器没有理由把整机吃满。
     static func budgetBytes() -> Int {
@@ -51,17 +59,20 @@ enum ImageMemory {
         }
     }
 
-    /// 给一个文件记的内存账。尺寸读不出来时按"一张大图"兜底。
-    static func estimate(path: String) -> Int {
+    /// 给一个文件记的内存账。`known` = 尺寸是真读出来的（估算可信）；
+    /// false = 尺寸读不出、按"一张大图"兜底 —— P2-15 的硬上限只拦 known 的账，
+    /// 兜底估算进调度器按普通预算排队（与 Rust `MemoryEstimate.known` 同一契约）。
+    static func estimate(path: String) -> (bytes: Int, known: Bool) {
         let ext = (path as NSString).pathExtension
         let channels = channels(forExtension: ext)
         guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
                 as? [CFString: Any] else {
-            return unknownEstimateBytes
+            return (unknownEstimateBytes, false)
         }
         let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0
         let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
-        return estimateBytes(width: width, height: height, channels: channels)
+        guard width > 0, height > 0 else { return (unknownEstimateBytes, false) }
+        return (estimateBytes(width: width, height: height, channels: channels), true)
     }
 }

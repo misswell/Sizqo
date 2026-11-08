@@ -102,6 +102,10 @@ pub enum ReasonCode {
     Stopped,
     /// 压缩会话还在跑，恢复被闸门挡住（不是失败，也不是用户取消）。
     SessionBusy,
+    /// 本轮加固（P2-15）：单任务内存硬上限。估算确认的真实解码矩阵超过
+    /// `MAX_SINGLE_TASK_BYTES` 的任务连空场放行都不许 —— 开始处理就是
+    /// 确定性的失败，明确拒绝比 OOM 拖垮整个应用诚实。
+    ResourceLimitExceeded,
     /// 未被任何生产者分类过的失败。它的存在是为了让「还不知道」显式可见，
     /// 而不是冒充成功。
     #[default]
@@ -134,6 +138,7 @@ impl ReasonCode {
             Self::Cancelled => "cancelled",
             Self::Stopped => "stopped",
             Self::SessionBusy => "session_busy",
+            Self::ResourceLimitExceeded => "resource_limit_exceeded",
             Self::Unknown => "unknown",
         }
     }

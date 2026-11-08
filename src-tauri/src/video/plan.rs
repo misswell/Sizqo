@@ -51,7 +51,21 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
     if probe.variable_frame_rate && options.frame_rate.is_none(){
         warnings.push("Variable-frame-rate source: original timestamps are preserved (passthrough)".into());
     }
-    if metadata_policy==MetadataPolicy::StripPrivate { warnings.push("Privacy mode removes GPS, location and device-model tags; ordinary metadata and chapters are preserved".into()); }
+    if metadata_policy==MetadataPolicy::StripPrivate {
+        warnings.push("Privacy mode removes GPS, location and device-model tags; ordinary metadata and chapters are preserved".into());
+        // 本轮加固（P2-8 / T14）：章节与 program 级的隐私键没有 FFmpeg CLI 能逐键
+        // 清理的开关 —— `-map_metadata:c/-map_metadata:p` 只能整体清空，会把普通
+        // 标签一起抹掉，与"普通 metadata 与章节照常保留"的承诺冲突。预检直接
+        // 拒绝并说明，绝不在编码完之后才让验证器发现清不掉（那等于白烧一遍
+        // CPU + 一条必失败的任务）。验证器扫的作用域与这里枚举的是同一份定义。
+        let (chapter_private,program_private)=crate::video::private_keys_in_chapter_or_program_scopes(probe);
+        if !chapter_private.is_empty()||!program_private.is_empty(){
+            return Err(format!(
+                "Privacy mode cannot selectively clean private tags in chapter or program metadata ({}) while preserving ordinary tags; FFmpeg can only clear those scopes wholesale. Pick KeepAll or StripAll for this file",
+                chapter_private.iter().chain(program_private.iter()).cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
     let encoder=if options.encoder=="auto" {
         let preference=if options.container=="webm"{vec!["libsvtav1","libvpx-vp9"]}else if options.mode=="twoPass"||options.mode=="targetSize"{vec!["libx264"]}else if options.mode=="crf"{vec!["libx265","libx264","libvpx-vp9"]}else{vec!["hevc_videotoolbox","libx265","h264_videotoolbox","libx264"]};
         let selected=preference.iter().find(|id|caps.encoder(id).is_some()).ok_or("No suitable encoder available")?;
@@ -89,7 +103,18 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
     let width=((sw as f64*scale) as u32/2*2).max(2);let height=((sh as f64*scale) as u32/2*2).max(2);
     // 用户没要求缩放却发生了 1px 取整（yuv420p 只接受偶数）时必须说明，不许静默变形。
     if options.resolution==0&&(sw%2!=0||sh%2!=0){warnings.push(format!("Source dimensions {sw}×{sh} are not even; yuv420p requires even numbers, output rounded to {width}×{height}"));}
-    let audio_bits=if options.audio_policy=="none"{0}else if options.audio_policy=="copy"{probe.audio().try_fold(0u64,|n,s|s.bit_rate.and_then(|b|n.checked_add(b))).unwrap_or(0)}else{options.audio_bitrate_kbps*1000*probe.audio().count() as u64};
+    // 本轮加固（P2-9 / T15）：copy/FLAC 的预算用源音轨**实测码率** —— FLAC 编码
+    // 不接 `-b:a`（无损可变码率），把固定码率预算套在它头上算出来的目标必然失真。
+    // 实测不出来的音轨不冒充数字：预算按 0 处理并如实警告"这是估计值"，
+    // 达成情况事后由 VideoResult.target* 字段按实际输出报告。
+    let measured_audio_bits=probe.audio().try_fold(0u64,|n,s|s.bit_rate.and_then(|b|n.checked_add(b)));
+    let audio_bits_unreliable=matches!(options.audio_policy.as_str(),"copy"|"flac")&&measured_audio_bits.is_none();
+    let audio_bits=if options.audio_policy=="none"{0}
+        else if options.audio_policy=="copy"||options.audio_policy=="flac"{measured_audio_bits.unwrap_or(0)}
+        else{options.audio_bitrate_kbps*1000*probe.audio().count() as u64};
+    if audio_bits_unreliable && options.mode=="targetSize"{
+        warnings.push("Target size budget could not measure the source audio bitrate (FLAC/copy is variable-rate); the result may miss the target and will be reported as such".into());
+    }
     let bitrate_kbps=if options.mode=="targetSize" {
         if options.audio_policy=="copy"&&probe.audio().any(|s|s.bit_rate.is_none()){return Err("Target size needs known audio bitrate; choose AAC/Opus".into());}
         let seconds=probe.duration_us.filter(|v|*v>0).ok_or("Target size requires known duration")? as f64/1e6;

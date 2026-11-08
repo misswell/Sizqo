@@ -65,7 +65,7 @@ installQueueRowPainter(context);
 installSelection(context);
 installSessionModel(context);
 context.setCompressionState('idle', true);
-vm.runInContext(slice('async function startCompression(', '// ─── 运行条 + 详情列'), context);
+vm.runInContext(slice('function withPerFileRelativePaths(', '// ─── 运行条 + 详情列'), context);
 
 // 每一行给个够用的假 DOM：真实 paintQueueRow 会往上写图标 / 文案 / 按钮。
 let rowSeq = 0;

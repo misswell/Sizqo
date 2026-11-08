@@ -53,7 +53,15 @@ pub fn drain(mut input: impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
         let take=n.min(limit.saturating_sub(saved.len())); saved.extend_from_slice(&chunk[..take]); }
     Ok(saved)
 }
+/// 旧签名兼容包装：无取消令牌的探测（启动恢复等后台维护用）。
 pub fn capture(mut cmd: Command, timeout: Duration, limit: usize) -> Result<Vec<u8>,String> {
+    capture_cancellable(cmd,timeout,limit,None)
+}
+/// 带**取消令牌**的探测（本轮加固 P2-10 / T16）：ffprobe 的 45s/300s 窗口里
+/// 用户点取消必须立即生效 —— 轮询令牌、SIGTERM 先礼后兵、两秒后强杀回收，
+/// 与编码用的 `run_command` 同一条纪律。stdout/stderr 读取线程随 join 回收。
+pub fn capture_cancellable(mut cmd: Command, timeout: Duration, limit: usize, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<Vec<u8>,String> {
+    use std::sync::atomic::Ordering;
     let mut child=cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e|e.to_string())?;
     let stdout=child.stdout.take().ok_or("stdout unavailable")?;
     let stderr=child.stderr.take().ok_or("stderr unavailable")?;
@@ -61,6 +69,24 @@ pub fn capture(mut cmd: Command, timeout: Duration, limit: usize) -> Result<Vec<
     let err=std::thread::spawn(move||drain(stderr,65536));
     let start=Instant::now();
     let status=loop {
+        if let Some(token)=cancel {
+            if token.load(Ordering::Acquire) {
+                // 先 SIGTERM 给 ffprobe 一个体面收场，两秒内不退再强杀 ——
+                // 与 run_command 的取消路径一致，不留僵尸子进程。
+                #[cfg(unix)]
+                unsafe{libc::kill(child.id() as i32,libc::SIGTERM);}
+                #[cfg(not(unix))]
+                { let _=child.kill(); }
+                let deadline=Instant::now()+Duration::from_secs(2);
+                loop {
+                    match child.try_wait() { Ok(Some(_))=>break, Ok(None)=>{}, Err(_)=>break }
+                    if Instant::now()>deadline { let _=child.kill(); let _=child.wait(); break; }
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+                let _=child.wait();
+                break Err("Cancelled by user".into());
+            }
+        }
         match child.try_wait() {
             Ok(Some(s))=>break Ok(s), Ok(None)=>{}, Err(e)=>{ let _=child.kill(); let _=child.wait(); break Err(e.to_string()); }
         }
@@ -77,6 +103,30 @@ pub fn capture(mut cmd: Command, timeout: Duration, limit: usize) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// T16（本轮加固 P2-10）：ffprobe/ffmpeg 探测阶段点取消 → 子进程立即终止回收，
+    /// 返回明确的取消错误，绝不等到超时。
+    #[test]
+    fn capture_cancellable_terminates_the_child_on_cancel() {
+        let token=std::sync::Arc::new(AtomicBool::new(false));
+        let token_for_thread=token.clone();
+        let killer=std::thread::spawn(move||{
+            std::thread::sleep(Duration::from_millis(150));
+            token_for_thread.store(true,Ordering::Release);
+        });
+        let mut cmd=if cfg!(windows){
+            let mut c=Command::new("ping");c.args(["-n","30","127.0.0.1"]);c
+        }else{
+            let mut c=Command::new("sleep");c.arg("30");c
+        };
+        let started=Instant::now();
+        let outcome=capture_cancellable(cmd,Duration::from_secs(60),1024*1024,Some(&token));
+        killer.join().unwrap();
+        assert!(started.elapsed()<Duration::from_secs(10),"取消必须立即生效，不能等满超时");
+        let error=outcome.expect_err("取消是一次明确的收场");
+        assert!(error.contains("Cancelled"),"{error}");
+    }
 
     /// 解析器不许把"本机跑不动的内置产物"当后端交出去。Linux/Windows 上这一条就是
     /// `Exec format error (os error 8)` 的正面防线：内置那一步必须被跳过。

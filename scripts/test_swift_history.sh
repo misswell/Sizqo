@@ -58,6 +58,7 @@ xcrun swiftc \
   "$SRC_DIR/Engine/CLIRunner.swift" \
   "$SRC_DIR/Engine/CompressionEngine.swift" \
   "$SRC_DIR/Engine/SystemImageConverter.swift" \
+  "$SRC_DIR/ViewModels/CancelBox.swift" \
   "$SWIFT_DIR/Tests/HistoryStoreCheck/main.swift" \
   "$SWIFT_DIR/Tests/HistoryStoreCheck/ContractVectors.swift"
 

@@ -69,7 +69,11 @@ func copyFileOverwriting(from src: String, to dst: String) -> Bool {
 /// 也不先把用户原来的文件删掉（`copyFileOverwriting` 那条路只给全新的占位名用）。
 func atomicCopyFile(from src: String, to dst: String) -> Bool {
     let parent = (dst as NSString).deletingLastPathComponent
-    guard let tmp = StagedTemp.claim(in: parent, prefix: ".sizqo-save") else { return false }
+    guard let stagedHandle = StagedTemp.claim(in: parent, prefix: ".sizqo-save") else { return false }
+    let tmp = stagedHandle.path
+    // 后面的写入是内核整份复制（不经句柄），复制还会拆掉重放路径上的文件 ——
+    // 句柄的使命到认领为止，先关（P1-1 句柄化后的调用点同步）。
+    stagedHandle.close()
     guard copyFileOverwriting(from: src, to: tmp), syncFile(at: tmp) else {
         try? FileManager.default.removeItem(atPath: tmp)
         return false
@@ -790,8 +794,14 @@ final class HistoryStore: @unchecked Sendable {
         }
         // 先写临时名再 rename：崩溃不许留下半个 original.xxx 冒充有效备份。
         // 临时名随机（§30）：两张图同时首次备份时，固定名会互相把对方的半成品盖掉。
-        guard let staged = StagedTemp.claim(in: dir, prefix: ".original"),
-              copyFileOverwriting(from: canonical, to: staged) else {
+        // 写入是内核整份复制（不经句柄）：句柄使命到认领为止，先关（P1-1 调用点同步）。
+        guard let stagedHandle = StagedTemp.claim(in: dir, prefix: ".original") else {
+            _ = removeDirectory(dir)
+            return nil
+        }
+        let staged = stagedHandle.path
+        stagedHandle.close()
+        guard copyFileOverwriting(from: canonical, to: staged) else {
             _ = removeDirectory(dir)
             return nil
         }
@@ -1208,9 +1218,12 @@ final class HistoryStore: @unchecked Sendable {
     static func writeBackupBack(to target: String, backup: String) throws {
         let parent = (target as NSString).deletingLastPathComponent
         // §30 随机临时名：恢复全部 / 事务回滚可能同时在多个文件上写回原图。
-        guard let tmp = StagedTemp.claim(in: parent, prefix: ".sizqo-restore") else {
+        // 写入是内核整份复制（不经句柄）：句柄使命到认领为止，先关（P1-1 调用点同步）。
+        guard let stagedHandle = StagedTemp.claim(in: parent, prefix: ".sizqo-restore") else {
             throw RestoreError.io("无法写入恢复临时文件")
         }
+        let tmp = stagedHandle.path
+        stagedHandle.close()
         guard copyFileOverwriting(from: backup, to: tmp) else {
             try? FileManager.default.removeItem(atPath: tmp)
             throw RestoreError.io("无法写入恢复临时文件")

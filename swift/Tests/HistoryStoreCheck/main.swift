@@ -2368,7 +2368,7 @@ do {
     // 外部删掉占位、放进自己的内容。
     try? FileManager.default.removeItem(atPath: claimedPath)
     writeData(claimedPath, [1, 2, 3, 4])
-    guard let staged = StagedWrite.claim(target: claimedPath) else {
+    guard var staged = StagedWrite.claim(target: claimedPath) else {
         check(false, "临时名该认领成功"); exit(1)
     }
     check(staged.writeSynced(Data([9, 9])), "候选该写满落盘")
@@ -2378,7 +2378,7 @@ do {
     check(readBytes(claimedPath) == [1, 2, 3, 4], "外部内容一个字节都不许动")
     // 无凭证（nil）路径必须失败关闭：证明不了占位归属就不许 rename，
     // 目标位上的字节原样保留（与 Rust `publish_claimed` 同一裁决）。
-    guard let stagedPlain = StagedWrite.claim(target: claimedPath) else {
+    guard var stagedPlain = StagedWrite.claim(target: claimedPath) else {
         check(false, "无凭证路径的临时名该认领成功"); exit(1)
     }
     check(stagedPlain.writeSynced(Data([7, 7])), "无凭证路径的候选该写满落盘")
@@ -2719,8 +2719,8 @@ do {
     let txnSource = sourceText("swift/Sources/SizqoSwift/Services/OutputTransactionStore.swift")
     check(!txnSource.contains("try? TempOwnership.writeMarker"),
           "标记写失败被 try? 吞掉，就等于把「没写成」当成「写成了」")
-    check(txnSource.components(separatedBy: "TempOwnership.protectForeignBytes(from: self.temp, nextTo: target)").count - 1 == 2,
-          "两处交换回滚失败都必须把外部字节交给保护处置")
+    check(txnSource.components(separatedBy: "TempOwnership.protectForeignBytes(from: self.temp, nextTo: target)").count - 1 == 3,
+          "三处交换回滚/发布对账失败都必须把外部字节交给保护处置")
     chmod(roDir, 0o700)
 }
 
@@ -2816,6 +2816,177 @@ do {
     check(readBytes(source2) == [7, 7, 7], "外来文件一个字节都不许动")
     check(FileManager.default.fileExists(atPath: output2), "产物还在（没有被提前清掉）")
     check(FileManager.default.fileExists(atPath: backup2), "备份还在")
+}
+
+// ─── 47. 外部审查 0.3.6-rc.10 加固回归：T08 / P1-4 / P1-5 / P1-1 ─────────────
+print("[47] T08 取消与提交竞争 / P1-4 尺寸不算凭证 / P1-5 多帧拒绝 / P1-1 发布对账")
+do {
+    // ── T08（P2-14）：取消与提交竞争同一个状态位 ─────────────────────────────
+    let box = CancelBox()
+    // 提交先到：requestCancel 必须被拒，且不许留下一笔"取消"。
+    check(box.tryBeginCommit("/t/first.png"), "T08：提交登记必须成功")
+    check(!box.requestCancel("/t/first.png"), "T08：提交期间取消必须被拒")
+    check(!box.isCancelled("/t/first.png"), "T08：被拒的取消不许留账")
+    check(!box.take("/t/first.png"), "T08：没有取消账可消费")
+    box.endCommit("/t/first.png")
+    // 取消先到：tryBeginCommit 必须输，取消照常记账、照常消费。
+    check(box.requestCancel("/t/second.png"), "T08：空闲项取消必须成功")
+    check(!box.tryBeginCommit("/t/second.png"), "T08：取消先到时提交必须输")
+    check(box.take("/t/second.png"), "T08：取消账可以消费")
+    check(!box.take("/t/second.png"), "T08：取消消费是一次性的")
+    check(box.tryBeginCommit("/t/second.png"), "T08：取消消费之后提交照常成立")
+    box.endCommit("/t/second.png")
+    // requestCancel 与 tryBeginCommit 的判决必须互斥且原子（同一把锁）：
+    // 一方赢，另一方必然输，不存在双双成立的窗口。
+    var racesAgree = true
+    let raceQueue = DispatchQueue(label: "sizqo-t08-race", attributes: .concurrent)
+    let raceGroup = DispatchGroup()
+    for index in 0..<200 {
+        raceGroup.enter()
+        raceQueue.async {
+            defer { raceGroup.leave() }
+            let path = "/t/race-\(index)"
+            let cancelFirst = index % 2 == 0
+            if cancelFirst {
+                let cancelWon = box.requestCancel(path)
+                let commitWon = box.tryBeginCommit(path)
+                if cancelWon == commitWon { racesAgree = false }   // 必须恰好一方赢
+                if !cancelWon && box.isCancelled(path) { racesAgree = false }
+            } else {
+                let commitWon = box.tryBeginCommit(path)
+                let cancelWon = box.requestCancel(path)
+                if cancelWon == commitWon { racesAgree = false }
+                if !commitWon && box.take(path) { racesAgree = false }
+            }
+        }
+    }
+    raceGroup.wait()
+    check(racesAgree, "T08：200 组并发竞争里取消与提交必须恰好一方赢")
+
+    // ── P1-4 / T06：没有 outputSha256 的事务，体积对上也一律不删 ────────────
+    let p14dir = freshRoot("47-p14")
+    let residue = canonicalPath(p14dir + "/out.jpg")
+    writeData(residue, [7, 7, 7, 7])                     // 外来字节，体积恰好等于"这次的产出"
+    let p14Source = canonicalPath(p14dir + "/in.png")
+    makeFile(p14Source, [1, 2, 3])
+    // 构造方式与 ContractVectors.contractLegacyTxn 同款：老日志（schemaVersion 0）、
+    // 无任何指纹，只有 expectedOutputSize 撞上了文件的真实长度。
+    let sizeTxn = ReplaceTransaction(
+        id: "t-size", historyId: "h-size", sourcePath: p14Source, outputPath: residue,
+        backupPath: "", tempOutputPath: nil, originalSize: 3, expectedOutputSize: 4,
+        originalSha256: nil, outputSha256: nil, backupSha256: nil, placeholderIdentity: nil,
+        createdAt: SizqoClock.nowMillis, crossFormat: true, mode: .replaceExisting, schemaVersion: 0)
+    OutputTransactionStore.removeGeneratedOutput(sizeTxn)
+    check(fileExists(at: residue) && readBytes(residue) == [7, 7, 7, 7],
+          "P1-4：没有内容指纹时，体积相等也绝不删（体积不构成所有权证明）")
+    // 对照组：指纹对得上的残骸照常收走。
+    let hashedTxn = ReplaceTransaction(
+        id: "t-hash", historyId: "h-hash", sourcePath: p14Source, outputPath: residue,
+        backupPath: "", tempOutputPath: nil, originalSize: 3, expectedOutputSize: 4,
+        originalSha256: nil, outputSha256: sha256OfData(Data([7, 7, 7, 7])), backupSha256: nil,
+        placeholderIdentity: nil, createdAt: SizqoClock.nowMillis, crossFormat: true,
+        mode: .replaceExisting, schemaVersion: 2)
+    OutputTransactionStore.removeGeneratedOutput(hashedTxn)
+    check(!fileExists(at: residue), "P1-4 对照：内容指纹对得上的残骸照常收走")
+
+    // ── P1-5 / T09 / T10：两帧 GIF 必须被统一多帧检测拒绝 ───────────────────
+    func solidImage(_ gray: UInt8) -> CGImage {
+        let context = CGContext(data: nil, width: 4, height: 4, bitsPerComponent: 8,
+                                bytesPerRow: 16, space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        context.setFillColor(CGColor(red: CGFloat(gray) / 255.0, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 4, height: 4))
+        return context.makeImage()!
+    }
+    let gifPath = freshRoot("47-gif") + "/anim.gif"
+    let gifBuffer = NSMutableData()
+    let gifDest = CGImageDestinationCreateWithData(
+        gifBuffer as CFMutableData, UTType.gif.identifier as CFString, 2, nil)
+    check(gifDest != nil, "测试前提：GIF 目标该建得出")
+    if let gifDest {
+        // Swift 不导出 kCGImageDestinationGIFFrameDelay 常量：按文档键名取 CFString。
+        let gifFrameDelay = "kCGImageDestinationGIFFrameDelay" as CFString
+        let frameProps = [gifFrameDelay: 0.1] as CFDictionary
+        CGImageDestinationAddImage(gifDest, solidImage(20), frameProps)
+        CGImageDestinationAddImage(gifDest, solidImage(220), frameProps)
+        check(CGImageDestinationFinalize(gifDest), "测试前提：两帧 GIF 该写得出")
+    }
+    try? gifBuffer.write(to: URL(fileURLWithPath: gifPath), options: .atomic)
+    let gifData = FileManager.default.contents(atPath: gifPath) ?? Data()
+    check(detectImageType(of: gifData) == "gif" && !gifData.isEmpty, "测试前提：写出的该是 GIF 字节")
+    guard let gifSource = CGImageSourceCreateWithData(gifData as CFData, nil) else {
+        check(false, "测试前提：GIF 该读得出源"); exit(1)
+    }
+    check(CGImageSourceGetCount(gifSource) == 2, "测试前提：GIF 该读出 2 帧")
+    let rejected = CompressionEngine.multiFrameRejectIfNeeded(
+        source: gifSource, originalData: gifData, targetFormat: "png")
+    check(rejected != nil, "P1-5：两帧输入必须被多帧检测拒绝")
+    check(rejected?.success == false && rejected?.verdict == .rejected
+            && rejected?.reason == .unsupportedFormat,
+          "P1-5：拒绝结论必须照实（rejected / unsupportedFormat）")
+    check(rejected?.error?.contains("2 帧") == true,
+          "P1-5：错误文案必须带帧数（实际：\(rejected?.error ?? "nil")）")
+    check(rejected?.error?.contains("未改动") == true, "P1-5：错误文案必须说明原文件未改动")
+    check(rejected?.compressed == gifData, "P1-5：拒绝时交回的必须是原图字节")
+    // downscale 对多帧返回 nil（诚实跳过），单帧照常可缩。
+    check(CompressionEngine.downscaledTempFile(file: gifPath, cap: 2) == nil,
+          "P1-5：多帧输入不许单帧缩放（downscale 诚实跳过）")
+    let singlePath = freshRoot("47-gif1") + "/one.png"
+    let singleBuffer = NSMutableData()
+    if let singleDest = CGImageDestinationCreateWithData(
+        singleBuffer as CFMutableData, UTType.png.identifier as CFString, 1, nil) {
+        CGImageDestinationAddImage(singleDest, solidImage(9), nil)
+        _ = CGImageDestinationFinalize(singleDest)
+    }
+    try? singleBuffer.write(to: URL(fileURLWithPath: singlePath), options: .atomic)
+    check(CompressionEngine.downscaledTempFile(file: singlePath, cap: 2) != nil,
+          "P1-5 对照：单帧输入照常允许缩放")
+    // 端到端：GIF → PNG 的转换入口（compressToFormat）也必须拒绝多帧输入。
+    var convertOptions = CompressOptions()
+    convertOptions.outputFormat = .png
+    let converted = CompressionEngine.compressToFormat(
+        file: gifPath, target: "png", options: convertOptions)
+    check(!converted.success && converted.verdict == .rejected
+            && converted.error?.contains("2 帧") == true,
+          "P1-5：GIF→PNG 转换入口必须拒绝多帧输入")
+
+    // ── P1-1：临时路径被外部偷换后，发布必须被内容对账拦下 ──────────────────
+    let p11dir = freshRoot("47-p11")
+    let p11Target = canonicalPath(p11dir + "/final.png")
+    let p11Fd = Darwin.open(p11Target, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+    check(p11Fd >= 0, "测试前提：占位该建得上")
+    Darwin.close(p11Fd)
+    guard let p11Identity = OutputTransactionStore.fileIdentity(p11Target),
+          var stagedSwapped = StagedWrite.claim(target: p11Target) else {
+        check(false, "测试前提：占位身份 / 临时名该拿得到"); exit(1)
+    }
+    // 外部把临时路径 unlink + 重建为不同内容（字节数也不同）。
+    check(Darwin.unlink(stagedSwapped.temp) == 0, "测试前提：外部拆掉我们的临时文件")
+    writeData(stagedSwapped.temp, [1, 2, 3, 4])
+    // 候选经句柄写满（fd 还指着我们认领的 inode，写入不经路径）。
+    check(stagedSwapped.writeSyncedRecording(Data([9, 9, 9])), "P1-1：候选经句柄写满落盘")
+    check(stagedSwapped.writtenSha256 == sha256OfData(Data([9, 9, 9])),
+          "P1-1：writtenSha256 必须记下写出字节的指纹")
+    let p11Outcome = stagedSwapped.publishIfPlaceholderMatches(
+        to: p11Target, placeholderIdentity: p11Identity)
+    check(p11Outcome != .published, "P1-1：临时路径被偷换后，发布必须被内容对账拦下")
+    check(readBytes(stagedSwapped.temp) == [1, 2, 3, 4],
+          "P1-1：外部放进临时路径的字节一个都不许动")
+    check(fileLength(p11Target) == 0, "P1-1：目标位上的占位原样保留（提交没有发生）")
+    // 正路径对照：没被偷换的发布在对账通过后照常成立。
+    let p11Happy = canonicalPath(p11dir + "/happy.png")
+    let happyFd = Darwin.open(p11Happy, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+    check(happyFd >= 0, "测试前提：对照占位该建得上")
+    Darwin.close(happyFd)
+    guard let happyIdentity = OutputTransactionStore.fileIdentity(p11Happy),
+          var stagedHappy = StagedWrite.claim(target: p11Happy) else {
+        check(false, "测试前提：对照占位身份 / 临时名该拿得到"); exit(1)
+    }
+    check(stagedHappy.writeSyncedRecording(Data([5, 5, 5, 5])), "对照候选该写满")
+    check(stagedHappy.publishIfPlaceholderMatches(
+        to: p11Happy, placeholderIdentity: happyIdentity) == .published,
+        "P1-1 对照：内容对账通过的正常发布照常成立")
+    check(readBytes(p11Happy) == [5, 5, 5, 5], "P1-1 对照：产物必须落在目标位")
 }
 
 runContractVectors()

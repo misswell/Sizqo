@@ -1257,7 +1257,9 @@ function handleFilePaths(filePaths) {
       return [];
     }
 
-    var mediaRecords = Array.isArray(probed) ? probed : [];
+    // 后端（0.3.6-rc.11）返回 { media, report }：导入不再静默遗漏，失败逐项记账。
+    var mediaRecords = Array.isArray(probed) ? probed : (probed && Array.isArray(probed.media) ? probed.media : []);
+    var importReport = probed && probed.report ? probed.report : null;
     var supportedRecords = mediaRecords.filter(function(record) {
       return record && normalizedMediaKind(record.mediaKind);
     });
@@ -1289,6 +1291,18 @@ function handleFilePaths(filePaths) {
 
     var unsupported = mediaRecords.filter(function(record) { return record && record.warning && !normalizedMediaKind(record.mediaKind); });
     if (unsupported.length > 0) showToast(unsupported[0].warning);
+    // 导入报告（P2-13）：有文件没进来就如实说，谁、多少、为什么。
+    if (importReport) {
+      var failedBits = [];
+      if (importReport.permissionDenied) failedBits.push(importReport.permissionDenied + ' 个位置无读取权限');
+      if (importReport.readDirectoryFailed) failedBits.push(importReport.readDirectoryFailed + ' 个目录读取失败');
+      if (importReport.canonicalizeFailed || importReport.disappeared) failedBits.push((importReport.canonicalizeFailed + importReport.disappeared) + ' 个文件无法解析或已消失');
+      if (importReport.unsupported) failedBits.push(importReport.unsupported + ' 个不支持的文件');
+      if (importReport.probeFailed) failedBits.push(importReport.probeFailed + ' 个视频探测失败（已入队待重试）');
+      if (failedBits.length > 0) {
+        showToast(localizeUiText('导入完成（' + importReport.imported + ' 个），但：') + failedBits.join('；'));
+      }
+    }
 
     var ac = document.getElementById('autoCompress');
     if (ac && ac.checked) {
@@ -2216,6 +2230,22 @@ function videoProgressNumbers(item) {
   return parts.join(' · ');
 }
 
+/// 混合媒体会话的阶段横幅（P2-11 / F21）：图片阶段 / 视频阶段一目了然。
+function mediaPhaseHandler(payload) {
+  var banner = document.getElementById('mediaPhaseBanner');
+  if (!banner) return;
+  var phase = payload && payload.phase;
+  if (phase === 'images') {
+    banner.textContent = localizeUiText('图片阶段：视频将随后处理');
+    banner.style.display = 'block';
+  } else if (phase === 'videos') {
+    banner.textContent = localizeUiText('视频阶段');
+    banner.style.display = 'block';
+  } else {
+    banner.style.display = 'none';
+  }
+}
+
 /// 状态词。暂停 / 收尾中必须能在文字里读到，所以 running 与 pending 走的是
 /// 与图片行**同一张**状态表（taskStatusMarkup）；有结论的那些走同一个
 /// 结果解释器（resultStatusText），不再由 `skippedLarger` 这类旧旗标拼句子。
@@ -2229,6 +2259,18 @@ function videoStatusText(item) {
   var facts = mediaResultFacts(result);
   if (!facts.hasProduct || facts.outputMissing) return resultStatusText(result);
   var savings = savingsPercentText(result);
+  // 目标体积模式的达成情况如实呈现（P2-9 / T15）：未达成不许显示成达标。
+  if (typeof result.targetBytes === 'number' && result.targetBytes > 0) {
+    var deviation = typeof result.targetDeviation === 'number' ? result.targetDeviation : null;
+    var met = result.targetMet === true;
+    var targetText = localizeUiText('目标 ') + formatBytes(result.targetBytes);
+    if (deviation !== null) {
+      var sign = deviation >= 0 ? '+' : '';
+      targetText += ' · ' + sign + deviation.toFixed(1) + '%';
+    }
+    if (!met) targetText += ' · ' + localizeUiText('未达标');
+    return resultStatusText(result) + ' · ' + targetText + (savings ? ' · ' + savings : '');
+  }
   if (facts.outcome === OUTCOME_TARGET_UNMET) {
     return resultStatusText(result) + (savings ? ' · ' + savings : '');
   }
@@ -2495,7 +2537,8 @@ async function openVideoCompare(sourcePath, outputPath, sourceProbeHint) {
   if (sourceLabel) sourceLabel.textContent = localizeUiText('原视频: ') + basename(sourcePath);
   if (outputLabel) outputLabel.textContent = localizeUiText('输出视频: ') + basename(outputPath);
   try {
-    var records = await invoke('probe_media', { paths: [sourcePath, outputPath] });
+    var probedPair = await invoke('probe_media', { paths: [sourcePath, outputPath] });
+    var records = Array.isArray(probedPair) ? probedPair : (probedPair && probedPair.media ? probedPair.media : []);
     if (videoCompareState !== state) return;
     state.sourceProbe = findProbedVideo(records, sourcePath) || state.sourceProbe;
     state.outputProbe = findProbedVideo(records, outputPath);
@@ -2638,7 +2681,11 @@ function removeQueueFile(filePath) {
   if (queueState(filePath) !== 'pending') return;
   if (isCompressing) {
     // 后端也要知道：它可能正堵在闸门上等着，得让那个 worker 自己退出。
-    invoke('cancel_file', { filePath: filePath }).catch(function() {});
+    invoke('cancel_file', { filePath: filePath }).then(function(accepted) {
+      // P2-14：提交段内的取消会被后端拒绝 —— 如实呈现「正在提交」，
+      // 绝不一边显示已取消一边等提交落盘。
+      if (accepted === false) showToast(localizeUiText('正在提交结果，无法取消；完成后会显示在队列里'));
+    }).catch(function() {});
   }
   setQueueState(filePath, 'removed');
   var idx = files.indexOf(filePath);
@@ -2800,6 +2847,9 @@ function renderRestoredActions(row, filePath) {
 /// 这一轮要发给后端的来源根 = 这轮里每个队列项自己的固定根。
 /// 不是 `inputPaths`（用户历次导入攒下来的清单）：换轮次、单文件重试时，
 /// 拿那份清单去推相对路径会得出和前一次不同的层级（§39 §40）。
+// 每文件冻结的相对路径（P2-11 / T18）：键=绝对路径，值=导入时定死的 relativePath。
+// 后端拿到这份映射就严格按它走，批级来源根并集的"最深根胜出"猜测不再参与决策 ——
+// 重叠来源根的批次换个执行顺序也不会改变输出目录结构。
 function sourceRootsForPaths(paths) {
   var roots = [];
   (paths || []).forEach(function(path) {
@@ -2970,6 +3020,21 @@ function handlePrimaryAction() {
   if (compressionState === COMPRESSION_PAUSED) return toggleCompressionPause();
   if (compressionState !== COMPRESSION_IDLE) return;
   return startCompression(false);
+}
+
+function withPerFileRelativePaths(options, paths) {
+  if (!options || typeof options !== 'object') return options;
+  var perFile = perFileRelativePathsMap(paths);
+  if (!perFile) return options;
+  return Object.assign({}, options, { perFileRelativePaths: perFile });
+}
+function perFileRelativePathsMap(paths) {
+  var map = {};
+  (paths || []).forEach(function(path) {
+    var item = queueItems.get(path);
+    if (item && item.relativePath) map[path] = item.relativePath;
+  });
+  return Object.keys(map).length > 0 ? map : null;
 }
 
 async function startCompression(isIncrement) {
@@ -3306,10 +3371,17 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
     var sessionResult;
     if (videoPaths.length > 0) {
       unlistenVideo = await listen('video-progress', function(event) { videoProgressHandler(event.payload); });
+    // P2-11 阶段呈现（F21）：图片先于视频是成文决定，UI 必须让用户看见当前阶段。
+    window.__sizqoPhaseUnlisten = window.__sizqoPhaseUnlisten
+      || await listen('media-phase', function(event) { mediaPhaseHandler(event.payload); });
       sessionResult = await invoke('start_media_session', {
         images: imagePaths,
-        videoTasks: videoPaths.map(function(path) { return { taskId: targetItems.get(path).taskId, path: path }; }),
-        imageOptions: batchOptions,
+        videoTasks: videoPaths.map(function(path) {
+          var item = targetItems.get(path) || {};
+          // P2-11 / T18：每个视频任务携带导入时冻结的来源根与相对路径。
+          return { taskId: item.taskId, path: path, sourceRoot: item.sourceRoot || null, relativePath: item.relativePath || null };
+        }),
+        imageOptions: withPerFileRelativePaths(batchOptions, imagePaths),
         videoOptions: videoOptions,
         sessionId: session.id,
         queueRevision: session.queueRevision,
@@ -3321,7 +3393,7 @@ async function startCompressionForPaths(isIncrement, requestedPaths) {
         sessionId: session.id,
         queueRevision: session.queueRevision,
         filePaths: imagePaths,
-        options: batchOptions,
+        options: withPerFileRelativePaths(batchOptions, imagePaths),
       });
     }
     // 事件是实时路径，返回值是补救路径：某一轮结束了却没有把事件送到时，

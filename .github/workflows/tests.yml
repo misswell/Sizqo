@@ -23,6 +23,9 @@ jobs:
         # --nocapture：崩溃注入的逐阶段结论就是这条门禁的证据，
         # 静默通过的 harness 在 CI 日志里和"没跑"看不出区别。
         run: cargo test --test crash_injection -- --nocapture
+      - name: dual-instance file transactions (两个真实进程 O_EXCL 竞争，T21)
+        working-directory: src-tauri
+        run: cargo test --test dual_instance -- --nocapture
       - name: contract vectors (Rust side)
         working-directory: src-tauri
         run: cargo test --lib rust_executes_every_contract -- --nocapture
@@ -54,6 +57,12 @@ jobs:
       - name: crash injection on macOS (APFS 上的真实 SIGKILL 现场)
         working-directory: src-tauri
         run: cargo test --test crash_injection -- --nocapture
+      - name: x86_64 slice compiles (Intel mac 用户不能只靠 arm64 的绿替自己背书)
+        working-directory: src-tauri
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo check --lib --target x86_64-apple-darwin
+          cargo check --lib --target x86_64-apple-darwin --features inproc-backends
 
   frontend-tests:
     runs-on: ubuntu-latest
@@ -71,6 +80,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Swift history/backup/scheduler self-checks + contract vectors
         run: bash scripts/test_swift_history.sh
+      - name: Full Swift source typecheck（含 AppState 生命周期 —— 不能只靠源码字符串检查）
+        run: |
+          TARGET="$(uname -m)-apple-macos13.0"
+          find swift/Sources/SizqoSwift -name '*.swift' -print0 | xargs -0 xcrun swiftc -typecheck -target "$TARGET"
 
   # §28 审查修复（P0-3）：`cargo check` 只能证明 Windows 分支编得过，证明不了
   # 目录 fsync 真跑得通（读句柄上 sync_all 会直接失败）。这一段要的是运行时结论。

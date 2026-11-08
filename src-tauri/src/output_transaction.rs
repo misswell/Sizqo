@@ -258,6 +258,23 @@ impl TransactionStore {
         let _ = fs::remove_file(self.path_of(id));
     }
 
+    /// 产物落进的目标位与记账时的计划位不同（编码期间输出名被抢 → 换号重试，
+    /// 本轮加固 P2-12）：把日志里的 `outputPath` 更新成实际位置。不更新的话，
+    /// 崩在"已安装、历史没写"窗口里的恢复会拿着计划路径去找产物 —— 内容指纹
+    /// 归属门虽然保证不误删，但实际位置上那份产物就没人认领了。
+    pub fn update_output_path(&self, id: &str, actual: &Path) -> Result<(), String> {
+        let path = self.path_of(id);
+        let Ok(raw) = fs::read_to_string(&path) else {
+            // 日志已经不在（finish 过了）就没有可更新的：调用方按无事务收尾。
+            return Ok(());
+        };
+        let mut txn: ReplaceTransaction = serde_json::from_str(&raw)
+            .map_err(|error| format!("事务日志读取失败（{error}），保持原样"))?;
+        txn.output_path = actual.to_string_lossy().into_owned();
+        let json = serde_json::to_string(&txn).map_err(|e| e.to_string())?;
+        write_atomic(&path, json.as_bytes())
+    }
+
     pub fn list(&self) -> Vec<ReplaceTransaction> {
         let Ok(entries) = fs::read_dir(&self.root) else {
             return Vec::new();
@@ -613,8 +630,10 @@ fn verify_backup_voucher(txn: &ReplaceTransaction, backup: &Path) -> Result<(), 
 
 /// 删掉这次压缩产生的新文件与临时文件。同格式 replace 的输出就是源文件本身，绝不删。
 ///
-/// 跨格式的输出文件也只删"能证明是这次生成的"：内容指纹命中，或老日志体积对上；
-/// 其它体积/内容说明这位置已经被别人的内容占了，宁可留下也不误删。
+/// 跨格式的输出文件也只删"能证明是这次生成的"：内容指纹命中，或带身份凭证的空占位。
+/// **体积不构成所有权证明**（本轮加固 P1-4）：老日志没有产物指纹时，与
+/// `expected_output_size` 恰好同大的文件可能是用户后来放进这个路径的自己的内容 ——
+/// 大小对上一律保留，宁留孤儿不误删。
 fn remove_generated_output(txn: &ReplaceTransaction) {
     let source = PathBuf::from(&txn.source_path);
     if txn.cross_format || !crate::history::same_file(&PathBuf::from(&txn.output_path), &source) {
@@ -633,18 +652,21 @@ fn remove_generated_output(txn: &ReplaceTransaction) {
                     .ok()
                     .as_deref()
                     == Some(expected),
-                // 老日志没有指纹：只删大小正好等于这次产出尺寸的文件。
-                // 旧契约的"无条件清"会把用户在崩溃后放进这个路径的内容一并删掉。
-                None => {
-                    fs::metadata(output).map(|meta| meta.len()).unwrap_or(0)
-                        == txn.expected_output_size
-                        && txn.expected_output_size > 0
-                }
+                // 老日志没有指纹：没有归属证明就绝不自动删（本轮 P1-4）。
+                // 大小相同从来不构成"这是我们的产物"的证据 —— 用户在崩溃后
+                // 恰好放进同路径同大小的文件会被旧判据误删。文件与日志都原样
+                // 保留，交给人工恢复清单。
+                None => false,
             },
             Err(_) => false,
         };
         if ours {
             let _ = fs::remove_file(output);
+        } else if fs::metadata(output).is_ok() {
+            log::warn!(
+                "事务恢复：{} 证明不了是本次产物，已原样保留（请人工确认）",
+                output.display()
+            );
         }
     }
     remove_temp(txn);
@@ -791,11 +813,22 @@ impl std::fmt::Display for SwapPublishError {
 /// - 换回失败：**保留现场** —— 目标位置此刻是我们的产物、用户内容在交换出来的
 ///   临时路径上；尽力把用户内容改名成看得见的 `*.sizqo-conflict-N` 防止它被
 ///   当作我们的临时文件清掉；调用方必须走回滚（用备份恢复原图）而不是 withdraw。
+/// 覆盖提交成功后的现场：交换出来的旧字节被放在哪里。
+#[derive(Debug)]
+pub struct SwapPublishOutcome {
+    /// 事务管理下的旧字节保留路径（`.sizqo-retire-*.keep`）。本轮加固（P1-3）起
+    /// 被换出的字节**不再无条件删除**：删除挡不住外部早已持有的写句柄在验证之后
+    /// 原地改写 —— 同长度的改写只有内容哈希看得出来，而那时字节已经没了。
+    /// None = 已按内容凭证降级删除（保留名认领失败的兜底）。
+    pub swapped_out_retained_at: Option<PathBuf>,
+}
+
 pub fn publish_replace_if_identity_matches(
     staged: &Path,
     target: &Path,
     expected: &crate::source_identity::SourceIdentity,
-) -> Result<(), SwapPublishError> {
+    expected_candidate_sha256: Option<&str>,
+) -> Result<SwapPublishOutcome, SwapPublishError> {
     match atomic_swap(staged, target) {
         Ok(()) => {}
         Err(error) if swap_unsupported(&error) => {
@@ -847,11 +880,71 @@ pub fn publish_replace_if_identity_matches(
             }
         }
     }
-    // 验证通过：提交成立。旧内容的可信副本在备份里，这份交换出来的可以删了。
-    if let Err(error) = fs::remove_file(staged) {
-        log::warn!("提交后被换出的旧文件删除失败（原图备份仍在）: {error}");
+    // 被换出的原图没问题。接着验**新产物**（本轮加固 P1-1）：原子交换保证目录项
+    // 换了位置，但外部持有 fd 可以对我们的候选 inode 原地改写 —— 落在目标位上的
+    // 字节必须与事务记账的内容指纹对得上。对不上就换回去，撤销提交。
+    if let Err(detail) = verify_installed_content(target, expected_candidate_sha256) {
+        match atomic_swap(staged, target) {
+            Ok(()) => {
+                return Err(SwapPublishError {
+                    swapped: false,
+                    detail: format!("{detail}；已交换回原状，本次提交已撤销"),
+                });
+            }
+            Err(swap_back) => {
+                let relocated = protect_foreign_bytes(staged, target);
+                return Err(SwapPublishError {
+                    swapped: true,
+                    detail: format!(
+                        "{detail}，交换回滚也失败（{swap_back}）；\
+                         产物字节已从目标位撤下，保留在 {relocated:?}，目标位与事务日志原样，请人工确认"
+                    ),
+                });
+            }
+        }
     }
-    Ok(())
+    // 双侧验证通过：提交成立。被换出的旧字节此刻停在 staged 路径上 —— 按本轮
+    // 加固（P1-3）转成事务管理的保留名，路径交给调用方记进历史、由用户明确清理；
+    // 保留名认领失败时按内容凭证降级删除，凭证也对不上就原样保留。
+    let retained = match retain_swapped_out(staged, target) {
+        Some(path) => Some(path),
+        None => match (&expected.sha256, crate::source_identity::sha256_of(staged)) {
+            (Some(expected_sha), Ok(actual)) if &actual == expected_sha => {
+                if let Err(error) = fs::remove_file(staged) {
+                    log::warn!("被换出的旧文件按凭证降级删除失败，已原样保留: {error}");
+                    Some(staged.to_path_buf())
+                } else {
+                    None
+                }
+            }
+            _ => {
+                log::warn!("被换出的旧文件改入保留名失败且内容凭证不可用，已原样保留");
+                Some(staged.to_path_buf())
+            }
+        },
+    };
+    Ok(SwapPublishOutcome {
+        swapped_out_retained_at: retained,
+    })
+}
+
+/// 把被换出的字节原子改名进一个独占认领的保留名（同目录 `.sizqo-retire-*.keep`）。
+/// 认领/改名任一步失败返回 None —— 调用方降级为按凭证删除或原样保留。
+fn retain_swapped_out(staged: &Path, target: &Path) -> Option<PathBuf> {
+    let quarantine = claim_quarantine_name(target).ok()?;
+    if quarantined_still_ours(&quarantine).is_err() {
+        let _ = fs::remove_file(&quarantine.path);
+        return None;
+    }
+    match fs::rename(staged, &quarantine.path) {
+        Ok(()) => Some(quarantine.path),
+        Err(error) => {
+            // 保留名空占位收回去，字节原样留在 staged 路径上给调用方处置。
+            let _ = fs::remove_file(&quarantine.path);
+            log::debug!("被换出的旧字节改入保留名失败（{error}）");
+            None
+        }
+    }
 }
 
 /// 把已经 fsync 的备份副本写回源位置 —— 带**产物身份复核**的提交（本轮加固 F5）。
@@ -867,9 +960,14 @@ pub(crate) fn write_back_verified(
     expected: &crate::source_identity::SourceIdentity,
 ) -> Result<(), String> {
     let staged = StagedOutput::copy_staged(backup, target)?;
-    match publish_replace_if_identity_matches(&staged.temp, target, expected) {
-        Ok(()) => {
+    let expected_sha = staged.written_sha256();
+    match publish_replace_if_identity_matches(&staged.temp, target, expected, expected_sha.as_deref())
+    {
+        Ok(outcome) => {
             staged.settle();
+            if let Some(retained) = outcome.swapped_out_retained_at {
+                log::warn!("恢复/回滚时被换出的产物保留在 {}（可人工清理）", retained.display());
+            }
             let _ = crate::history::sync_dir(target.parent().unwrap_or_else(|| Path::new("/")));
             Ok(())
         }
@@ -1108,7 +1206,7 @@ fn claim_placeholder(target: &Path) -> Result<ClaimedPlaceholder, String> {
 ///
 /// 上一轮在②失败后落到「`exists()` 查空 + `fs::rename`」，查空与改名之间外部
 /// 塞进来的文件会被直接盖掉（P1-a）。
-fn install_at_free_path(candidate: &Path, target: &Path) -> Result<(), String> {
+pub(crate) fn install_at_free_path(candidate: &Path, target: &Path) -> Result<(), String> {
     match rename_no_replace(candidate, target) {
         Ok(()) => return Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1231,7 +1329,8 @@ fn publish_via_quarantine(
     staged: &Path,
     target: &Path,
     verify: impl Fn(&Path) -> Option<String>,
-) -> Result<(), SwapPublishError> {
+    expected_candidate_sha256: Option<&str>,
+) -> Result<SwapPublishOutcome, SwapPublishError> {
     let refused = |detail: String| SwapPublishError {
         swapped: false,
         detail,
@@ -1291,11 +1390,31 @@ fn publish_via_quarantine(
         });
     }
 
-    // 覆盖已经成立：隔离名上的就是被换出的原图（刚复验过，备份里还有一份可信副本）。
-    if let Err(error) = fs::remove_file(&quarantine.path) {
-        log::warn!("提交后被换出的旧文件删除失败（原图备份仍在）: {error}");
+    // 候选内容对账（本轮加固 P1-1）：装进目标位的必须是这次写下去的那份字节。
+    // 对不上就把原图放回原位、撤销提交 —— 候选字节被交换出来，停在保留名上。
+    if let Err(detail) = verify_installed_content(target, expected_candidate_sha256) {
+        return Err(SwapPublishError {
+            swapped: false,
+            detail: match restore_quarantined(&quarantine.path, target) {
+                Restored::InPlace => format!("{detail}；原图已放回原位，本次提交已撤销"),
+                Restored::InPlaceForeignKept(kept) => format!(
+                    "{detail}；原图已回到原位，候选那份保留在 {}，未删除",
+                    kept.display()
+                ),
+                Restored::Kept(kept) => format!(
+                    "{detail}；原图字节保留在 {}，请人工确认",
+                    kept.display()
+                ),
+            },
+        });
     }
-    Ok(())
+
+    // 覆盖已经成立：隔离名上的就是被换出的原图（刚复验过，备份里还有一份可信副本）。
+    // 本轮加固（P1-3）起不再删除 —— 这份字节就是事务管理的保留文件，路径交给调用方
+    // 记进历史、由用户明确清理。
+    Ok(SwapPublishOutcome {
+        swapped_out_retained_at: Some(quarantine.path),
+    })
 }
 
 /// 同格式覆盖的隔离路线：验的是**内容指纹**。
@@ -1303,12 +1422,22 @@ fn publish_replace_via_quarantine(
     staged: &Path,
     target: &Path,
     expected: &crate::source_identity::SourceIdentity,
-) -> Result<(), SwapPublishError> {
+) -> Result<SwapPublishOutcome, SwapPublishError> {
     use crate::source_identity::SourceCheck;
-    publish_via_quarantine(staged, target, |path| match expected.verify(path) {
-        SourceCheck::Changed(detail) => Some(format!("目标文件在提交前一刻被外部修改（{detail}）")),
-        SourceCheck::Unchanged => None,
-    })
+    // 隔离路线没有 StagedOutput 在手（入口是裸路径），候选指纹在这里补一遍：
+    // 交换前的 staged 内容就是即将落进目标位的内容。
+    let candidate_sha256 = crate::source_identity::sha256_of(staged).ok();
+    publish_via_quarantine(
+        staged,
+        target,
+        |path| match expected.verify(path) {
+            SourceCheck::Changed(detail) => {
+                Some(format!("目标文件在提交前一刻被外部修改（{detail}）"))
+            }
+            SourceCheck::Unchanged => None,
+        },
+        candidate_sha256.as_deref(),
+    )
 }
 
 /// 跨格式 / 新建输出的隔离路线：验的是**占位 inode 凭证**。
@@ -1317,16 +1446,23 @@ fn publish_claimed_via_quarantine(
     target: &Path,
     expected: (u64, u64),
 ) -> Result<(), String> {
-    publish_via_quarantine(staged, target, |path| {
-        if file_identity(path) == Some(expected) {
-            None
-        } else {
-            Some(format!(
-                "输出位置已被外部改动（{} 不是本次认领的占位文件）",
-                target.display()
-            ))
-        }
-    })
+    let candidate_sha256 = crate::source_identity::sha256_of(staged).ok();
+    publish_via_quarantine(
+        staged,
+        target,
+        |path| {
+            if file_identity(path) == Some(expected) {
+                None
+            } else {
+                Some(format!(
+                    "输出位置已被外部改动（{} 不是本次认领的占位文件）",
+                    target.display()
+                ))
+            }
+        },
+        candidate_sha256.as_deref(),
+    )
+    .map(|_| ())
     .map_err(|error| error.detail)
 }
 
@@ -1372,11 +1508,47 @@ enum Restored {
 /// 任何一条路走不通，结果都是"字节还在磁盘上"+ 一句说实话的警告，绝不会是
 /// "报了保留却把文件删了"。
 ///
-/// `Ok(())` = 原图已删除；`Err(detail)` = 原图保留，detail 是给用户看的原话。
+/// `Ok(RetiredOriginal)` = 原图已经隔离改名成事务管理的保留文件（**不再自动删除**，
+/// 路径交给历史记录、由用户在历史里明确清理）；`Err(detail)` = 原图留在原位，
+/// detail 是给用户看的原话。
+///
+/// 为什么不删（本轮加固 P1-3）：macOS/Linux/Windows 都不能仅凭一次 SHA-256 证明
+/// "没有别的进程还持有这支 inode 的写句柄"。复验、长度检查都通过之后，外部那份
+/// 早先打开的 fd 仍能原地改写同样长度的内容 —— 备份里存的是压缩之前的旧字节，
+/// 用户后来写进原图的那份修改会随删除一起消失。宁可多留一份几 MB 的原文件，
+/// 也不冒静默丢失用户修改的风险。
+#[derive(Debug)]
+pub struct RetiredOriginal {
+    /// 保留文件的实际路径（同目录 `.sizqo-retire-*.keep`）。
+    pub path: PathBuf,
+    /// 隔离时的文件大小（来自身份凭证）。
+    pub size: u64,
+}
+
 pub fn retire_original(
     file: &Path,
     identity: &crate::source_identity::SourceIdentity,
+) -> Result<RetiredOriginal, String> {
+    retire_with_policy(file, identity, true).and_then(|retired| {
+        retired.ok_or_else(|| "内部错误：保留策略未返回保留路径".to_string())
+    })
+}
+
+/// 用户明确要求删除的文件（历史页「删除这次压缩结果」）走删除版：身份复核、
+/// 隔离认领、复验与长度检查一样不少 —— 只是最后真的删除。与 `retire_original`
+/// 的差别仅在最终处置：一个是事务管理的保留文件，一个是用户点名要删的产物。
+pub fn retire_verified(
+    file: &Path,
+    identity: &crate::source_identity::SourceIdentity,
 ) -> Result<(), String> {
+    retire_with_policy(file, identity, false).map(|_| ())
+}
+
+fn retire_with_policy(
+    file: &Path,
+    identity: &crate::source_identity::SourceIdentity,
+    retain: bool,
+) -> Result<Option<RetiredOriginal>, String> {
     use crate::source_identity::SourceCheck;
 
     if let SourceCheck::Changed(detail) = identity.verify(file) {
@@ -1416,9 +1588,9 @@ pub fn retire_original(
 
     #[cfg(test)]
     inject_retire_post_verify_fault(&quarantine.path);
-    // ④ 删除前再看一眼体积：改名不会让外部**已经持有的文件句柄**失效，验证通过之后
+    // ④ 保留前再看一眼体积：改名不会让外部**已经持有的文件句柄**失效，验证通过之后
     //    那支 fd 仍能往同一个 inode 里追加。这一眼拦得住"又长了字节"的那一类；
-    //    同长度原地改写拦不住 —— 那一小段的兜底是覆盖前就做好的原图备份，不是这里。
+    //    同长度原地改写拦不住 —— 正因如此，下一步**保留**而不是删除（本轮 P1-3）。
     if let Ok(meta) = fs::metadata(&quarantine.path) {
         if meta.len() != identity.size {
             return Err(match restore_quarantined(&quarantine.path, file) {
@@ -1442,8 +1614,17 @@ pub fn retire_original(
             });
         }
     }
+    // ⑤ 最终处置按策略走。retain = true（跨格式替换的本轮 P1-3 新政策）：删除动作
+    //    取消，隔离名（`.sizqo-retire-*.keep`）从这一刻起就是事务管理的原文件副本，
+    //    路径交给调用方记进历史 —— 用户清空历史时才删除，绝不自动永久删除。
+    if retain {
+        return Ok(Some(RetiredOriginal {
+            path: quarantine.path,
+            size: identity.size,
+        }));
+    }
     match fs::remove_file(&quarantine.path) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(None),
         Err(error) => Err(match restore_quarantined(&quarantine.path, file) {
             Restored::InPlace => format!("原图删除失败（{error}），已放回原位"),
             Restored::InPlaceForeignKept(kept) => format!(
@@ -1563,15 +1744,25 @@ fn inject_retire_fault(quarantine: &Path, original: &Path) {
 
 /// 测试用：复验**已经通过**之后、删除之前，另一个持有 fd 的写者继续写 ——
 /// 改名不会让人家的文件句柄失效，所以这个窗口真实存在（上一轮问的 P2）。
+/// 模式 5 = 同长度原地改写（T05 的场景本体）：长度检查拦不住它，只有
+/// "保留不删"能保住用户后来写进原图的那份修改。
 #[cfg(test)]
 fn inject_retire_post_verify_fault(quarantine: &Path) {
-    use std::io::Write;
-    if TEST_FAULT_IN_RETIRE_WINDOW.with(std::cell::Cell::get) != 4 {
-        return;
+    use std::io::{Seek, SeekFrom, Write};
+    let mode = TEST_FAULT_IN_RETIRE_WINDOW.with(std::cell::Cell::get);
+    if mode == 4 {
+        if let Ok(mut handle) = fs::OpenOptions::new().append(true).open(quarantine) {
+            let _ = handle.write_all(b"-late-write");
+            let _ = handle.sync_all();
+        }
     }
-    if let Ok(mut handle) = fs::OpenOptions::new().append(true).open(quarantine) {
-        let _ = handle.write_all(b"-late-write");
-        let _ = handle.sync_all();
+    if mode == 5 {
+        if let Ok(mut handle) = fs::OpenOptions::new().write(true).open(quarantine) {
+            // 与原内容严格同长度的外部改写：SHA 全变，stat 三项与文件长度都不变。
+            let _ = handle.seek(SeekFrom::Start(0));
+            let _ = handle.write_all(b"external-same-length-EDIT");
+            let _ = handle.sync_all();
+        }
     }
 }
 
@@ -1781,6 +1972,11 @@ pub struct ClaimedOutput {
     /// 躺着的还是不是我们认领的那个占位"就有了可验证的凭证 —— 外部程序即使
     /// 删掉占位又建了自己的同名文件，提交和清理也都不会碰它。
     identity: Option<(u64, u64)>,
+    /// 一直开着的占位句柄（本轮加固 R3）：只比 `(dev,ino)` 挡不住 inode 复用 ——
+    /// ext4 等文件系统在 unlink 之后立刻复用 inode，外部"删占位 → 建同名文件"
+    /// 可能恰好拿到同一个 inode。句柄开着，unix 上 `nlink == 0` 就能识破这一手，
+    /// Windows 上打开句柄存续期间文件 ID 不会被复用。
+    handle: Option<fs::File>,
 }
 
 impl ClaimedOutput {
@@ -1805,7 +2001,20 @@ impl ClaimedOutput {
         }
     }
 
-    fn still_ours(&self) -> bool {
+    /// 目标位上现在躺着的还是我们认领的那个占位吗？（对外可见：视频提交与
+    /// 换号重试在动手前都要问这一句。）
+    pub fn still_ours(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match self.handle.as_ref().map(|file| file.metadata()) {
+                // 名字被 unlink 掉了：我们那个 inode 只剩这份句柄，没有任何目录项
+                // 指向它 —— 同路径上的任何文件都不是我们的，哪怕 inode 被复用。
+                Some(Ok(meta)) if meta.nlink() == 0 => return false,
+                Some(Err(_)) => return false,
+                _ => {}
+            }
+        }
         match (self.identity, file_identity(&self.path)) {
             (Some(expected), Some(actual)) => expected == actual,
             // 取不到身份（其他平台、或这个位置根本打不开）：文件已经不在了才无事可做，
@@ -1838,13 +2047,17 @@ impl OutputNameAllocator {
                 .create_new(true)
                 .open(&path)
             {
-                // 句柄在这里就丢掉：我们要的只是"这个名字已经名花有主"这件事。
                 // 占位的 (dev,ino) 从**还开着的句柄**上取（本轮加固 F1）：
-                // 它就是提交时"这个路径上是谁的文件"的凭证。
+                // 它就是提交时"这个路径上是谁的文件"的凭证。句柄随 `ClaimedOutput`
+                // 一起活着 —— 提交/清理前的每一次 `still_ours` 都要靠它识破
+                // "unlink 之后 inode 复用"那一类偷换（见结构体注释）。
                 Ok(file) => {
                     let identity = identity_of_open(&file);
-                    drop(file);
-                    return Ok(ClaimedOutput { path, identity });
+                    return Ok(ClaimedOutput {
+                        path,
+                        identity,
+                        handle: Some(file),
+                    });
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
                 Err(error) => {
@@ -1861,32 +2074,73 @@ impl OutputNameAllocator {
 }
 
 /// 分块把一个文件复制进已经打开的临时文件：视频的原图可能有几个 GB，整份进内存不行。
-fn copy_file_into(file: &mut fs::File, source: &Path) -> Result<(), String> {
+/// 边复制边算内容指纹：发布后的对账凭证不靠额外一遍全文件读。
+fn copy_file_into(file: &mut fs::File, source: &Path) -> Result<String, String> {
     use std::io::{Read, Write};
+    use sha2::{Digest, Sha256};
     let mut reader = fs::File::open(source).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
     let mut buffer = [0u8; 256 * 1024];
     loop {
         let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
         if read == 0 {
             break;
         }
+        hasher.update(&buffer[..read]);
         file.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// 发布落定后的对账：目标位上的字节必须就是这次事务写下去的那份。
+///
+/// 原子交换/占位覆盖只能保证"换的是同一个目录项"，挡不住外部持有 fd 对**我们
+/// 的候选 inode**原地改写（占位是普通权限文件，别人开得开）。内容指纹对不上
+/// = 目标位上的字节来历不明：调用方必须换回撤销，绝不能当作提交成功。
+fn verify_installed_content(target: &Path, expected: Option<&str>) -> Result<(), String> {
+    let Some(expected_sha) = expected else {
+        // 没有凭证就无法对账 —— 上一轮加固已让所有写入路径都记账指纹，
+        // 走到这里的 None 只能是旧调用方，宁可拒绝也不装作看不见。
+        return Err(format!(
+            "缺少候选内容指纹（{}），无法证明落盘的就是本次产物，放弃提交",
+            target.display()
+        ));
+    };
+    let actual = crate::source_identity::sha256_of(target).map_err(|error| {
+        format!("提交后无法读取目标内容做对账（{error}），放弃提交")
+    })?;
+    if actual != expected_sha {
+        return Err(format!(
+            "目标位上的内容与本次写入的指纹不符（{expected_sha} → {actual}），\
+             放弃提交以保护该位置的字节"
+        ));
     }
     Ok(())
 }
 
-/// 压缩结果的落盘：同目录独占临时文件 → flush + fsync → rename 覆盖目标。
+/// 压缩结果的落盘：同目录独占临时文件 → 持有句柄写入（truncate→write→flush→fsync）
+/// → rename / 原子交换覆盖目标。
 ///
 /// 临时文件必须和目标同目录，否则 rename 跨挂载点就不是原子操作了。
+///
+/// 本轮加固（审查 P1-1）：临时文件从创建到提交**始终持有打开句柄**。旧写法在
+/// `keep()` 处丢掉创建句柄、写入时按路径重新 open —— 两次打开之间外部程序可以
+/// 删掉临时文件、在同一个路径上放进自己的文件，而截断缺失还会让旧文件尾部残留在
+/// 候选尾部。现在：写入只用创建时的那个句柄，写入前显式 `set_len(0)`，身份凭证
+/// 也从句柄上取。
 pub struct StagedOutput {
     pub temp: PathBuf,
     /// 认领这个临时名时的 `(dev,ino)`：`discard` 的归属凭证。
     /// 原子交换会把外部字节放到这条路径上，届时 inode 变了 —— 凭证对不上就不许删。
     claimed_identity: Option<(u64, u64)>,
-    /// 已经写下去的那份字节的内容指纹：inode 凭证不可用时的归属依据。
+    /// 已经写下去的那份字节的内容指纹：inode 凭证不可用时的归属依据，
+    /// 也是发布后"目标位上确实是这次写出去的字节"的对账凭证。
     /// `RefCell` 而不是 `&mut self`：`withdraw` 闭包按不可变借用持有 staged，
     /// 而写候选的那一步要在同一个借用期内记下这份指纹。
     written_sha256: std::cell::RefCell<Option<String>>,
+    /// 创建临时文件时拿到、一直开到提交完成的句柄。写入必须走它：按路径重开
+    /// 就回到了"两次打开之间路径可能换一个 inode"的老问题上。
+    handle: std::cell::RefCell<Option<fs::File>>,
 }
 impl StagedOutput {
     /// 写一批字节再原子改名到目标（history.json、设置文件这些不需要中途记账的落盘）。
@@ -1904,10 +2158,21 @@ impl StagedOutput {
 
     /// 整份复制一个文件再原子改名到目标（原图备份、把备份写回源文件）。
     /// 分块读写而不是整份进内存：视频的原图可能有几个 GB。
+    /// 复制的同时就地算内容指纹 —— 发布后的对账凭证不靠额外一遍全文件读。
     pub fn copy_from(source: &Path, target: &Path) -> Result<Self, String> {
-        Self::stage(target, ".sizqo-copy-", None, |file| {
-            copy_file_into(file, source)
-        })
+        let staged = Self::claim(target, ".sizqo-copy-")?;
+        let outcome = staged.fill(|file| copy_file_into(file, source));
+        match outcome {
+            Ok(sha256) => *staged.written_sha256.borrow_mut() = Some(sha256),
+            Err(_) => {}
+        }
+        match staged.publish(target) {
+            Ok(()) => Ok(staged),
+            Err(error) => {
+                staged.discard();
+                Err(error)
+            }
+        }
     }
 
     /// 整份复制到同目录临时名但**不改名**：恢复原图这类"提交前还要凭证核验"的
@@ -1915,9 +2180,12 @@ impl StagedOutput {
     /// 写失败时自己收走临时文件；临时名与 copy_from 同一套独占分配。
     pub fn copy_staged(source: &Path, target: &Path) -> Result<Self, String> {
         let staged = Self::claim(target, ".sizqo-copy-")?;
-        if let Err(error) = staged.fill(|file| copy_file_into(file, source)) {
-            staged.discard();
-            return Err(error);
+        match staged.fill(|file| copy_file_into(file, source)) {
+            Ok(sha256) => *staged.written_sha256.borrow_mut() = Some(sha256),
+            Err(error) => {
+                staged.discard();
+                return Err(error);
+            }
         }
         Ok(staged)
     }
@@ -1941,18 +2209,22 @@ impl StagedOutput {
             .suffix(".tmp")
             .tempfile_in(parent)
             .map_err(|e| e.to_string())?;
-        // keep() 之后这份临时文件归我们收尾：TempPath 一 drop 就把它删掉，而改名完成后
-        // 那个 inode 是用户要的产物，不许被"自动清理"顺手删了。
-        let temp = named
-            .into_temp_path()
+        // into_parts() 把创建句柄留在我们手里（本轮加固 P1-1）：TempPath 一 drop 就会
+        // 删文件，而改名完成后那个 inode 是用户要的产物，所以先把 TempPath keep 成
+        // 裸路径，句柄单独存进结构体 —— 写入、身份凭证、发布对账全都走它。
+        let (file, temp_path) = named.into_parts();
+        let temp = temp_path
             .keep()
             .map_err(|error| error.error.to_string())?;
         // 认领后立即记下 inode：之后任何一次清理都只认这份凭证。
-        // 读不出来（非 unix / 刚建好就被移走）时记 None —— 清理侧据此拒绝删除。
+        // 身份从还开着的句柄上取（按路径 stat 是上一轮明令禁止的做法）；句柄上
+        // 读不出来时记 None —— 清理侧据此拒绝删除。
+        let claimed_identity = identity_of_open(&file);
         Ok(Self {
-            claimed_identity: file_identity(&temp),
+            claimed_identity,
             written_sha256: std::cell::RefCell::new(None),
             temp,
+            handle: std::cell::RefCell::new(Some(file)),
         })
     }
 
@@ -1973,18 +2245,54 @@ impl StagedOutput {
             use std::io::Write;
             file.write_all(bytes).map_err(|e| e.to_string())
         })
+        .map(|_| ())
     }
 
-    fn fill(&self, fill: impl FnOnce(&mut fs::File) -> Result<(), String>) -> Result<(), String> {
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .open(&self.temp)
-            .map_err(|e| e.to_string())?;
-        fill(&mut file)?;
+    /// 发布对账凭证：这次事务写下去的字节的内容指纹。
+    pub fn written_sha256(&self) -> Option<String> {
+        self.written_sha256.borrow().clone()
+    }
+
+    /// 用**创建时一直开着的那个句柄**写入：截断到 0 → 写 → flush → fsync。
+    ///
+    /// 按路径重开是违规路径（本轮加固 P1-1）：两次打开之间外部可以删掉临时文件、
+    /// 在同一路径放进自己的文件；没有 truncate 时，比新内容长的旧文件还会在候选
+    /// 尾部残留旧字节。句柄已经不在了（理论上不该发生）就按失败处理，绝不悄悄
+    /// 退化成按路径写入。
+    fn fill<T>(
+        &self,
+        fill: impl FnOnce(&mut fs::File) -> Result<T, String>,
+    ) -> Result<T, String> {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut handle_ref = self.handle.borrow_mut();
+        let file = match handle_ref.as_mut() {
+            Some(file) => file,
+            // 创建句柄丢了还按路径重开，就等于把 P1-1 的洞重新挖开。
+            None => return Err("暂存文件的创建句柄已不可用，拒绝按路径重写".into()),
+        };
+        // 明确归零：这个临时文件是独占创建的空文件，但防线要挡的是"路径被换成
+        // 内容更长的外部文件后我们又恰好按路径写"的那类残留。
+        file.set_len(0).map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        let value = fill(file)?;
         file.flush().map_err(|e| e.to_string())?;
         // 落盘确认：崩溃后 rename 过去的不能是个只在内核缓存里的文件。
-        file.sync_all().map_err(|e| e.to_string())
+        file.sync_all().map_err(|e| e.to_string())?;
+        // 句柄还开着，unix 上顺手看一眼目录项还在不在：临时名被外部 unlink 时，
+        // 我们写下去的字节已经没有任何名字指着 —— 这时候提交（按路径 rename）
+        // 注定失败，早一点失败还能把现场留给调用方收尾。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match file.metadata() {
+                Ok(meta) if meta.nlink() == 0 => {
+                    return Err("暂存文件在写入期间被外部移除，候选字节已无处可发布".into());
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        Ok(value)
     }
 
     /// 把已经 fsync 的临时文件原子改名到目标。改名之前该核的都必须已经核过。
@@ -2016,10 +2324,33 @@ impl StagedOutput {
         };
         match atomic_swap(&self.temp, target) {
             Ok(()) => {
-                // 交换成功：self.temp 现在持有被换出来的那份（应该是我们的占位）。
+                // 交换成功：self.temp 现在持有被换出来的那份（应该是我们的占位），
+                // target 上是我们写下去的候选。**两侧都验**（本轮加固 P1-1）：
+                // 换出来的必须是我们的占位 inode，落进目标位的必须是指纹对得上的
+                // 候选字节 —— 占位是普通权限文件，外部持有 fd 就能对它原地改写，
+                // 只验 inode 会把被改写过的字节当成提交成功。
                 if file_identity(&self.temp) == Some(expected) {
-                    let _ = fs::remove_file(&self.temp);
-                    return Ok(());
+                    match verify_installed_content(
+                        target,
+                        self.written_sha256.borrow().as_deref(),
+                    ) {
+                        Ok(()) => {
+                            let _ = fs::remove_file(&self.temp);
+                            return Ok(());
+                        }
+                        Err(detail) => {
+                            // 目标位上的字节来历不明：换回去撤销，候选字节退回临时路径
+                            // 交给调用方 discard（归属门会拦住外来内容）。
+                            if atomic_swap(&self.temp, target).is_ok() {
+                                return Err(detail);
+                            }
+                            let kept = protect_foreign_bytes(&self.temp, target);
+                            return Err(format!(
+                                "{detail}；交换回滚也失败，那份内容保留在 {}，未删除",
+                                kept.display()
+                            ));
+                        }
+                    }
                 }
                 // 换出来的不是我们的占位：换回去，外部文件一个字节都不动。
                 if atomic_swap(&self.temp, target).is_ok() {
@@ -2040,7 +2371,9 @@ impl StagedOutput {
             // 目标位上连占位都没了（被外部删掉）：空位仍是空位，用不覆盖的方式装进去，
             // 而不是因为"验不了凭证"把用户这次的结果整个丢掉。
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                install_at_free_path(&self.temp, target)
+                install_at_free_path(&self.temp, target).and_then(|()| {
+                    verify_installed_content(target, self.written_sha256.borrow().as_deref())
+                })
             }
             Err(error) => Err(format!("原子交换失败: {error}")),
         }
@@ -2399,7 +2732,8 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), b"compressed");
     }
 
-    /// §3.3 原子交换：验证通过 = 提交同时成立，被换出的旧文件随后清掉。
+    /// §3.3 原子交换：验证通过 = 提交同时成立。被换出的旧文件不再无条件删除
+    /// （本轮加固 P1-3）：它被改名成事务管理的保留文件，旧字节一个不少地躺在里面。
     #[test]
     fn publish_replace_swaps_and_verifies_the_swapped_out_bytes() {
         let dir = tempfile::tempdir().unwrap();
@@ -2409,9 +2743,18 @@ mod tests {
         fs::write(&staged, b"new-output").unwrap();
         let expected = crate::source_identity::SourceIdentity::read_with_hash(&target).unwrap();
 
-        publish_replace_if_identity_matches(&staged, &target, &expected).unwrap();
+        let outcome = publish_replace_if_identity_matches(
+            &staged,
+            &target,
+            &expected,
+            Some(crate::source_identity::sha256_bytes(b"new-output").as_str()),
+        )
+        .unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"new-output");
-        assert!(!staged.exists(), "验证通过后被换出的旧文件应当删掉");
+        assert!(!staged.exists(), "候选已经发布，临时路径应当腾空");
+        // 本轮加固（P1-3）：被换出的原图转成保留文件，路径随 outcome 交给历史记录。
+        let retained = outcome.swapped_out_retained_at.expect("被换出的字节必须保留");
+        assert_eq!(fs::read(&retained).unwrap(), b"true-original");
     }
 
     /// §3.3 被换出来的不是预期原图：换回原状，目标与候选都原样保留。
@@ -2426,7 +2769,13 @@ mod tests {
         fs::write(&expected_file, b"true-original").unwrap();
         let expected = crate::source_identity::SourceIdentity::read_with_hash(&expected_file).unwrap();
 
-        let error = publish_replace_if_identity_matches(&staged, &target, &expected).unwrap_err();
+        let error = publish_replace_if_identity_matches(
+            &staged,
+            &target,
+            &expected,
+            Some(crate::source_identity::sha256_bytes(b"new-output").as_str()),
+        )
+        .unwrap_err();
         assert!(!error.swapped, "换回成功 = 什么都没发生");
         assert_eq!(fs::read(&target).unwrap(), b"something-else-entirely");
         assert_eq!(fs::read(&staged).unwrap(), b"new-output");
@@ -2789,8 +3138,9 @@ mod tests {
         );
     }
 
-    /// 老日志（没有身份哈希）维持升级前的恢复契约：一律回滚，产物照原样清掉。
-    /// "证明不了归属就不动手"这道强身份门只对带指纹的新日志生效。
+    /// 老日志（没有身份哈希）维持升级前的恢复契约：一律回滚。产物残骸的清理
+    /// 本轮加固（P1-4）收紧：没有指纹就没有所有权证明 —— 体积恰好等于承诺
+    /// 产出也不再构成"这是我们的产物"的证据，一律保留交人工。
     #[test]
     fn legacy_logs_are_identified_as_far_as_possible_and_never_clobber_unknown_content() {
         let dir = tempfile::tempdir().unwrap();
@@ -2801,7 +3151,7 @@ mod tests {
         fs::write(&backup, b"true-original").unwrap();
 
         // §3.4 能证明的先做：现场源文件还是原图字节（= 备份字节）→
-        // 什么都不用盖，只清产物残骸，不算一次"回滚覆盖"。
+        // 什么都不用盖。产物残骸没有指纹可对账：本轮起一律保留，绝不按大小清。
         fs::write(&source, b"true-original").unwrap();
         let output = dir.path().join("photo.webp");
         fs::write(&output, b"converted").unwrap();
@@ -2813,7 +3163,11 @@ mod tests {
         let report = store.recover(&history);
         assert_eq!(report.rolled_back, 1, "原图仍在原位：只清产物，不重复写回");
         assert_eq!(fs::read(&source).unwrap(), b"true-original");
-        assert!(!output.exists(), "大小对得上的产物照清");
+        assert!(
+            output.exists(),
+            "老日志没有产物指纹：大小对得上也不许自动删（T06）"
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"converted");
 
         // 源文件是用户在崩溃后写入的内容：旧契约"一律回滚"会把用户的新内容
         // 盖掉 —— 新契约保留现场（源文件、备份、事务日志），交人工恢复。
@@ -2946,19 +3300,23 @@ mod tests {
         );
     }
 
-    /// 正常路径：身份一路对得上 → 原图让位给产物，且隔离名一起带走。
+    /// 正常路径：身份一路对得上 → 原图让位给产物。本轮加固（P1-3）起原图
+    /// **保留**成事务管理的保留文件而不是删除 —— 同长度原地改写拦不住，
+    /// 自动删除等于拿用户最新修改赌运气（T05）。
     #[test]
-    fn an_unmodified_original_is_retired_without_leaving_quarantine_names() {
+    fn an_unmodified_original_is_retained_as_a_managed_copy() {
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("photo.png");
         fs::write(&original, b"true-original").unwrap();
         let baseline = crate::source_identity::SourceIdentity::read_with_hash(&original).unwrap();
 
-        retire_original(&original, &baseline).expect("身份一致就该完成跨格式替换");
+        let retired = retire_original(&original, &baseline).expect("身份一致就该完成跨格式替换");
         assert!(!original.exists(), "跨格式替换的语义就是原图让位给产物");
+        assert_eq!(fs::read(&retired.path).unwrap(), b"true-original");
+        assert_eq!(retired.size, b"true-original".len() as u64);
         assert!(
-            quarantine_residue(dir.path()).is_empty(),
-            "删除成功必须把隔离名一起带走"
+            quarantine_residue(dir.path()).len() == 1,
+            "保留文件就躺在隔离名下：路径随历史记录、随用户清空历史清理"
         );
     }
 
@@ -3000,7 +3358,7 @@ mod tests {
     }
 
     /// 故障注入 ②：隔离窗口里外部在原位置放进了新版本。
-    /// 这条路径上被删的只有**我们已经证明得了归属**的那份字节（隔离名里的原图），
+    /// 这条路径上被保留的只有**我们已经证明得了归属**的那份字节（隔离名里的原图），
     /// 外部那份一个字节都不动 —— RC.3 的"复核 + 无条件 remove_file"删的正是它。
     #[test]
     fn an_external_file_reoccupying_the_original_path_is_never_touched() {
@@ -3013,13 +3371,15 @@ mod tests {
         let outcome = retire_original(&original, &baseline);
         set_fault_in_retire_window(0);
 
-        assert!(outcome.is_ok(), "删的是隔离名里那份已复验的原图: {outcome:?}");
+        assert!(outcome.is_ok(), "隔离的是已复验的原图字节: {outcome:?}");
         assert_eq!(
             fs::read(&original).unwrap(),
             b"external-new-version",
             "原位上外部放进去的那份不许被顶掉，也不许被当原图删掉"
         );
-        assert!(quarantine_residue(dir.path()).is_empty());
+        // 本轮加固（P1-3）：隔离名上的原图字节保留，不再删除。
+        let retired = outcome.unwrap();
+        assert_eq!(fs::read(&retired.path).unwrap(), b"true-original");
     }
 
     /// 故障注入 ③：字节被改写 **且** 原位被外部占了 —— 放回原图时只有原子交换
@@ -3169,14 +3529,13 @@ mod tests {
         fs::write(&staged, b"compressed-bytes").unwrap();
         let baseline = crate::source_identity::SourceIdentity::read_with_hash(&target).unwrap();
 
-        publish_replace_via_quarantine(&staged, &target, &baseline)
+        let outcome = publish_replace_via_quarantine(&staged, &target, &baseline)
             .expect("身份一致时隔离改名发布必须成立");
         assert_eq!(fs::read(&target).unwrap(), b"compressed-bytes");
         assert!(!staged.exists(), "候选的名字已改名进目标位");
-        assert!(
-            quarantine_residue(dir.path()).is_empty(),
-            "被换出的原图交给备份恢复，隔离名不留"
-        );
+        // 本轮加固（P1-3）：被换出的原图保留在隔离名上，路径随 outcome 交给历史。
+        let retained = outcome.swapped_out_retained_at.expect("原图字节必须保留");
+        assert_eq!(fs::read(&retained).unwrap(), b"true-original");
     }
 
     /// 隔离发布遇到基线不符：目标位上的字节已经不是这次编码所依据的那份 ——
@@ -3507,6 +3866,120 @@ mod tests {
                 .join("photo_compressed.jpg.sizqo-conflict-0")
                 .exists(),
             "正常删除不产生冲突迁移现场"
+        );
+    }
+
+    // ─── 本轮加固回归（0.3.6-rc.11 外部审查 T 系列） ───────────────────
+
+    /// T01：临时文件被外部替换 → 候选字节经句柄写入，绝不落到外部文件上；
+    /// 占位被偷换后 publish_claimed 拒绝提交，外部内容分文不动。
+    #[test]
+    fn t01_an_externally_replaced_temp_file_never_receives_our_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("photo.png");
+        fs::write(&target, b"original").unwrap();
+        let staged = StagedOutput::claim(&target, ".sizqo-write-").unwrap();
+        let foreign_path = staged.temp.clone();
+        // 外部：删掉我们的临时文件、在同一个路径放进自己的文件。
+        fs::remove_file(&foreign_path).unwrap();
+        fs::write(&foreign_path, b"foreign-bytes-here").unwrap();
+
+        // 写入走的是我们自己持有的句柄；目录项已经被外部 unlink，unix 上写入前
+        // 的 nlink 检查让这次发布注定失败 —— 快速失败并说明，绝不把候选字节
+        // 写到路径上的外部文件里。
+        let write_error = staged
+            .write_synced(b"our-candidate-bytes")
+            .expect_err("目录项已消失：发布注定失败，必须提前拒绝");
+        assert!(write_error.contains("移除"), "{write_error}");
+        // 路径上的字节还是外部的：句柄写入没有经过路径。
+        assert_eq!(fs::read(&foreign_path).unwrap(), b"foreign-bytes-here");
+
+        let placeholder_identity = staged.identity();
+        let publish_error =
+            staged
+                .publish_claimed(&target, placeholder_identity)
+                .expect_err("占位被偷换后提交必须拒绝");
+        assert!(publish_error.contains("外部"), "{publish_error}");
+        assert_eq!(fs::read(&foreign_path).unwrap(), b"foreign-bytes-here",
+            "拒绝提交时外部文件分文不动");
+        assert_eq!(fs::read(&target).unwrap(), b"original", "目标位原样");
+        // discard 的归属门：路径上已不是我们的 inode，绝不替外部收尾。
+        staged.discard();
+        assert_eq!(fs::read(&foreign_path).unwrap(), b"foreign-bytes-here");
+    }
+
+    /// T02：候选文件在发布前被外部改写 → 落进目标位的内容与事务指纹对不上，
+    /// 换回撤销，原图原样，改写过的候选字节保留（不当垃圾清掉）。
+    #[test]
+    fn t02_a_candidate_tampered_before_publish_is_never_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.png");
+        fs::write(&target, b"true-original").unwrap();
+        let staged = dir.path().join(".sizqo-staged");
+        fs::write(&staged, b"our-output").unwrap();
+        let expected = crate::source_identity::SourceIdentity::read_with_hash(&target).unwrap();
+        // 外部在发布前一刻把候选路径上的字节原地换成同长度内容。
+        fs::write(&staged, b"tampered!!!!").unwrap();
+
+        let error = publish_replace_if_identity_matches(
+            &staged,
+            &target,
+            &expected,
+            Some(crate::source_identity::sha256_bytes(b"our-output").as_str()),
+        )
+        .expect_err("候选指纹对不上必须撤销提交");
+        assert!(!error.swapped, "换回成功 = 目标位没有被污染");
+        assert_eq!(fs::read(&target).unwrap(), b"true-original", "原图原样");
+        assert_eq!(fs::read(&staged).unwrap(), b"tampered!!!!",
+            "换回后改写过的候选字节停在原位，绝不当垃圾清掉");
+    }
+
+    /// T03：输出占位 unlink 后 inode 复用 → release/归属门绝不认领外部文件。
+    #[test]
+    fn t03_a_reused_placeholder_inode_is_never_released_onto_a_foreign_file() {
+        
+        let dir = tempfile::tempdir().unwrap();
+        let naming = OutputNaming::WithSuffix {
+            stem: "clip".into(),
+            suffix: "_compressed".into(),
+            extension: "mp4".into(),
+        };
+        let claimed = OutputNameAllocator::claim(dir.path(), &naming).unwrap();
+        let placeholder = claimed.path().to_path_buf();
+        // 外部：删占位 → 同路径建自己的文件（ext4 等文件系统此时可能复用 inode，
+        // 只比 (dev,ino) 就会被骗过 —— 我们的句柄还开着，nlink 看得出来）。
+        fs::remove_file(&placeholder).unwrap();
+        fs::write(&placeholder, b"foreign-file").unwrap();
+
+        claimed.release();
+        assert_eq!(
+            fs::read(&placeholder).unwrap(),
+            b"foreign-file",
+            "外部文件绝不能被当成我们的占位删掉"
+        );
+    }
+
+    /// T05：原图在复验通过之后被持有 fd 的写者**同长度原地改写** —— 长度检查
+    /// 拦不住它，删除会把用户最新修改一起销毁。保留策略下这份修改必须活在
+    /// 保留文件里，路径随历史记录。
+    #[test]
+    fn t05_a_same_length_rewrite_of_the_original_survives_retention() {
+        use crate::source_identity::SourceIdentity;
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("photo.png");
+        fs::write(&original, b"external-same-length-ORIG").unwrap();
+        let baseline = SourceIdentity::read_with_hash(&original).unwrap();
+
+        set_fault_in_retire_window(5);
+        let outcome = retire_original(&original, &baseline);
+        set_fault_in_retire_window(0);
+
+        let retired = outcome.expect("同长度改写挡不住长度检查，也不该挡住保留");
+        assert!(!original.exists(), "跨格式替换的原图让位给产物");
+        assert_eq!(
+            fs::read(&retired.path).unwrap(),
+            b"external-same-length-EDIT",
+            "用户（或外部程序）最后写进原图的那份修改必须保留，不能被删除窗口吞掉"
         );
     }
 }

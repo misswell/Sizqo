@@ -2581,6 +2581,86 @@ Windows 分支（`identity_of_open` 的 `GetFileInformationByHandle` 支、`Move
 **仍未通过正式发布门禁**：签名/公证/装订、装包内视频引擎、验收矩阵、
 macOS 真实媒体矩阵、R3–R5 未实施。本次只发预发布（pre-release）。
 
+## 0.3.6-rc.11（2026-11-08）：R3+R4+R5 加固收口 —— 外部审查（0.3.6-rc.10 报告）15 项逐条回证
+
+外部审查报告（5×P1 + 10×P2 + 22 条强制回归测试）以本轮为最终交付轮。
+全部改动以 `main` @ `b95bde9`（0.3.6-rc.10）为基线，保留既有事务/队列/引擎设计。
+
+### P1 数据安全（Rust + Swift）
+
+| 审查项 | 实施 | 证据 |
+| --- | --- | --- |
+| P1-1 临时文件所有权不贯穿写入/发布 | Rust `StagedOutput` 持创建句柄：写入走句柄（truncate(0)→seek(0)→write→flush→fsync→unix nlink 快速失败），凭证从句柄 fstat 取；发布双侧对账（换出占位/原图 inode + 目标位内容 SHA256），对不上换回撤销；Swift `StagedTempHandle`/`StagedWrite.writeSynced` 同款（truncate→句柄写→fsync→SHA 记账），`publishIfPlaceholderMatches`/`publishReplaceIfIdentityMatches` 成功路径补候选内容对账 | Rust `t01`/`t02`；Swift §47 [4] P1-1 现场测试 |
+| P1-2 `ClaimedOutput` 凭证仍不安全 | Rust `ClaimedOutput` 持句柄（unix nlink 判 unlink + 路径 (dev,ino) 复核）；Swift `ClaimedOutput` 改 class、凭证来自句柄、`release()` 带归属门；Swift `claimQuarantine` 句柄随作用域存活 | Rust `t03`；Swift §47 [1] T08 前置 |
+| P1-3 原图同长度修改丢失 | `retire_original` 改为**保留不删**：原图隔离改名成事务管理的 `.sizqo-retire-*.keep`，路径记入历史新字段 `retiredOriginalPath`（serde default 兼容旧记录），清空历史时清理；同格式覆盖换出的旧字节同政策保留；新故障注入模式 5（同长度原地改写）证明外部最新修改存活 | Rust `t05` + `an_unmodified_original_is_retained_as_a_managed_copy`；审查四项"绝不妥协"之三落地 |
+| P1-4 旧事务按大小删除 | Rust `remove_generated_output`（journal 版 + HistoryEntry 版）缺 SHA 一律不删、只删带凭证的空占位；Swift `removeGeneratedOutput` 同款 | Rust 更新后的 legacy 恢复测试（T06 断言"大小对上也不删"）；Swift §47 [2] |
+| P1-5 Swift 高级模式动画丢帧 | `multiFrameRejectIfNeeded` 统一检测接入全部高级入口（PNG/JPG/WebP/换格式），`downscaledTempFile` 由"仅 GIF"改为真实帧数判据；拒绝文案与 Rust 同语义（含帧数、"未改动"） | Swift §47 [3]（2 帧 GIF 构造 + 端到端拒绝） |
+
+### P2 功能/逻辑/性能
+
+| 审查项 | 实施 | 证据 |
+| --- | --- | --- |
+| P2-6 EXIF Orientation | Rust：四个 `image::open` 裸解码点改 `ImageReader→into_decoder→orientation()→apply_orientation()` 烘焙；Swift：四点裸解码改 `uprightImage`（WithTransform + MaxPixelSize=max(w,h)），保留 metadata 时方向标签重写为 1 | 代码审阅 + 双侧接线；Orientation 1-8 真机矩阵待 macOS 真实媒体轮补齐（如实记录） |
+| P2-7 视频完整性 | probe 增 `nbFrames`（`-count_frames` 实测，仅编码期两侧探测使用）；`validate` 增帧数对账（CFR 用户指定按目标帧率×时长，VFR 按实测帧数）；KeepAll 升级逐项对账（音轨/字幕 codec+语言+标题+disposition、章节起止+标题、附件名+数量） | `plan.rs`/`validation.rs` 单测；附件**内容** SHA 需解包，如实以名字+数量为界（下文"未完成"） |
+| P2-8 StripPrivate 作用域 | `private_keys_in_chapter_or_program_scopes` 一份定义两处共用；章节/program 级隐私键预检直接拒绝（FFmpeg 无法逐键清理这两个作用域，整体清空会违背"保留普通标签"承诺——失败关闭） | `plan.rs` 预检分支 |
+| P2-9 FLAC 预算 | copy/FLAC 预算改源实测音频码率；估不出如实警告"估计值"；`VideoResult` 增 `targetBytes/targetMet/targetDeviation`（serde default），targetSize 超出 5% 判未达成 + 警告；前端状态行呈现偏差与"未达标" | `plan.rs`/`ffmpeg_backend.rs`/`app.js` |
+| P2-10 ffprobe 取消 | `capture_cancellable`（SIGTERM→2s 强杀→wait 回收），源探测/复探接入会话取消链；新增 T16 单测（真实子进程 150ms 内被取消终止） | `process.rs` T16 |
+| P2-11 来源根混淆 | `VideoTask` 增 `sourceRoot/relativePath`（serde default），每任务冻结值优先（合法性验：非绝对、无 `..`），批级"最深根胜出"只做缺省兜底；图片侧 `CompressOptions.perFileRelativePaths` 同款；前端两线都发冻结字段 | Rust T18；`tests/source-root.cjs` 不缩水 |
+| P2-12 输出名编码期不占位 | `claim_output` 编码前 `O_EXCL` 占名（句柄+凭证持有到提交）；commit 换号重试（`install_at_free_path` 候选序，partial 复用不重编）；实际路径写回事务日志（`update_output_path`）与历史 | Rust T17（占位被抢 → `_1` 候选接住、外部文件原样、历史记录实际路径） |
+| P2-13 导入静默遗漏 | `ImportReport`（scanned/imported/skipped/unsupported/permissionDenied/canonicalizeFailed/readDirectoryFailed/probeFailed/disappeared）；`probe_media` 返回 `{media, report}`；前端逐项呈现 | Rust T19（chmod 000 子目录） |
+| P2-14 取消/提交竞态 | Rust `TaskLedger`（同一把锁：cancelled + committing）：`tryBeginCommit` 原子竞争、提交段 RAII 租约、`cancel_file` 提交段内拒绝；Swift `CancelBox`（新文件）三态账本 + `tryBeginCommit`/`defer endCommit`，`cancelFile` 被拒不改 removed 并如实提示，`applyResult` 接受 removed 行的带产物结果 | Rust 全套既有取消测试不缩水；Swift §47 [1] T08（含 200 组双序并发断言） |
+| P2-15 内存硬上限 | `MAX_SINGLE_TASK_BYTES = 4 GiB`（Rust `image_memory` + Swift `ImageMemory` 同值）：估算确认超限的任务在进入调度器前按 `resource_limit_exceeded` 失败收场；估算未知（known=false）不拒——512MiB 兜底是"不知道"，不是"知道很大" | Rust T20 |
+
+### 回归测试（T 系列）
+
+| 编号 | 现场 | 结果 |
+| --- | --- | --- |
+| T01/T02/T03 | 临时文件外部替换 / 候选发布前改写 / 占位 inode 复用 | Rust 单测三条全绿（`output_transaction::tests::t01…t03`） |
+| T05 | 原图同长度原地改写 | 故障注入模式 5 + 保留策略（`t05`） |
+| T06 | 旧事务缺 SHA | legacy 恢复测试改判"不删" |
+| T08 | Swift 提交中取消 | CancelBox 三态账本 + 并发双序断言（Swift §47 [1]） |
+| T09/T10 | APNG/动画 WebP 丢帧 | Swift 2 帧 GIF 构造 + 统一拒绝（§47 [3]） |
+| T16/T17 | ffprobe 取消 / 编码中输出名被抢 | `capture_cancellable`（真实子进程）+ commit 换号重试 |
+| T18/T19/T20 | 重叠来源根 / 无权限子目录 / 超大图 | T18/T19/T20 单测 |
+| T21 | 双实例同文件 | `tests/dual_instance.rs`：两个**真实进程** O_EXCL 竞争，产物各自完整、无覆盖残骸 |
+| T22 | 恢复与压缩同时发生 | 会话租约 ↔ 维护租约原子互斥单测 |
+| T12/T13/T14/T15 | VFR 帧数对账 / KeepAll 逐流 / 章节隐私 / FLAC 目标体积 | 代码 + 单测落地；真实媒体端到端随真实矩阵轮补齐（见下） |
+
+### 本机回归读数（2026-11-08）
+
+| 命令 | 读数 |
+| --- | --- |
+| `cargo test --lib` | 299 passed / 0 failed（新增 T01/T02/T03/T05/T17/T18/T19/T20/T22 + 更新 4 条旧政策断言） |
+| `cargo test --lib --features inproc-backends` | 297 passed / 0 failed |
+| `cargo test --no-default-features --features inproc-backends` | 全绿（crash_injection 3 处同步新签名） |
+| `cargo test --test dual_instance` | 双进程竞争全绿 |
+| `cargo test --test crash_injection` | 全绿 |
+| `npm run test:frontend` | 29 套全 PASS（probe_media 新形状 + 冻结字段 + 阶段横幅接线） |
+| `bash scripts/test_swift_history.sh` | 全绿（契约向量 32 条 + 新增 §47 4 组）；红线检查未动 |
+| 全源 `swiftc -typecheck`（26 文件，含 AppState/Views） | exit 0 |
+
+### Swift 轨改动明细
+
+- `OutputTransactionStore.swift`：`StagedTempHandle`（fd 包装、幂等 close + deinit 兜底）、`StagedWrite` 句柄化 + 发布候选对账、`ClaimedOutput` 归属门、`QuarantineClaim` 持句柄、`removeGeneratedOutput` 无指纹不删。
+- `AppState.swift` + 新文件 `ViewModels/CancelBox.swift`：提交段原子登记（defer 解除）、占位凭证从句柄取、取消被拒如实提示、removed 行带产物结果恢复显示、硬上限前置拒绝。
+- `CompressionEngine.swift`：多帧统一检测 + 方向烘焙替换四处裸解码。
+- `HistoryStore.swift`：3 处 `StagedTemp.claim` 调用点同步（内核整份复制路径，句柄使命到认领为止）。
+
+### 行为变化（有意，均如实呈现）
+
+1. 跨格式替换的原图**不再自动删除**：保留在同目录 `.sizqo-retire-*.keep`，历史记录与警告文案说明路径与清理方式；同格式覆盖换出的旧字节同政策。
+2. 老事务（无产物指纹）恢复时不再按文件大小清理产物；文件与日志保留交人工。
+3. `probe_media` 返回形状从数组改为 `{media, report}`（前端同步）；导入有遗漏时逐项说明。
+4. 取消发生在提交段内会被拒绝并提示「正在提交」；提交完成后结果照常显示（不再出现"磁盘有产物、队列看不到"）。
+5. StripPrivate 遇到章节/program 级隐私键时预检拒绝（此前是编码完才验证失败，白烧 CPU）。
+6. Swift `StagedWrite` 无凭证/句柄不再退化按路径写；相关旧断言更新为拒绝语义。
+
+### 仍未完成（如实记录，继续挡正式发布门禁）
+
+- T11（EXIF Orientation 1–8）与 T12–T15 的**真实媒体端到端**用例：需要 macOS 真实媒体矩阵轮（brew ffmpeg + `--ignored` + VideoToolbox 实测）补齐；单测已覆盖逻辑分支。
+- 附件内容 SHA256：ffprobe 不提供附件内容，需 `-dump_attachment` 解包才可对账；本轮如实以"名字+数量"为界。
+- FFmpeg GPL 对应源码与配置义务、许可审查；Direct Windows/Linux 包随包正确架构引擎；签名/公证/装订；验收矩阵全项。门禁未过，本轮仍只发预发布。
+
 ## Release gate (per [AGENTS.md](../AGENTS.md))
 
 Before any tag/Release: full three-track build, signed Direct runtime check,

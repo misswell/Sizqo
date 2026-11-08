@@ -75,6 +75,34 @@ pub fn is_private_metadata_key(key: &str) -> bool {
             .any(|private| private.eq_ignore_ascii_case(&key))
 }
 
+/// 隐私键在**章节 / program 作用域**里的出现清单（本轮加固 P2-8 / T14）：
+/// 预检（plan::build 决定拒不拒）与验证器（validate_metadata 决定过不过）共用
+/// 同一份作用域枚举 —— 验证器扫的四层就是这里枚举的四层，"清理器清不到、
+/// 验证器却在扫"的那种错位从结构上不可能再出现。
+pub fn private_keys_in_chapter_or_program_scopes(probe: &probe::VideoProbe) -> (Vec<String>, Vec<String>) {
+    let mut chapter_keys: Vec<String> = Vec::new();
+    for chapter in &probe.chapters {
+        if let Some(tags) = chapter["tags"].as_object() {
+            for key in tags.keys() {
+                if is_private_metadata_key(key) && !chapter_keys.iter().any(|k| k.eq_ignore_ascii_case(key)) {
+                    chapter_keys.push(key.clone());
+                }
+            }
+        }
+    }
+    let mut program_keys: Vec<String> = Vec::new();
+    for program in &probe.programs {
+        if let Some(tags) = program["tags"].as_object() {
+            for key in tags.keys() {
+                if is_private_metadata_key(key) && !program_keys.iter().any(|k| k.eq_ignore_ascii_case(key)) {
+                    program_keys.push(key.clone());
+                }
+            }
+        }
+    }
+    (chapter_keys, program_keys)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct VideoOptions {
@@ -109,6 +137,11 @@ pub struct VideoResult {
     #[serde(default)] pub outcome: Option<crate::result_model::ResultOutcome>,
     /// §4 结论的理由；前端不再解析 `reason` 文案。
     #[serde(default)] pub reason_code: Option<crate::result_model::ReasonCode>,
+    /// 本轮加固（P2-9 / T15）：目标体积模式的如实对账 —— 预算值、是否达成、
+    /// 偏差百分比。非 targetSize 模式恒为 None；未达成不许显示成达标。
+    #[serde(default)] pub target_bytes: Option<f64>,
+    #[serde(default)] pub target_met: Option<bool>,
+    #[serde(default)] pub target_deviation: Option<f64>,
 }
 impl VideoResult {
     pub fn pending(task_id: &str, path: &Path, options: &VideoOptions) -> Self {
@@ -117,7 +150,8 @@ impl VideoResult {
             output_bytes: None, elapsed_ms: 0, encoder_actual: String::new(), backend_actual: "ffmpeg".into(),
             savings: None, reason: None, warnings: vec![], diagnostics_log_path: None,
             output_mode: options.output_mode.clone(), history_id: None, stage: "failed".into(),
-            outcome: None, reason_code: None }
+            outcome: None, reason_code: None,
+            target_bytes: None, target_met: None, target_deviation: None }
     }
 }
 pub fn is_video_extension(path:&Path) -> bool {

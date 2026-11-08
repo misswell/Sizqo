@@ -145,13 +145,17 @@ enum CompressionEngine {
     /// 只缩不放大：最长边超过上限时输出缩放后的同格式临时文件；无需缩放/不宜处理时返回 nil。
     /// ImageIO thumbnail 管线保持 alpha 通道不丢，重采样语义与 Rust 侧 Lanczos3 同一意图
     /// （尺寸收敛优先于逐像素等算法）——这是这里选它而不是自写 vImage 核的原因。
-    private static func downscaledTempFile(file: String, cap: Int) -> String? {
+    ///
+    /// P1-5 / T09 / T10：多帧判据取代扩展名猜测 —— APNG、动图 WebP 与 GIF 一样
+    /// 不许单帧缩放；真正的帧数（`CGImageSourceGetCount` > 1）才返回 nil，
+    /// 调用方按"诚实跳过 + 警告"处理。测试也从这条公开入口断言。
+    static func downscaledTempFile(file: String, cap: Int) -> String? {
         guard let (edge, _, _) = longestEdge(file: file), edge > cap else { return nil }
-        let imgType = detectImageType(path: file)
-        // 动图单帧缩放会丢帧，交给调用方按原尺寸处理（诚实跳过 + 警告）。
-        guard imgType != "gif" else { return nil }
         let url = URL(fileURLWithPath: file)
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        // 动图单帧缩放会丢帧，交给调用方按原尺寸处理（诚实跳过 + 警告）。
+        guard CGImageSourceGetCount(src) <= 1 else { return nil }
+        let imgType = detectImageType(path: file)
         let thumbOpts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -253,6 +257,11 @@ enum CompressionEngine {
             opts.outputFormat = OutputFormat(rawValue: target) ?? .original
             return SystemImageConverter.convert(file: file, options: opts)
         }
+        // P1-5 / T09 / T10：转换入口先做多帧检测（覆盖 heic/avif 这类不走下面
+        // 三个入口的分支；走它们的分支会被入口检测再拦一次，幂等且便宜）。
+        if let rejected = multiFrameRejectIfNeeded(file: file, targetFormat: target) {
+            return rejected
+        }
         switch target {
         case "webp": return compressToWebP(file: file, options: options)
         case "avif": return compressToAVIF(file: file, options: options)
@@ -272,6 +281,10 @@ enum CompressionEngine {
     // MARK: - PNG
 
     static func compressPNG(file: String, options: CompressOptions) -> EngineResult {
+        // P1-5 / T09 / T10：高级路径入口先做多帧检测（APNG 之类在这里现形）。
+        if let rejected = multiFrameRejectIfNeeded(file: file, targetFormat: "png") {
+            return rejected
+        }
         let original = (try? Data(contentsOf: URL(fileURLWithPath: file))) ?? Data()
         let originalSize = original.count
         let quality = options.quality
@@ -320,7 +333,10 @@ enum CompressionEngine {
     static func compressPNGImageIO(file: String) -> Data? {
         guard let data = FileManager.default.contents(atPath: file),
               let src = CGImageSourceCreateWithData(data as CFData, nil),
-              let image = CGImageSourceCreateImageAtIndex(src, 0, nil)
+              // P1-5：多帧输入绝不去第一帧（入口检测之外的第二道门）。
+              CGImageSourceGetCount(src) <= 1,
+              // P2-6 / T11：EXIF 方向烘进像素；输出不带方向元数据，无双旋转。
+              let image = uprightImage(from: src)
         else { return nil }
         let out = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(
@@ -334,6 +350,10 @@ enum CompressionEngine {
     // MARK: - JPEG
 
     static func compressJPG(file: String, options: CompressOptions) -> EngineResult {
+        // P1-5 / T09 / T10：高级路径入口先做多帧检测。
+        if let rejected = multiFrameRejectIfNeeded(file: file, targetFormat: "jpg") {
+            return rejected
+        }
         let original = (try? Data(contentsOf: URL(fileURLWithPath: file))) ?? Data()
         let originalSize = original.count
         let quality = options.quality
@@ -359,7 +379,10 @@ enum CompressionEngine {
     static func compressJPGImageIO(file: String, quality: Int) -> Data? {
         guard let data = FileManager.default.contents(atPath: file),
               let src = CGImageSourceCreateWithData(data as CFData, nil),
-              let image = CGImageSourceCreateImageAtIndex(src, 0, nil)
+              // P1-5：多帧输入绝不去第一帧。P2-6 / T11：方向烘进像素；
+              // 输出属性传 nil（不携带元数据），正立像素不会遭遇双旋转。
+              CGImageSourceGetCount(src) <= 1,
+              let image = uprightImage(from: src)
         else { return nil }
         let out = NSMutableData()
         let destOpts: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: quality]
@@ -374,7 +397,10 @@ enum CompressionEngine {
     static func convertToPPM(file: String) -> Data? {
         guard let data = FileManager.default.contents(atPath: file),
               let src = CGImageSourceCreateWithData(data as CFData, nil),
-              let image = CGImageSourceCreateImageAtIndex(src, 0, nil)
+              // P1-5：多帧输入绝不去第一帧。P2-6 / T11：cjpeg 拿到的也必须是
+              // 烘好方向的 RGB —— PPM 没有元数据，躺倒的像素就是永久躺倒。
+              CGImageSourceGetCount(src) <= 1,
+              let image = uprightImage(from: src)
         else { return nil }
 
         let width = image.width
@@ -431,6 +457,10 @@ enum CompressionEngine {
     // MARK: - WebP
 
     static func compressToWebP(file: String, options: CompressOptions) -> EngineResult {
+        // P1-5 / T09 / T10：高级路径入口先做多帧检测（动图 WebP 在这里现形）。
+        if let rejected = multiFrameRejectIfNeeded(file: file, targetFormat: "webp") {
+            return rejected
+        }
         let original = (try? Data(contentsOf: URL(fileURLWithPath: file))) ?? Data()
         let originalSize = original.count
         let quality = options.quality
@@ -460,7 +490,9 @@ enum CompressionEngine {
     static func compressWebPImageIO(file: String, quality: Int) -> Data? {
         guard let data = FileManager.default.contents(atPath: file),
               let src = CGImageSourceCreateWithData(data as CFData, nil),
-              let image = CGImageSourceCreateImageAtIndex(src, 0, nil)
+              // P1-5：多帧输入绝不去第一帧。P2-6 / T11：方向烘进像素。
+              CGImageSourceGetCount(src) <= 1,
+              let image = uprightImage(from: src)
         else { return nil }
         let out = NSMutableData()
         let destOpts: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: quality]
@@ -584,6 +616,65 @@ enum CompressionEngine {
         } catch {}
         try? FileManager.default.removeItem(atPath: tmp)
         return noImprovement(original: original, outType: "heic", algorithm: "sips", originalSize: originalSize)
+    }
+
+    // MARK: - 多帧动画统一检测（P1-5 / T09 / T10）
+
+    /// 多帧输入统一检测（P1-5 / T09 / T10）：与 Rust `animation_rejection` 同语义、
+    /// 同措辞方向。高级路径的每个编码入口都先查这一道 —— 单帧重编码会静默丢帧，
+    /// 那就是毁数据。返回 nil = 单帧（或帧数读不出），调用方继续；非 nil = 已拒绝，
+    /// 交回的 compressed 是**原图字节**、verdict = rejected（原文件未改动）。
+    /// 措辞风格与 SystemImageConverter 的多帧拒绝同一方向：帧数 + 拒绝 + 未改动。
+    static func multiFrameRejectIfNeeded(
+        source: CGImageSource, originalData: Data, targetFormat: String
+    ) -> EngineResult? {
+        let frameCount = CGImageSourceGetCount(source)
+        guard frameCount > 1 else { return nil }
+        return EngineResult(
+            success: false, compressed: originalData, outType: targetFormat,
+            algorithm: "none",
+            error: "动图（\(frameCount) 帧）不支持压缩/转换为单帧格式：单帧重编码会丢帧。"
+                + "已拒绝，原文件未改动",
+            verdict: .rejected, reason: .unsupportedFormat
+        )
+    }
+
+    /// 便利入口：从文件建源再做同一道检测。文件读不出时返回 nil（让调用方按
+    /// 原有的"读不出"分支如实失败，而不是在这里伪造一条拒绝）。
+    static func multiFrameRejectIfNeeded(file: String, targetFormat: String) -> EngineResult? {
+        guard let data = FileManager.default.contents(atPath: file),
+              let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        return multiFrameRejectIfNeeded(source: src, originalData: data, targetFormat: targetFormat)
+    }
+
+    // MARK: - EXIF 方向烘焙（P2-6 / T11）
+
+    /// 带方向变换的解码：EXIF orientation ≠ 1 的输入，像素必须先转正再编码。
+    ///
+    /// 裸 `CGImageSourceCreateImageAtIndex` 解出的是**存储方向**的像素；旧实现把
+    /// 这样的像素直接重编码且不带任何方向元数据，横拍（orientation 6/8）的照片
+    /// 压缩后就永久躺倒了。这里用「thumbnail + WithTransform + FromImageAlways +
+    /// MaxPixelSize = max(宽, 高)」把方向烘进像素 —— MaxPixelSize 取原宽高的较大者，
+    /// 转正后两条边都不会小于原尺寸（只旋不缩）。
+    ///
+    /// 返回的 CGImage 已经正立：调用方的输出不得再带非 1 的方向元数据（像素已正立，
+    /// 再写 orientation 就成了双旋转）。本文件三条 *ImageIO 编码路径向
+    /// `CGImageDestinationAddImage` 传 nil 属性、不携带任何方向元数据，天然满足。
+    static func uprightImage(from source: CGImageSource) -> CGImage? {
+        guard let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int,
+              let height = props[kCGImagePropertyPixelHeight] as? Int,
+              let orientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.intValue,
+              orientation != 1 else {
+            // 方向是 1（或读不出方向信息）：普通解码即是正立。
+            return CGImageSourceCreateImageAtIndex(source, 0, nil)
+        }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(width, height)
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, opts as CFDictionary)
     }
 
     // MARK: - Helpers

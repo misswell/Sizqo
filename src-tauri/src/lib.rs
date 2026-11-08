@@ -20,7 +20,7 @@ mod system_image;
 #[cfg(windows)]
 mod win32_fs;
 
-use commands::AppState;
+use commands::{AppState, TaskLedger};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -654,7 +654,7 @@ pub fn run() {
                 app_settings::effective_cpu_limit(settings.cpu_thread_limit, cpu_info.budget_ceiling());
 
             app.manage(AppState {
-                cancel_queue: Mutex::new(HashSet::new()),
+                task_ledger: Mutex::new(TaskLedger::default()),
                 pending_compare: Mutex::new(None),
                 compression: std::sync::Arc::new(commands::CompressionScheduler::new(cpu_limit)),
                 history_store,

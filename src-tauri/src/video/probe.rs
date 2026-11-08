@@ -10,6 +10,10 @@ pub struct VideoStream {
     /// §56 采样率：音频转换后必须与原轨一致，不能只看声道数。
     #[serde(default)] pub sample_rate: u32,
     pub frame_rate: Option<f64>,
+    /// 本轮加固（P2-7 / T12）：帧数对账的输入。`-count_frames` 探测时由
+    /// `nb_read_frames`（实测解码帧数）填充；导入档的快速探测没有这个数。
+    /// 没有帧数对账就证明不了"源 30000 帧 → 输出 29990 帧"的丢失。
+    #[serde(default)] pub nb_frames: Option<u64>,
     pub time_base: String, pub color_transfer: String, pub color_primaries: String,
     pub color_space: String, pub field_order: String, pub tags: Value,
     pub disposition: Value, pub side_data: Value, pub raw: Value,
@@ -49,7 +53,10 @@ impl VideoProbe {
                 width:uint(s,"width") as u32,height:uint(s,"height") as u32,pixel_format:text(s,"pix_fmt"),
                 bit_rate:Some(uint(s,"bit_rate")).filter(|n|*n>0),channels:uint(s,"channels") as u32,
                 sample_rate:uint(s,"sample_rate") as u32,
-                frame_rate:rational(&text(s,"avg_frame_rate")),time_base:text(s,"time_base"),color_transfer:text(s,"color_transfer"),
+                frame_rate:rational(&text(s,"avg_frame_rate")),
+                nb_frames:Some(uint(s,"nb_read_frames")).filter(|n|*n>0)
+                    .or_else(||Some(uint(s,"nb_frames")).filter(|n|*n>0)),
+                time_base:text(s,"time_base"),color_transfer:text(s,"color_transfer"),
                 color_primaries:text(s,"color_primaries"),color_space:text(s,"color_space"),field_order:text(s,"field_order"),
                 tags:s["tags"].clone(),disposition:s["disposition"].clone(),side_data:s["side_data_list"].clone(),raw:s.clone() });
         }
@@ -89,19 +96,31 @@ pub fn probe(path:&Path)->Result<VideoProbe,String>{probe_with_timeout(path,std:
 /// 不该被导入档的 45 秒掐死 —— 超时会把一次完整成功的编码整体作废。
 #[cfg(not(feature="inproc-backends"))]
 pub fn probe_with_timeout(path:&Path,timeout:std::time::Duration)->Result<VideoProbe,String>{
+    probe_cancellable(path,timeout,None,false)
+}
+/// 编码期的源探测与产物复探共用这一条（本轮加固 P2-10 / P2-7）：
+/// - `cancel`：45s/300s 的 ffprobe 窗口内用户点取消立即生效（SIGTERM → 强杀回收）；
+/// - `count_frames`：加 `-count_frames` 实测解码帧数（nb_read_frames），帧数对账
+///   的输入。这条路径要多解一遍全片，所以只用在编码期 —— 导入档保持快速探测。
+#[cfg(not(feature="inproc-backends"))]
+pub fn probe_cancellable(path:&Path,timeout:std::time::Duration,cancel:Option<&std::sync::atomic::AtomicBool>,count_frames:bool)->Result<VideoProbe,String>{
     let path=path.canonicalize().map_err(|e|e.to_string())?;
     let size=std::fs::metadata(&path).map_err(|e|e.to_string())?.len();
     if size==0 {return Err("Empty file".into());}
     let mut cmd=super::process::command("ffprobe")?;
     // §6 program 也要采：隐私校验必须遍历得到 program 级 metadata。
-    cmd.args(["-v","error","-protocol_whitelist","file,pipe","-show_format","-show_streams","-show_chapters","-show_programs","-of","json"]).arg(path);
-    let out=super::process::capture(cmd,timeout,8*1024*1024)?;
+    cmd.args(["-v","error","-protocol_whitelist","file,pipe","-show_format","-show_streams","-show_chapters","-show_programs","-of","json"]);
+    if count_frames {cmd.arg("-count_frames");}
+    cmd.arg(path);
+    let out=super::process::capture_cancellable(cmd,timeout,8*1024*1024,cancel)?;
     VideoProbe::parse(serde_json::from_slice(&out).map_err(|e|e.to_string())?,size)
 }
 #[cfg(feature="inproc-backends")]
 pub fn probe(_path:&Path)->Result<VideoProbe,String> {Err(super::capabilities::NATIVE_UNAVAILABLE.into())}
 #[cfg(feature="inproc-backends")]
 pub fn probe_with_timeout(_path:&Path,_timeout:std::time::Duration)->Result<VideoProbe,String> {Err(super::capabilities::NATIVE_UNAVAILABLE.into())}
+#[cfg(feature="inproc-backends")]
+pub fn probe_cancellable(_path:&Path,_timeout:std::time::Duration,_cancel:Option<&std::sync::atomic::AtomicBool>,_count_frames:bool)->Result<VideoProbe,String> {Err(super::capabilities::NATIVE_UNAVAILABLE.into())}
 #[cfg(test)] mod tests { use super::*;
     #[test] fn hdr_rotation_tracks_are_not_lost() { let p=VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":1080,"height":1920,"pix_fmt":"yuv420p10le","color_transfer":"smpte2084","side_data_list":[{"rotation":90}]},{"index":1,"codec_type":"audio","codec_name":"aac","channels":6}],"format":{"duration":"4.5","format_name":"mov"}}),123).unwrap();assert_eq!(p.duration_us,Some(4500000));assert_eq!(p.hdr_kind,"hdr10");assert_eq!(p.rotation,90);assert_eq!(p.audio().count(),1); }
     #[test] fn invalid_video_is_rejected() {assert!(VideoProbe::parse(serde_json::json!({"streams":[]}),0).is_err());assert_eq!(rational("0/0"),None);}

@@ -24,9 +24,70 @@ use crate::sandbox_access::FileAccess;
 use crate::source_identity::{SourceCheck, SourceIdentity};
 use crate::system_info::{CpuInfo, CpuStatus};
 
+/// 单文件取消与提交的**同一把锁**账本（本轮加固 P2-14 / T08）。
+///
+/// `cancelled` 记「用户取消了这个文件」，`committing` 记「这个文件正处在原子提交段」。
+/// 两本账拆成两把锁等于把"检查取消 → 记账提交"的竞态窗口原样挖回来：取消与提交
+/// 必须竞争同一个状态位 —— 取消先赢提交被拒，提交先赢取消被拒，不存在
+/// "UI 显示已取消、后台照样落盘"的中间态。
+#[derive(Default)]
+pub struct TaskLedger {
+    cancelled: HashSet<String>,
+    committing: HashSet<String>,
+}
+
+impl TaskLedger {
+    /// 取消登记。提交已经开跑（正在提交段）时拒绝：调用方把
+    /// 「正在提交，无法取消」如实报给用户，绝不能一边显示已取消一边等提交落盘。
+    pub fn request_cancel(&mut self, file_path: &str) -> bool {
+        if self.committing.contains(file_path) {
+            return false;
+        }
+        self.cancelled.insert(file_path.to_string());
+        true
+    }
+
+    /// 提交段的原子登记：取消先到 → 认领那次取消（等价 take）并拒绝提交；
+    /// 提交先到 → 登记提交段并放行。返回 true = 这次提交赢下了竞争。
+    pub fn try_begin_commit(&mut self, file_path: &str) -> bool {
+        if self.cancelled.remove(file_path) {
+            return false;
+        }
+        if self.committing.contains(file_path) {
+            return false;
+        }
+        self.committing.insert(file_path.to_string());
+        true
+    }
+
+    pub fn end_commit(&mut self, file_path: &str) {
+        self.committing.remove(file_path);
+    }
+
+    pub fn is_cancelled(&self, file_path: &str) -> bool {
+        self.cancelled.contains(file_path)
+    }
+
+    /// 闸门判据：take（一次取消只允许被认领一次）。
+    pub fn take_cancelled(&mut self, file_path: &str) -> bool {
+        self.cancelled.remove(file_path)
+    }
+
+    pub fn extend_cancelled<I: IntoIterator<Item = String>>(&mut self, items: I) {
+        self.cancelled.extend(items);
+    }
+
+    /// 只清取消账。提交段由 RAII 租约自己解除，清账不许碰它 ——
+    /// 否则提交进行中清一次账，租约 Drop 时就把别人的提交段标成自己的了。
+    pub fn clear_cancelled(&mut self) {
+        self.cancelled.clear();
+    }
+}
+
 /// Shared app state.
 pub struct AppState {
-    pub cancel_queue: Mutex<HashSet<String>>,
+    /// 单文件取消 / 提交竞争账本（`TaskLedger`，同一把锁）。
+    pub task_ledger: Mutex<TaskLedger>,
     /// 主窗口打开对比时暂存的待渲染载荷，compare 窗口加载完成后取走。
     pub pending_compare: Mutex<Option<serde_json::Value>>,
     pub compression: std::sync::Arc<CompressionScheduler>,
@@ -456,7 +517,7 @@ impl Drop for SessionGuard {
         // 先清本轮的取消账本、再交还批次凭证：end_batch 会立刻放行下一轮会话，
         // 若顺序颠倒，下一轮刚登记的用户取消会被这里顺手清空（取消丢失，
         // 该文件仍被压缩）。清完账本再 end_batch，新会话登记的取消不会被误删。
-        self.app.state::<AppState>().cancel_queue.lock().unwrap().clear();
+        self.app.state::<AppState>().task_ledger.lock().unwrap().clear_cancelled();
         self.app
             .state::<crate::video_commands::VideoRuntime>()
             .cancellations
@@ -765,6 +826,22 @@ fn same_output_format(file_path: &Path, out_format: &str) -> bool {
 /// 输出目录顶层。这里不再按"这一批只有一个目录""就是文件的父目录"去补一个根 ——
 /// 那等于每跑一批重新猜一次，重试、续跑、导出各自猜出不同的答案。
 fn relative_output_path(file_path: &Path, options: &CompressOptions) -> PathBuf {
+    // 本轮加固（P2-11 / T18）：每文件冻结的 relativePath 优先 —— 必须真是
+    // 相对路径（不是绝对路径、不含 `..` 上跳），防御目录逃逸；非法或缺省
+    // 才退化到来源根解析。
+    if let Some(map) = &options.per_file_relative_paths {
+        if let Some(relative) = map.get(file_path.to_string_lossy().as_ref()) {
+            let candidate = Path::new(relative);
+            let safe = !relative.is_empty()
+                && candidate.is_relative()
+                && !candidate
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir));
+            if safe {
+                return candidate.to_path_buf();
+            }
+        }
+    }
     crate::source_root::relative_to_roots(file_path, &options.source_roots).unwrap_or_else(|| {
         file_path
             .file_name()
@@ -824,6 +901,9 @@ pub enum OutputWriteError {
     /// §24 连"这份文件是什么"都读不出来（stat 失败 / 内容指纹读不动）。
     /// 编码前就走到这里的话，原图一个字节都没被碰过。
     SourceUnreadable(String),
+    /// 本轮加固（P2-15）：单任务内存硬上限的明确拒绝。资源限制不是编码故障，
+    /// 但必须以失败结论如实上报（resource_limit_exceeded）。
+    ResourceLimit(String),
 }
 
 impl OutputWriteError {
@@ -840,11 +920,15 @@ impl OutputWriteError {
             OutputWriteError::Collision(_) => ReasonCode::OutputCollision,
             OutputWriteError::SourceChanged(_) => ReasonCode::SourceChanged,
             OutputWriteError::SourceUnreadable(_) => ReasonCode::SourceReadFailed,
+            OutputWriteError::ResourceLimit(_) => ReasonCode::ResourceLimitExceeded,
         }
     }
 
     pub fn user_message(&self) -> String {
         match self {
+            OutputWriteError::ResourceLimit(detail) => {
+                format!("这张图的解码内存超过单任务上限，已拒绝处理：{detail}")
+            }
             OutputWriteError::BackupFailed(detail) => {
                 format!("无法保存原图备份，已跳过覆盖（{detail}）")
             }
@@ -1130,7 +1214,8 @@ fn write_output_file(
     history: &HistoryStore,
     transactions: &TransactionStore,
     retention_days: u32,
-    cancel: &(dyn Fn() -> bool + Sync),
+    begin_commit: &(dyn Fn() -> bool + Sync),
+    end_commit: &(dyn Fn() + Sync),
     baseline: ReplaceBaseline,
 ) -> Result<(), OutputWriteError> {
     let artifact = EncodedArtifact::from_engine(engine_result);
@@ -1154,7 +1239,7 @@ fn write_output_file(
     }
     let facts = match commit_output(
         result, &artifact, file_path, options, history, transactions, retention_days,
-        cancel, baseline,
+        &begin_commit, &end_commit, baseline,
     ) {
         Ok(CommitResult::Committed(facts)) => facts,
         // §33 取消打在落盘之前：磁盘一个字节都没动，所以这条发布的是 Cancelled，
@@ -1205,12 +1290,24 @@ fn commit_output(
     history: &HistoryStore,
     transactions: &TransactionStore,
     retention_days: u32,
-    cancel: &(dyn Fn() -> bool + Sync),
+    begin_commit: &(dyn Fn() -> bool + Sync),
+    end_commit: &(dyn Fn() + Sync),
     baseline: ReplaceBaseline,
 ) -> Result<CommitResult, OutputWriteError> {
-    if cancel() {
+    // 本轮加固（P2-14 / T08）：取消与提交竞争同一个状态位。`begin_commit` 在同一把锁里
+    // 先对账取消、再登记提交段 —— 取消先赢 = 这次调用按取消收场；提交先赢 = 提交段
+    // 登记成立，期间的 cancel_file 会被拒绝并如实回报「正在提交」。租约持有到本函数
+    // 任何一条退出路径（RAII Drop 解除登记）。
+    if !begin_commit() {
         return Ok(CommitResult::Cancelled);
     }
+    struct CommitLease<'a>(&'a (dyn Fn() + Sync));
+    impl Drop for CommitLease<'_> {
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+    let _commit_lease = CommitLease(end_commit);
     let compressed = artifact.bytes;
     // 目标位置的扩展名以 **Encode 交回的字节格式** 为准（§10）。它就是 result.out_type
     // 的同一个来源，但 Commit 不该隔着结果字段去猜自己要把文件叫什么。
@@ -1413,30 +1510,41 @@ fn commit_output(
     }
 
     // ⑥原子发布。到这里用户的原图才真的被换掉。
+    // 本轮加固（P1-3）：被换出的旧字节不再无条件删除 —— 发布原语把它们转成事务
+    // 管理的保留文件，路径记进历史、随用户清空历史时清理。
+    let mut swapped_out_retained_at: Option<PathBuf> = None;
+    let mut retired_original_path: Option<PathBuf> = None;
     match (cross_format, replace.as_ref()) {
-        // §3.3 同格式覆盖走原子交换：先交换、再验证**被换出来的**字节，
-        // 验证结束到提交之间不再有可以塞进竞争的窗口。
+        // §3.3 同格式覆盖走原子交换：先交换、再验证**被换出来的**字节与**落进目标的
+        // 候选**（本轮 P1-1 双侧对账），验证结束到提交之间不再有可以塞进竞争的窗口。
         (false, Some(identity)) => {
-            if let Err(error) = output_transaction::publish_replace_if_identity_matches(
+            let candidate_sha = staged.written_sha256();
+            match output_transaction::publish_replace_if_identity_matches(
                 &staged.temp,
                 &out_path,
                 identity,
+                candidate_sha.as_deref(),
             ) {
-                if error.swapped {
-                    // 覆盖已经发生（换回还失败了）：用户的原内容已在冲突名下保留。
-                    // 用备份把原图写回去，绝不能用 withdraw 假装什么都没发生 ——
-                    // 那会留下"报了失败却真实存在"的覆盖。
-                    if let Err(rollback) = output_transaction::rollback(&txn) {
-                        return Err(OutputWriteError::RollbackFailed(format!(
-                            "{}；{rollback}",
-                            error.detail
-                        )));
-                    }
-                    transactions.finish(&history_id);
-                    return Err(OutputWriteError::Collision(error.detail));
+                Ok(outcome) => {
+                    swapped_out_retained_at = outcome.swapped_out_retained_at;
                 }
-                // 交换没发生或已换回原状：目标原样，收走自己的临时文件。
-                return Err(withdraw(OutputWriteError::Collision(error.detail)));
+                Err(error) => {
+                    if error.swapped {
+                        // 覆盖已经发生（换回还失败了）：用户的原内容已在冲突名下保留。
+                        // 用备份把原图写回去，绝不能用 withdraw 假装什么都没发生 ——
+                        // 那会留下"报了失败却真实存在"的覆盖。
+                        if let Err(rollback) = output_transaction::rollback(&txn) {
+                            return Err(OutputWriteError::RollbackFailed(format!(
+                                "{}；{rollback}",
+                                error.detail
+                            )));
+                        }
+                        transactions.finish(&history_id);
+                        return Err(OutputWriteError::Collision(error.detail));
+                    }
+                    // 交换没发生或已换回原状：目标原样，收走自己的临时文件。
+                    return Err(withdraw(OutputWriteError::Collision(error.detail)));
+                }
             }
         }
         // 跨格式 replace 的产物是独占申请来的新名字、新建模式（suffix/folder）同理会
@@ -1469,31 +1577,44 @@ fn commit_output(
     }
 
     if cross_format {
-        // §28 审查修复（本轮 P0-1）：删除原图前的最后一道身份门。此前的 ①⑤ 复核
+        // §28 审查修复（本轮 P0-1）：动原图前的最后一道身份门。此前的 ①⑤ 复核
         // 与删除之间隔着整个落盘流程，外部完全可能在窗口里改掉原图 ——
         // 备份保住的是旧字节，用户刚写的新字节只有这次复核看得见。
         //
-        // 上一轮这里只是**记了警告**（"已保留原文件"）却继续往下删：警告与磁盘事实
-        // 相反。现在删除整件事交给 `retire_original`：身份不匹配根本不进删除，
-        // 匹配也要先隔离改名、复验后才删，删除窗口里被改动的字节一律放回。
+        // 本轮加固（P1-3）起原图**保留不删**：`retire_original` 把原图隔离改名成
+        // 事务管理的保留文件，身份不匹配根本不进隔离（放回原位）。保留路径记进
+        // 历史记录，用户清空历史时一并清理 —— 无法证明外部没有写句柄时，绝不
+        // 自动永久删除。
         let retired = match replace.as_ref() {
-            // 无基线（理论上不可能：cross_format 必有覆盖依据）时保守拒绝删除。
-            None => Err("缺少原图身份依据，不能证明要删的是哪份字节".to_string()),
+            // 无基线（理论上不可能：cross_format 必有覆盖依据）时保守拒绝。
+            None => Err("缺少原图身份依据，不能证明要动的是哪份字节".to_string()),
             Some(identity) => output_transaction::retire_original(file_path, identity),
         };
-        if let Err(detail) = retired {
-            log::warn!("跨格式替换：未删除原图 —— {detail}");
-            result
-                .warnings
-                .get_or_insert_with(Vec::new)
-                .push(format!("{detail}（跨格式产物照常生成）"));
+        match retired {
+            Ok(original) => {
+                let retained_display = original.path.display().to_string();
+                retired_original_path = Some(original.path);
+                result
+                    .warnings
+                    .get_or_insert_with(Vec::new)
+                    .push(format!(
+                        "原图未删除，已保留在 {retained_display}（清空历史记录时清理）"
+                    ));
+            }
+            Err(detail) => {
+                log::warn!("跨格式替换：原图未隔离保留 —— {detail}");
+                result
+                    .warnings
+                    .get_or_insert_with(Vec::new)
+                    .push(format!("{detail}（跨格式产物照常生成）"));
+            }
         }
     }
     // 输出方式是历史要记的**输入事实**，不是结论；产物路径要等 Publish 才写。
     result.output_mode = Some(options.output_mode.clone());
 
     // 输出确认落盘之后才记历史：历史里绝不出现没写成的文件。
-    let entry = HistoryEntry::record_with_id(
+    let mut entry = HistoryEntry::record_with_id(
         history_id.clone(),
         file_path,
         result,
@@ -1501,6 +1622,11 @@ fn commit_output(
         backup_file.as_deref(),
         retention_days,
     );
+    // 本轮加固（P1-3）：被替换的旧字节去哪儿了，历史必须说实话 ——
+    // 保留文件的位置记进条目，清空历史时由 store 层一并清理。
+    entry.retired_original_path = retired_original_path
+        .or(swapped_out_retained_at)
+        .map(|path| path.to_string_lossy().into_owned());
     if let Err(error) = history.add(entry.clone()) {
         // ⑦失败 = 这次落盘不能算数。覆盖模式用备份把真正原图写回去；新建模式从没动过
         //    原图，它删掉自己生成的那个文件（§32「磁盘没有 orphan output」）。
@@ -1528,8 +1654,8 @@ fn commit_output(
 }
 
 // ─── Batch compression core ─────────────────────────────────────
-fn take_cancelled(cancel_queue: &Mutex<HashSet<String>>, file_path: &str) -> bool {
-    cancel_queue.lock().unwrap().remove(file_path)
+fn take_cancelled(ledger: &Mutex<TaskLedger>, file_path: &str) -> bool {
+    ledger.lock().unwrap().take_cancelled(file_path)
 }
 
 // 启动下一个文件前的闸门就是 `CompressionScheduler::acquire`：暂停与 CPU 上限在同一次
@@ -1593,7 +1719,7 @@ pub(crate) async fn compress_batch(
 
     let options = Arc::new(options);
     let app_arc = Arc::new(app.clone());
-    let cancel_queue = &state.cancel_queue;
+    let task_ledger = &state.task_ledger;
     let control = state.compression.clone();
     let history = state.history_store.clone();
     let transactions = state.transactions.clone();
@@ -1609,11 +1735,32 @@ pub(crate) async fn compress_batch(
     for file_path in all_files {
         // §63 先量尺寸再排队：只读文件头，不把像素读进内存。
         // 一张 200 MP 的图不该和一张缩略图按同一个并发名额起跑。
-        let memory = crate::image_memory::estimate(Path::new(&file_path)).bytes;
+        let estimate = crate::image_memory::estimate(Path::new(&file_path));
+        let memory = estimate.bytes;
+        // 本轮加固（P2-15 / T20）：并发预算与单任务硬上限分开。估算确认（读出了
+        // 真实尺寸）超过硬上限的图，连空场放行都不许 —— 开始处理就是确定性的
+        // 失败。明确拒绝并照实报因，绝不假装"再等等就能跑"。
+        if estimate.known && estimate.bytes > crate::image_memory::MAX_SINGLE_TASK_BYTES {
+            let done = processed_arc.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = app_arc.emit(
+                "compress-progress",
+                ProgressPayload {
+                    session_id: session_id_arc.to_string(),
+                    queue_revision,
+                    file: file_path.clone(),
+                    status: ProgressStatus::Failed,
+                    timestamp: event_timestamp(),
+                    session_total,
+                    session_processed: done,
+                    result: Some(resource_limited_result(&file_path, estimate.bytes)),
+                },
+            );
+            continue;
+        }
         // 闸门：暂停、名额用完或解码预算不够，都在这里等；拿到的瞬间三者都已满足。
         // 等待期间这个文件被取消就直接退出，**绝不因此解除暂停**。
         let outcome = control
-            .acquire_with_memory(memory, || take_cancelled(cancel_queue, &file_path))
+            .acquire_with_memory(memory, || take_cancelled(task_ledger, &file_path))
             .await;
         let permit = match outcome {
             AcquireOutcome::Acquired(permit) => permit,
@@ -1698,7 +1845,7 @@ pub(crate) async fn compress_batch(
             let cancel_requested = {
                 let app_for_cancel = app_c.clone();
                 let fp_for_cancel = fp.clone();
-                move || take_cancelled(&app_for_cancel.state::<AppState>().cancel_queue, &fp_for_cancel)
+                move || take_cancelled(&app_for_cancel.state::<AppState>().task_ledger, &fp_for_cancel)
             };
 
             // 预算阶梯的取消判据：只认「用户明确取消了这个文件」。整批停止**不在**这里：
@@ -1713,10 +1860,10 @@ pub(crate) async fn compress_batch(
                 move || {
                     app_for_probe
                         .state::<AppState>()
-                        .cancel_queue
+                        .task_ledger
                         .lock()
                         .unwrap()
-                        .contains(&fp_for_probe)
+                        .is_cancelled(&fp_for_probe)
                 }
             };
 
@@ -1750,6 +1897,32 @@ pub(crate) async fn compress_batch(
             let started = Instant::now();
             // §18.2 显式换格式走转换语义：用户要的是容器，不适用"没变小就跳过"。
             // 压缩（含智能候选）仍然是收益语义；这两条不能靠一个 bool 在引擎里来回猜。
+            // 本轮加固（P2-14）：提交段的原子登记 / 解除。与取消账本同一把锁 ——
+            // 取消先赢提交被拒、提交先赢取消被拒，没有中间态。
+            let begin_commit = {
+                let app_for_begin = app_c.clone();
+                let fp_for_begin = fp.clone();
+                move || {
+                    app_for_begin
+                        .state::<AppState>()
+                        .task_ledger
+                        .lock()
+                        .unwrap()
+                        .try_begin_commit(&fp_for_begin)
+                }
+            };
+            let end_commit = {
+                let app_for_end = app_c.clone();
+                let fp_for_end = fp.clone();
+                move || {
+                    app_for_end
+                        .state::<AppState>()
+                        .task_ledger
+                        .lock()
+                        .unwrap()
+                        .end_commit(&fp_for_end)
+                }
+            };
             let engine_result = if engine::is_format_conversion(&path, &opts) {
                 engine::convert_to_format_with_cancel(
                     &path,
@@ -1775,7 +1948,8 @@ pub(crate) async fn compress_batch(
                 &history_c,
                 &transactions_c,
                 retention_days,
-                &cancel_requested,
+                &begin_commit,
+                &end_commit,
                 baseline,
             ) {
                 // 结论已经由 Publish 写进 result（失败、无产物、体积账按原图结），
@@ -1885,6 +2059,20 @@ fn failed_result(file: String) -> CompressResult {
 
 /// §6.4 取消是一个明确结论：没有产物、没有历史，但可以重试。
 /// 它和 `failed_result` 的区别就是「用户不要了」和「系统坏了」的区别。
+/// 本轮加固（P2-15）：单任务超过内存硬上限的明确拒绝 —— 资源限制错误，
+/// 不是"系统坏了"的那种失败，原因码与文案都必须说实话。
+fn resource_limited_result(file: &str, estimate_bytes: usize) -> CompressResult {
+    let mut result = empty_result(file.to_string());
+    publish_failure(
+        &mut result,
+        &OutputWriteError::ResourceLimit(format!(
+            "解码内存估算 {estimate_bytes} 字节，超过单任务硬上限 {}；任务已拒绝，未动用任何资源",
+            crate::image_memory::MAX_SINGLE_TASK_BYTES
+        )),
+    );
+    result
+}
+
 fn cancelled_result(file: &str) -> CompressResult {
     let mut result = empty_result(file.to_string());
     // 走 Publish 而不是手写各字段：结论写两处就有两种可能不一样。
@@ -2169,10 +2357,16 @@ pub fn apply_retention_on_exit(app: &AppHandle) {
 
 #[tauri::command]
 pub fn cancel_file(file_path: String, state: State<'_, AppState>) -> bool {
-    state.cancel_queue.lock().unwrap().insert(file_path);
+    // 本轮加固（P2-14）：提交段内拒绝取消 —— 返回 false 让前端如实呈现
+    // 「正在提交」，绝不一边显示已取消一边等提交落盘。
+    let accepted = state
+        .task_ledger
+        .lock()
+        .unwrap()
+        .request_cancel(&file_path);
     // 只把正在等的 worker 叫醒，暂停态原样保留 —— 取消一张图不等于继续整批。
     state.compression.wake_waiters();
-    true
+    accepted
 }
 
 /// 一次 IPC 取消整批：前端 Clear All 不再循环 N 次 `cancel_file`。
@@ -2183,15 +2377,23 @@ pub fn cancel_file(file_path: String, state: State<'_, AppState>) -> bool {
 pub fn cancel_batch(file_paths: Vec<String>, state: State<'_, AppState>) -> usize {
     let unique: HashSet<String> = file_paths.into_iter().collect();
     let queued = unique.len();
-    state.cancel_queue.lock().unwrap().extend(unique);
+    let mut accepted = 0usize;
+    {
+        let mut ledger = state.task_ledger.lock().unwrap();
+        for path in &unique {
+            if ledger.request_cancel(path) {
+                accepted += 1;
+            }
+        }
+    }
     // 一批取消只唤醒一次：与逐个 invoke 相比，中间态少得多。
     state.compression.wake_waiters();
-    queued
+    accepted
 }
 
 #[tauri::command]
 pub fn clear_cancel_queue(state: State<'_, AppState>) -> bool {
-    state.cancel_queue.lock().unwrap().clear();
+    state.task_ledger.lock().unwrap().clear_cancelled();
     state.compression.wake_waiters();
     true
 }
@@ -3569,7 +3771,7 @@ mod tests {
     #[tokio::test]
     async fn stopping_defers_a_waiting_file_while_removing_it_cancels_it() {
         let scheduler = std::sync::Arc::new(CompressionScheduler::new(1));
-        let queue = std::sync::Arc::new(Mutex::new(HashSet::new()));
+        let queue = std::sync::Arc::new(Mutex::new(TaskLedger::default()));
         assert!(scheduler.try_begin_batch());
         let held = scheduler.acquire_permit().await;
 
@@ -3590,7 +3792,7 @@ mod tests {
         // ② 取消：新一批里把文件移出队列，拿到的必须是 Cancelled。
         scheduler.end_batch();
         assert!(scheduler.try_begin_batch());
-        queue.lock().unwrap().insert("/gone.png".to_string());
+        queue.lock().unwrap().request_cancel("/gone.png");
         assert_eq!(
             outcome_name(
                 scheduler
@@ -3602,7 +3804,7 @@ mod tests {
         );
 
         // ③ 两者同时成立时「取消」优先：用户点过 × 的文件本来就不该再压。
-        queue.lock().unwrap().insert("/both.png".to_string());
+        queue.lock().unwrap().request_cancel("/both.png");
         scheduler.stop();
         assert_eq!(
             outcome_name(
@@ -3673,8 +3875,8 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_paused_file_leaves_the_rest_still_paused() {
         let scheduler = std::sync::Arc::new(CompressionScheduler::new(2));
-        let queue = std::sync::Arc::new(Mutex::new(HashSet::new()));
-        queue.lock().unwrap().insert("/gone.png".to_string());
+        let queue = std::sync::Arc::new(Mutex::new(TaskLedger::default()));
+        queue.lock().unwrap().request_cancel("/gone.png");
         assert!(scheduler.try_begin_batch());
         scheduler.pause();
 
@@ -4338,6 +4540,59 @@ mod tests {
         HistoryStore::new(dir.join("history")).unwrap()
     }
 
+    /// T22（本轮加固）：会话租约与维护租约在同一原子状态上仲裁 ——
+    /// 一方持有，另一方必须拿不到，不存在"各拿一半检查"的窗口。
+    #[test]
+    fn maintenance_and_session_leases_exclude_each_other_atomically() {
+        let scheduler = std::sync::Arc::new(CompressionScheduler::new(4));
+        let session = scheduler.try_begin_batch();
+        assert!(session, "空场上会话应该开得起来");
+        assert!(
+            scheduler.begin_maintenance().is_none(),
+            "批次持有期间维护租约必须拿不到"
+        );
+        scheduler.end_batch();
+        let maintenance = scheduler.begin_maintenance();
+        assert!(maintenance.is_some(), "空场上维护租约应该拿得到");
+        drop(maintenance);
+        assert!(scheduler.try_begin_batch(), "维护租约释放后批次能开");
+        scheduler.end_batch();
+    }
+
+    /// T20（本轮加固 P2-15）：估算确认超过单任务硬上限的图按资源限制失败收场，
+    /// 原因码如实，绝不开始处理。
+    #[test]
+    fn a_task_estimated_over_the_hard_memory_cap_is_rejected_upfront() {
+        let result = resource_limited_result("/huge/panorama.png", 8 * 1024 * 1024 * 1024);
+        assert_eq!(result.outcome, Some(ResultOutcome::Failed));
+        assert_eq!(result.reason_code, Some(ReasonCode::ResourceLimitExceeded));
+        assert!(result.error.as_deref().is_some_and(|e| e.contains("上限")));
+        assert!(!result.has_product());
+    }
+
+    /// T18（本轮加固 P2-11）：每文件冻结的相对路径赢过批级"最深根胜出"；
+    /// 非法的冻结值（绝对路径 / `..` 上跳）被拒用并退化到根解析。
+    #[test]
+    fn a_frozen_per_file_relative_path_beats_the_deepest_root_guess() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "/photos/2026/a.png".to_string(),
+            "2026/a.png".to_string(),
+        );
+        let mut options = CompressOptions::default();
+        options.source_roots = vec!["/photos".into(), "/photos/2026".into()];
+        options.per_file_relative_paths = Some(map);
+        let relative = relative_output_path(Path::new("/photos/2026/a.png"), &options);
+        assert_eq!(relative, PathBuf::from("2026/a.png"), "冻结快照说了算，与批次无关");
+
+        // 非法冻结值：目录逃逸被拒，退化到根解析（这里根不存在 → 文件名兜底）。
+        let mut escape = std::collections::HashMap::new();
+        escape.insert("/photos/2026/b.png".to_string(), "../../etc/passwd".to_string());
+        options.per_file_relative_paths = Some(escape);
+        let relative = relative_output_path(Path::new("/photos/2026/b.png"), &options);
+        assert_eq!(relative, PathBuf::from("b.png"), "上跳路径绝不能照单全收");
+    }
+
     fn transactions_in(dir: &Path) -> TransactionStore {
         TransactionStore::new(
             dir.join("history")
@@ -4346,14 +4601,18 @@ mod tests {
     }
 
     /// §34 的取消分支另有专门测试；这些用例跑的都是「没人取消」那条正常路径。
-    fn never_cancel() -> bool {
+    /// 新语义（P2-14）：提交闸赢下竞争 = 允许提交。演「没有取消」。
+    fn commit_gate_begin_no_cancel() -> bool {
+        true
+    }
+
+    /// 演「编码跑完之后用户按了取消」：Commit 前的检查点一按就响 ——
+    /// begin 闸输给取消 = 拒绝提交。
+    fn commit_gate_begin_always_cancel() -> bool {
         false
     }
 
-    /// 演「编码跑完之后用户按了取消」：Commit 前的检查点一按就响。
-    fn always_cancel() -> bool {
-        true
-    }
+    fn commit_gate_end_noop() {}
 
     /// 测试用的 Commit 入口：把取消检查点固定成"没有取消"，覆盖依据走**同一个**
     /// `capture_replace_baseline`（§90：判据不许在测试里另写一份），其余参数原样交给
@@ -4376,7 +4635,8 @@ mod tests {
             history,
             transactions,
             retention_days,
-            &never_cancel,
+            &commit_gate_begin_no_cancel,
+            &commit_gate_end_noop,
             capture_replace_baseline(file_path, options, history),
         )
     }
@@ -4563,7 +4823,8 @@ mod tests {
             &history,
             &transactions,
             3,
-            &never_cancel,
+            &commit_gate_begin_no_cancel,
+            &commit_gate_end_noop,
             baseline,
         )
         .expect_err("源文件已经不是压缩时那份，覆盖必须作废");
@@ -4637,7 +4898,8 @@ mod tests {
             &history,
             &transactions,
             3,
-            &never_cancel,
+            &commit_gate_begin_no_cancel,
+            &commit_gate_end_noop,
             baseline,
         )
         .expect_err("对不上号的快照不能撑起一次覆盖");
@@ -4693,7 +4955,8 @@ mod tests {
             &history,
             &transactions,
             3,
-            &never_cancel,
+            &commit_gate_begin_no_cancel,
+            &commit_gate_end_noop,
             baseline,
         )
         .expect("老记录的备份读得出字节，这次覆盖就该照常完成");
@@ -4732,7 +4995,8 @@ mod tests {
             &history,
             &transactions,
             3,
-            &never_cancel,
+            &commit_gate_begin_no_cancel,
+            &commit_gate_end_noop,
             baseline,
         )
         .expect_err("依据没备齐就不许覆盖");
@@ -5256,7 +5520,8 @@ mod tests {
                 &history,
                 &transactions,
                 3,
-                &always_cancel,
+                &commit_gate_begin_always_cancel,
+                &commit_gate_end_noop,
                 // 覆盖依据走同一个 `capture_replace_baseline`：取消打在它之后、Commit 之前，
                 // 所以编码前那份快照确实在磁盘上。但它不是产物、不是历史、也不是事务，
                 // 下一次退出清理会把它当无人引用收走 —— 用户说的是"这次不要"。

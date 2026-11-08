@@ -105,6 +105,7 @@ fn run_crash_child(phase: &str, workdir: &Path) -> ! {
                 fs::write(&partial, COMPRESSED).unwrap();
                 let settled = sizqo_lib::output_transaction::publish_replace_if_identity_matches(
                     &partial, &source, &identity,
+                    Some(sizqo_lib::source_identity::sha256_bytes(COMPRESSED).as_str()),
                 );
                 assert!(settled.is_ok(), "生产交换必须成功: {settled:?}");
             }
@@ -115,11 +116,13 @@ fn run_crash_child(phase: &str, workdir: &Path) -> ! {
                 fs::write(&partial, COMPRESSED).unwrap();
                 let settled = sizqo_lib::output_transaction::publish_replace_if_identity_matches(
                     &partial, &source, &identity,
+                    Some(sizqo_lib::source_identity::sha256_bytes(COMPRESSED).as_str()),
                 );
                 assert!(settled.is_ok(), "生产交换必须成功: {settled:?}");
                 let entry = HistoryEntry {
                     media_kind: "image".into(),
                     video_metadata: None,
+                    retired_original_path: None,
                     id: "crash-1".into(),
                     created_at: sizqo_lib::history::now_millis(),
                     expires_at: sizqo_lib::history::now_millis() + 86_400_000,
