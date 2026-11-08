@@ -133,7 +133,7 @@ async fn compress_png(file: &Path, options: &CompressOptions, rule: OutputRule) 
 
 /// image crate 兜底：PNG 无损重编码，保留原色型（RGB→RGB8，RGBA→RGBA8）。
 fn compress_png_with_image(file: &Path) -> Option<Vec<u8>> {
-    let img = image::open(file).ok()?;
+    let img = crate::engine::decode_with_orientation(file)?;
     let mut buf = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new_with_quality(
         &mut buf,
@@ -166,7 +166,7 @@ fn compress_png_with_oxipng(file: &Path, quality: u32) -> Option<Vec<u8>> {
 /// 量化后用 png crate 直接写 8-bit 调色板 PNG（PLTE + 索引像素），与 pngquant CLI 一致。
 fn compress_png_with_imagequant(file: &Path, quality: u32) -> Option<Vec<u8>> {
     use imagequant::{RGBA, Attributes};
-    let img = image::open(file).ok()?;
+    let img = crate::engine::decode_with_orientation(file)?;
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
     let raw: &[u8] = rgba.as_raw();
@@ -233,7 +233,7 @@ fn compress_png_with_imagequant(file: &Path, quality: u32) -> Option<Vec<u8>> {
 
 /// image crate 兜底：JPEG 按质量重编码（RGB8）。
 fn compress_jpg_with_image(file: &Path, quality: u8) -> Option<Vec<u8>> {
-    let img = image::open(file).ok()?;
+    let img = crate::engine::decode_with_orientation(file)?;
     let rgb = img.to_rgb8();
     let mut buf = Vec::new();
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
@@ -246,7 +246,7 @@ fn compress_jpg_with_image(file: &Path, quality: u8) -> Option<Vec<u8>> {
 
 /// mozjpeg crate 量化（同源 cjpeg trellis quant）：set_quality + optimize + progressive。
 fn compress_jpg_with_mozjpeg(file: &Path, quality: u32) -> Option<Vec<u8>> {
-    let img = image::open(file).ok()?;
+    let img = crate::engine::decode_with_orientation(file)?;
     let rgb = img.to_rgb8();
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
     let mut cinfo = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_EXT_RGB);
@@ -290,7 +290,7 @@ async fn compress_jpg(file: &Path, options: &CompressOptions, rule: OutputRule) 
 
 /// webp crate 编码（同源 cwebp/libwebp）：from_rgba + encode(quality)。
 fn compress_to_webp_with_cwebp(file: &Path, quality: u32) -> Option<Vec<u8>> {
-    let img = image::open(file).ok()?;
+    let img = crate::engine::decode_with_orientation(file)?;
     let rgba = img.to_rgba8();
     let encoder = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height());
     let webp_data = encoder.encode(quality as f32);
@@ -352,7 +352,7 @@ async fn compress_gif(file: &Path, options: &CompressOptions, rule: OutputRule) 
 
 /// ravif crate 编码（同源 AV1/rav1e，对齐 avifenc）：with_quality + with_speed(6)。
 fn compress_to_avif_with_avifenc(file: &Path, quality: u32) -> Option<Vec<u8>> {
-    let img = image::open(file).ok()?;
+    let img = crate::engine::decode_with_orientation(file)?;
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
     let pixels: Vec<ravif::RGBA8> = rgba.as_raw().chunks_exact(4)

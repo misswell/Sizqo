@@ -65,7 +65,7 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
         // 产物复探给足时间（编码刚完成，同一份大文件慢卷上不止 45 秒）。
         // 复探同样可取消 + count_frames：产物帧数与源帧数在 validate 里对账。
         let encoded=probe::probe_cancellable(&partial,Duration::from_secs(300),Some(&cancel),true)?;
-        super::validation::validate(&source_probe,&encoded,&plan)?;
+        super::validation::validate(&source_probe,&encoded,&plan,Some(&source),Some(&partial))?;
         // Decode the entire output to null. Exit 0 and a progress=end record alone are insufficient.
         let mut verify=super::process::command("ffmpeg")?;
         verify.args(["-hide_banner","-v","error","-xerror","-nostdin","-protocol_whitelist","file,pipe","-threads"]).arg(plan.threads.to_string())
@@ -176,7 +176,7 @@ mod tests {
             run(&args,&log,&cancel,|_|{}).unwrap();
         }
         let encoded=probe::probe(&out).unwrap();
-        validation::validate(source_probe,&encoded,&plan).expect("输出必须通过 §56 全量校验");
+        validation::validate(source_probe,&encoded,&plan,None,None).expect("输出必须通过 §56 全量校验");
         encoded
     }
 
@@ -234,7 +234,7 @@ mod tests {
             run(&args,&dir.join(format!("matrix-{}.log",std::process::id())),&cancel,|_|{}).unwrap();
         }
         let encoded=probe::probe(&out).unwrap();
-        validation::validate(&source_probe,&encoded,&plan).expect("输出必须通过 §56 全量校验");
+        validation::validate(&source_probe,&encoded,&plan,None,None).expect("输出必须通过 §56 全量校验");
         encoded
     }
 
@@ -352,5 +352,200 @@ mod tests {
         let mut tiny=base.clone();tiny.mode="targetSize".into();tiny.audio_policy="none".into();tiny.container="mp4".into();tiny.target_mi_b=Some(0.0001);
         let sdr_probe=probe::probe(&good).unwrap();
         assert!(plan::build(&tiny,&sdr_probe,&caps,2).is_err(),"不可达的目标体积必须被拒");
+    }
+
+    /// 全链路 encode() 的现场：真实 HistoryStore/TransactionStore/来源根/日志目录，
+    /// 与 video_commands.rs 的调用方式同构 —— 这些 ignored 测试证明的是整条管线，
+    /// 不是 plan/argv 的切片。
+    fn encode_full_chain(root:&Path,source:&Path,options:&VideoOptions)->VideoResult{
+        let caps=capabilities::capabilities();
+        let history=crate::history::HistoryStore::new(root.join("history")).unwrap();
+        let transactions=crate::output_transaction::TransactionStore::new(root.join("transactions"));
+        let logs=root.join("logs");
+        let roots=vec![root.to_string_lossy().into_owned()];
+        let cancel=Arc::new(AtomicBool::new(false));
+        let emit=|_event:VideoProgress|{};
+        encode("real-e2e-task",source,options,&caps,"real-e2e-session",1,&roots,None,&history,&transactions,30,2,&logs,cancel,&emit)
+    }
+
+    /// T12 的证据工具：直接 ffprobe（绕开 probe.rs），拿 `-count_frames` 实测解码帧数。
+    fn nb_read_frames(media:&Path)->Option<u64>{
+        let mut cmd=super::super::process::command("ffprobe").ok()?;
+        cmd.args(["-v","error","-count_frames","-select_streams","v","-show_entries","stream=nb_read_frames","-of","csv=p=0"]).arg(media);
+        let out=super::super::process::capture(cmd,Duration::from_secs(300),64*1024).ok()?;
+        String::from_utf8_lossy(&out).trim().split(',').next()?.trim().parse().ok()
+    }
+    /// T12 的证据工具：视频流全部帧的 pts_time（秒）。
+    fn frame_pts(media:&Path)->Vec<f64>{
+        let mut cmd=super::super::process::command("ffprobe").unwrap();
+        cmd.args(["-v","error","-select_streams","v","-show_entries","frame=pts_time","-of","csv=p=0"]).arg(media);
+        let out=super::super::process::capture(cmd,Duration::from_secs(300),4*1024*1024).unwrap();
+        String::from_utf8_lossy(&out).lines().filter_map(|l|l.trim().trim_end_matches(',').parse::<f64>().ok()).collect()
+    }
+    /// 夹具把第 60 帧之后的 PTS 翻倍：窗口内必须同时存在 ~1/30s 的均匀间隔
+    /// 和 ≥2×（翻倍后）的变间隔 —— 这是"真的 VFR 材料"的直接证据。
+    fn pts_holds_a_doubled_gap(pts:&[f64])->bool{
+        let window=&pts[..pts.len().min(70)];
+        let mut doubled=false;let mut uniform=false;
+        for pair in window.windows(2){
+            let d=pair[1]-pair[0];
+            if d>0.05{doubled=true;}
+            if d>0.0&&d<0.04{uniform=true;}
+        }
+        doubled&&uniform
+    }
+
+    /// T12 真实端到端：VFR 源 → 默认 passthrough 编码 → 帧数对账。
+    /// mkv 容器不暴露 r≠avg（s11 已用 mp4 验过探测路径），这里用时间戳间隔
+    /// 本身当 VFR 证据，并显式再探一次产物：`-count_frames` 实测帧数必须与
+    /// 源一致 —— 一帧都不许丢。
+    /// 需要 ffmpeg/ffprobe，显式运行：`cargo test --lib real -- --ignored`
+    #[test]
+    #[ignore="requires bundled ffmpeg/ffprobe; run explicitly for release validation"]
+    fn t12_real_vfr_frame_count_reconciliation(){
+        assert!(super::super::process::tool("ffmpeg").is_ok()&&super::super::process::tool("ffprobe").is_ok(),"需要 ffmpeg/ffprobe");
+        let dir=tempfile::tempdir().unwrap();
+        let root=dir.path();
+        let caps=capabilities::capabilities();
+        let timing=caps.frame_timing_flag.clone();
+        assert!(!timing.is_empty(),"这台 ffmpeg 既不认 -fps_mode 也不认 -vsync：时间轴语义无法保证");
+        // setpts 把第 60 帧之后的 PTS 翻倍：前 2 秒均匀 30fps，之后间隔 66.7ms，
+        // 帧数不变（120）—— 真正的 VFR 材料，不是丢帧。
+        let vfr=make_fixture(root,"vfr-source.mkv",&[
+            "-f","lavfi","-i","testsrc2=duration=4:size=160x120:rate=30",
+            "-vf","setpts='if(gt(N,59), PTS*2, PTS)'",timing.as_str(),"vfr",
+            "-c:v","libx264","-preset","ultrafast","-pix_fmt","yuv420p"]);
+        let source_pts=frame_pts(&vfr);
+        assert!(pts_holds_a_doubled_gap(&source_pts),"夹具时间戳必须真的有变间隔（前 70 帧内同时存在 ~33ms 与 ≥67ms 间隔）");
+        let options=VideoOptions{encoder:"libx264".into(),mode:"crf".into(),crf:Some(23.0),preset:"veryfast".into(),audio_policy:"none".into(),metadata_policy:"preserve".into(),container:"mkv".into(),threads:2,..Default::default()};
+        let result=encode_full_chain(root,&vfr,&options);
+        assert!(result.success,"VFR passthrough 编码必须提交成功: {:?}",result.reason);
+        assert_eq!(result.outcome,Some(ResultOutcome::Committed));
+        let output=PathBuf::from(result.output_path.as_deref().expect("提交后必须回填 output_path"));
+        // 产物显式复探（-count_frames 实测）：帧数对账是 T12 的核心证据 ——
+        // 不依赖 encode 内部那次校验的自证。
+        let src_frames=nb_read_frames(&vfr).expect("源必须探得出实测帧数");
+        let out_frames=nb_read_frames(&output).expect("产物必须探得出实测帧数");
+        assert!(src_frames>0&&out_frames>0,"实测帧数必须为正（{src_frames} / {out_frames}）");
+        assert_eq!(src_frames,out_frames,"VFR passthrough 一帧都不许丢: {src_frames} → {out_frames}");
+        assert!(pts_holds_a_doubled_gap(&frame_pts(&output)),"passthrough 必须原样保留变间隔时间戳");
+        assert_eq!(result.output_bytes,Some(std::fs::metadata(&output).unwrap().len()),"output_bytes 必须与产物实际大小一致");
+    }
+
+    /// T13 真实端到端：KeepAll 多轨（aac+ac3 双音轨、一条 srt 字幕、章节、附件）
+    /// 全链路编码后逐项核对 —— 轨道数量、codec、语言与标题 tag、章节标题、
+    /// 附件名字都在；附件内容 SHA256 对账由 encode 内部带路径的 KeepAll
+    /// validate 跑过，这里再显式对一次作为独立证据。
+    /// 需要 ffmpeg/ffprobe，显式运行：`cargo test --lib real -- --ignored`
+    #[test]
+    #[ignore="requires bundled ffmpeg/ffprobe; run explicitly for release validation"]
+    fn t13_real_keep_all_multi_track_roundtrip(){
+        assert!(super::super::process::tool("ffmpeg").is_ok()&&super::super::process::tool("ffprobe").is_ok(),"需要 ffmpeg/ffprobe");
+        let dir=tempfile::tempdir().unwrap();
+        let root=dir.path();
+        let meta=root.join("keepall-meta.txt");
+        fs::write(&meta,";FFMETADATA1\ntitle=KeepAll Roundtrip\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=2000\ntitle=Intro\n").unwrap();
+        let subs=root.join("keepall.srt");
+        fs::write(&subs,"1\n00:00:00,000 --> 00:00:01,000\nhello\n\n2\n00:00:01,000 --> 00:00:02,000\nkeepall\n").unwrap();
+        let attachment=root.join("credits.txt");
+        fs::write(&attachment,"Sizqo KeepAll attachment payload\n").unwrap();
+        let multi=make_fixture(root,"keepall-multi.mkv",&[
+            "-f","lavfi","-i","testsrc2=size=160x120:rate=24:duration=2",
+            "-f","lavfi","-i","sine=frequency=440:duration=2",
+            "-f","lavfi","-i","sine=frequency=880:duration=2",
+            "-i",meta.to_str().unwrap(),"-i",subs.to_str().unwrap(),
+            "-map","0:v","-map","1:a","-map","2:a","-map","4:s",
+            "-c:v","libx264","-preset","ultrafast","-pix_fmt","yuv420p",
+            "-c:a:0","aac","-c:a:1","ac3","-c:s","srt",
+            "-metadata:s:a:0","language=eng","-metadata:s:a:0","title=Main",
+            "-metadata:s:a:1","language=jpn","-metadata:s:a:1","title=Secondary",
+            "-attach",attachment.to_str().unwrap(),"-metadata:s:t:0","mimetype=text/plain",
+            "-map_chapters","3","-map_metadata","3","-shortest"]);
+        let source_probe=probe::probe(&multi).unwrap();
+        assert_eq!(source_probe.audio().count(),2,"夹具必须真的有双音轨");
+        assert_eq!(source_probe.subtitles().count(),1,"夹具必须真的有字幕");
+        assert_eq!(source_probe.chapters.len(),1,"夹具必须真的有章节");
+        let aac=source_probe.streams.iter().find(|s|s.index==1).unwrap();
+        assert_eq!(aac.codec_name,"aac","夹具第一音轨必须是 aac");
+        assert_eq!(aac.tags["language"],"eng","夹具必须写入了 eng 语言");
+        assert_eq!(aac.tags["title"],"Main");
+        let ac3=source_probe.streams.iter().find(|s|s.index==2).unwrap();
+        assert_eq!(ac3.codec_name,"ac3","夹具第二音轨必须是 ac3");
+        assert_eq!(ac3.tags["language"],"jpn");
+        assert_eq!(ac3.tags["title"],"Secondary");
+        assert_eq!(source_probe.streams.iter().find(|s|s.codec_type=="attachment").unwrap().tags["filename"],"credits.txt");
+
+        let options=VideoOptions{encoder:"libx264".into(),mode:"crf".into(),crf:Some(23.0),preset:"veryfast".into(),audio_policy:"copy".into(),subtitle_policy:"copy".into(),metadata_policy:"preserve".into(),container:"mkv".into(),threads:2,..Default::default()};
+        let result=encode_full_chain(root,&multi,&options);
+        assert!(result.success,"KeepAll 多轨编码必须提交成功: {:?}",result.reason);
+        let output=PathBuf::from(result.output_path.as_deref().expect("提交后必须回填 output_path"));
+        let out=probe::probe(&output).unwrap();
+        assert_eq!(out.audio().count(),2,"双音轨丢了");
+        assert_eq!(out.subtitles().count(),1,"字幕丢了");
+        assert_eq!(out.chapters.len(),1,"章节丢了");
+        let out_aac=out.streams.iter().find(|s|s.index==1).unwrap();
+        assert_eq!(out_aac.codec_name,"aac","copy 策略下 codec 不许变");
+        assert_eq!(out_aac.tags["language"],"eng","语言 tag 丢了");
+        assert_eq!(out_aac.tags["title"],"Main","标题 tag 丢了");
+        let out_ac3=out.streams.iter().find(|s|s.index==2).unwrap();
+        assert_eq!(out_ac3.codec_name,"ac3","copy 策略下 codec 不许变");
+        assert_eq!(out_ac3.tags["language"],"jpn","语言 tag 丢了");
+        assert_eq!(out_ac3.tags["title"],"Secondary","标题 tag 丢了");
+        assert_eq!(out.chapters[0]["tags"]["title"],"Intro","章节标题丢了");
+        let out_att=out.streams.iter().find(|s|s.codec_type=="attachment").unwrap();
+        assert_eq!(out_att.tags["filename"],"credits.txt","附件名字丢了");
+        // encode 内部的 KeepAll validate 已带路径跑过内容 SHA256 对账；
+        // 这里把两侧真实文件再显式对一次，作为独立证据。
+        validation::verify_attachments_content(&source_probe,&out,&multi,&output)
+            .expect("附件内容 SHA256 必须一致");
+    }
+
+    /// T15 真实端到端：FLAC + targetSize 全链路 —— 结果必须如实回填
+    /// target_bytes / target_met / target_deviation，偏差与
+    /// (output_bytes-target)/target 一致；未达标时 warnings 里必须有
+    /// "Target size missed"。源音轨用 ac3：mkv 里 ffprobe 报得出实测码率，
+    /// FLAC 预算走"实测码率"路径。
+    /// 需要 ffmpeg/ffprobe，显式运行：`cargo test --lib real -- --ignored`
+    #[test]
+    #[ignore="requires bundled ffmpeg/ffprobe; run explicitly for release validation"]
+    fn t15_real_flac_target_size_reported_honestly(){
+        assert!(super::super::process::tool("ffmpeg").is_ok()&&super::super::process::tool("ffprobe").is_ok(),"需要 ffmpeg/ffprobe");
+        let dir=tempfile::tempdir().unwrap();
+        let root=dir.path();
+        // 夹具刻意做大（320x240×6s）：FLAC 是无损可变码率，实际码率会超出
+        // "源 ac3 实测码率"的预算估计 —— 目标体积的偏差正是要如实报告的对象，
+        // 但产物必须仍小于源，否则会在"有效但没变小"的跳过门处收场（rc.15
+        // 首跑实证过 2s/160x120 夹具太小会踩这一步）。
+        let source=make_fixture(root,"t15-source.mkv",&[
+            "-f","lavfi","-i","testsrc2=size=320x240:rate=24:duration=6",
+            "-f","lavfi","-i","sine=frequency=440:duration=6",
+            "-map","0:v","-map","1:a","-c:v","libx264","-preset","ultrafast","-pix_fmt","yuv420p",
+            "-c:a","ac3","-b:a","128k","-shortest"]);
+        let source_probe=probe::probe(&source).unwrap();
+        let audio=source_probe.audio().next().expect("夹具必须有音轨");
+        assert_eq!(audio.codec_name,"ac3");
+        assert!(audio.bit_rate.is_some(),"夹具音轨必须报得出实测码率（FLAC 预算的输入）");
+        // 目标取源体积的 50%：扣掉实测 128kbps 音频预算后仍有 ≥32kbps 的视频
+        // 余量（可达目标）；即使 FLAC 实际码率超出预算估计，产物也小于源
+        // —— success 路径成立，偏差按实际输出如实报告。
+        // metadata 用 strip：FLAC 按定义转换音频 codec，而 KeepAll 的逐流对账
+        // 要求 audio codec 原样（T13 契约），两者组合会被 validate 拒绝 ——
+        // T15 的主题是 targetSize 的如实回填，不引入这层无关契约。
+        let target_mi_b=(source_probe.size_bytes as f64*0.5)/(1024.0*1024.0);
+        let options=VideoOptions{encoder:"libx264".into(),mode:"targetSize".into(),target_mi_b:Some(target_mi_b),preset:"veryfast".into(),audio_policy:"flac".into(),metadata_policy:"strip".into(),container:"mkv".into(),threads:2,..Default::default()};
+        let result=encode_full_chain(root,&source,&options);
+        assert!(result.success,"FLAC targetSize 编码必须提交成功: {:?}",result.reason);
+        let target=result.target_bytes.expect("targetSize 模式必须回填 target_bytes");
+        assert!((target-target_mi_b*1024.0*1024.0).abs()<1.0,"target_bytes 必须等于目标 MiB 换算的字节数");
+        let met=result.target_met.expect("targetSize 模式必须回填 target_met");
+        let deviation=result.target_deviation.expect("targetSize 模式必须回填 target_deviation");
+        let output=PathBuf::from(result.output_path.as_deref().expect("提交后必须回填 output_path"));
+        let out_bytes=std::fs::metadata(&output).unwrap().len() as f64;
+        assert_eq!(result.output_bytes,Some(out_bytes as u64),"output_bytes 必须与产物实际大小一致");
+        let expected=((out_bytes-target)/target)*100.0;
+        assert!((deviation-expected).abs()<0.1,"target_deviation {deviation} 必须与 (output-target)/target 一致（{expected}）");
+        if !met{
+            assert!(result.warnings.iter().any(|w|w.contains("Target size missed")),"未达标必须如实警告: {:?}",result.warnings);
+        }
     }
 }

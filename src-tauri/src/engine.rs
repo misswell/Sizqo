@@ -841,8 +841,28 @@ async fn compress_png(file: &Path, options: &CompressOptions, rule: OutputRule) 
     }
 }
 
+/// 本轮加固（P2-6 / T11）：带 **EXIF Orientation 烘焙**的统一解码入口。
+///
+/// `image::open` 不读方向 —— iPhone 竖拍（Orientation=6）的像素在高级路径会
+/// 被原样压成横放。这里与 Swift `uprightImage`（WithTransform）同一条纪律：
+/// decoder 取 `orientation()` → `apply_orientation` 把方向烘进像素 → 编码器
+/// 本来就不写 EXIF 方向标签，输出因此不再依赖旧标签、不会二次旋转。
+/// 多帧/动画输入由动画拒绝逻辑负责，这里只管方向。
+pub fn decode_with_orientation(file: &Path) -> Option<image::DynamicImage> {
+    use image::ImageDecoder;
+    let reader = image::ImageReader::open(file).ok()?;
+    let reader = reader.with_guessed_format().ok()?;
+    let mut decoder = reader.into_decoder().ok()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
+    Some(img)
+}
+
 fn compress_png_with_image(file: &Path) -> Option<Vec<u8>> {
-    let img = image::open(file).ok()?;
+    let img = decode_with_orientation(file)?;
     let mut buf = Vec::new();
     let encoder = image::codecs::png::PngEncoder::new_with_quality(
         &mut buf,
@@ -873,8 +893,8 @@ async fn compress_jpg(file: &Path, options: &CompressOptions, rule: OutputRule) 
 
     // 1. cjpeg (mozjpeg) via PPM pipe: decode with image crate, encode with mozjpeg
     if let Some(tool) = find_tool("cjpeg") {
-        // Decode image and convert to PPM for cjpeg input
-        if let Ok(img) = image::open(file) {
+        // Decode image and convert to PPM for cjpeg input（方向烘焙，P2-6）。
+        if let Some(img) = decode_with_orientation(file) {
             let rgb = img.to_rgb8();
             let (w, h) = (rgb.width(), rgb.height());
             // Build PPM (P6) header + raw RGB data
@@ -924,7 +944,7 @@ async fn compress_jpg(file: &Path, options: &CompressOptions, rule: OutputRule) 
 }
 
 fn compress_jpg_with_image(file: &Path, quality: u8) -> Option<Vec<u8>> {
-    let img = image::open(file).ok()?;
+    let img = decode_with_orientation(file)?;
     let rgb = img.to_rgb8();
     let mut buf = Vec::new();
     let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
@@ -1294,12 +1314,13 @@ pub(crate) fn prepare_working_file(file: &Path, options: &CompressOptions) -> Wo
     let Some((target_w, target_h)) = capped_dims(width, height, cap) else {
         return WorkingFile::unchanged(file);
     };
-    let decoded = match image::open(file) {
-        Ok(image) => image,
-        Err(error) => {
+    // 尺寸上限同样要走方向烘焙：竖拍图按视觉高度算上限，压完不能横躺。
+    let decoded = match decode_with_orientation(file) {
+        Some(image) => image,
+        None => {
             return WorkingFile::unchanged_with_warning(
                 file,
-                format!("{}px 尺寸上限未能应用：进程内解码失败（{error}），本次按原始尺寸处理", cap),
+                format!("{}px 尺寸上限未能应用：进程内解码失败，本次按原始尺寸处理", cap),
             );
         }
     };

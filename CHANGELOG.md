@@ -3,6 +3,18 @@
 Sizqo's versioning starts at 0.1.0. This file records user-visible changes;
 engineering rules live in [AGENTS.md](AGENTS.md).
 
+## 0.3.6-rc.15 — Goal 复核轮（预发布，2026-11-08）
+
+- 修正记录：0.3.6-rc.11 的发布说明曾把"EXIF 方向烘焙（Rust 侧）"记为已完成，
+  实际当时只完成了 Swift 侧——本轮重核发现并如实更正，Rust 侧补齐
+  （engine 与 inproc 引擎共 10 处解码点统一方向烘焙）。
+- EXIF Orientation 1–8 以真实夹具测试闭合（手工拼接 APP1 EXIF 的 JPEG × 8 方向，
+  iPhone 竖拍 Orientation=6 端到端：像素转正、产物不再携带方向标签）。
+- 视频完整性端到端补齐：VFR 帧数对账、KeepAll 多音轨/字幕/章节/附件往返、
+  FLAC + 目标体积如实回填偏差，全部以真实 ffmpeg 编码背书（`--ignored` 矩阵）。
+- KeepAll 附件对账升级到内容级：`-dump_attachment` 解包两侧附件逐名比对
+  SHA256，同名换内容会被拦下。
+
 ## 0.3.6-rc.12 — 可靠性加固第三轮（预发布，2026-11-08）
 
 （rc.11 与 rc.12 同属一轮：rc.12 只修 Windows CI 抓到的 4 处平台差异，见下第 13 条。）

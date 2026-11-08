@@ -2989,6 +2989,146 @@ do {
     check(readBytes(p11Happy) == [5, 5, 5, 5], "P1-1 对照：产物必须落在目标位")
 }
 
+// ─── 48. §48 T11 EXIF 方向端到端：orientation 6 烘进像素，输出不再带方向标签 ──
+print("[48] §48 T11 EXIF 方向端到端：orientation 6 烘进像素，输出 20×32 无 EXIF 方向标签")
+do {
+    // ── ① 构造 32×20 原图：左半红、右半蓝，(0,0) 处锚一块 2×2 白标记 ─────────
+    // 直接铺像素缓冲建 CGImage：行 0 就是顶行，避开 CGContext 底左原点的坐标歧义。
+    // 白标记取 2×2：JPEG 4:2:0 的色度块恰好 2×2，纯白块自成一个色度块，颜色扛得住有损压缩。
+    let srcW = 32, srcH = 20
+    var pixels = [UInt8](repeating: 0, count: srcW * srcH * 4)
+    func putPixel(_ x: Int, _ y: Int, _ r: UInt8, _ g: UInt8, _ b: UInt8) {
+        let o = (y * srcW + x) * 4
+        pixels[o] = r; pixels[o + 1] = g; pixels[o + 2] = b; pixels[o + 3] = 255
+    }
+    for y in 0..<srcH {
+        for x in 0..<srcW {
+            if x < srcW / 2 { putPixel(x, y, 255, 0, 0) } else { putPixel(x, y, 0, 0, 255) }
+        }
+    }
+    for marker in [(0, 0), (1, 0), (0, 1), (1, 1)] { putPixel(marker.0, marker.1, 255, 255, 255) }
+    let pixelData = Data(pixels)
+    guard let srcImage = CGImage(
+        width: srcW, height: srcH, bitsPerComponent: 8, bitsPerPixel: 32,
+        bytesPerRow: srcW * 4, space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+        provider: CGDataProvider(data: pixelData as CFData)!,
+        decode: nil, shouldInterpolate: false, intent: .defaultIntent) else {
+        check(false, "测试前提：32×20 原图 CGImage 该建得出"); exit(1)
+    }
+    // ── ② 编基线 JPEG，再手工拼 APP1 EXIF（orientation 6）插进 SOI 之后 ──────
+    // CGImageDestination 的属性拼不出单条目 EXIF（§47 两帧 GIF 同理），直接拼字节最可控：
+    // FFE1 + 大端段长（含长度字段自己的两字节）+ "Exif\0\0" + 小端 TIFF（II*\0）
+    // + IFD0 偏移 8 + 单条目 tag 0x0112（Orientation）type 3（SHORT）count 1 值 6 + 下一 IFD = 0。
+    let exifPayload: [UInt8] = [
+        0x45, 0x78, 0x69, 0x66, 0x00, 0x00,          // "Exif\0\0"
+        0x49, 0x49, 0x2A, 0x00,                      // "II" 42：小端 TIFF
+        0x08, 0x00, 0x00, 0x00,                      // IFD0 在 TIFF 头之后偏移 8
+        0x01, 0x00,                                  // 条目数 = 1
+        0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, // Orientation=6
+        0x00, 0x00, 0x00, 0x00,                      // 下一 IFD 偏移 = 0
+    ]
+    let app1Length = exifPayload.count + 2           // 段长含长度字段自己的两字节，大端
+    var app1 = Data([0xFF, 0xE1, UInt8(app1Length >> 8), UInt8(app1Length & 0xFF)])
+    app1.append(contentsOf: exifPayload)
+    let baseJpeg = NSMutableData()
+    let baseDest = CGImageDestinationCreateWithData(
+        baseJpeg as CFMutableData, UTType.jpeg.identifier as CFString, 1, nil)
+    check(baseDest != nil, "测试前提：基线 JPEG 目标该建得出")
+    if let baseDest {
+        CGImageDestinationAddImage(
+            baseDest, srcImage, [kCGImageDestinationLossyCompressionQuality: 1.0] as CFDictionary)
+        check(CGImageDestinationFinalize(baseDest), "测试前提：基线 JPEG 该写得出")
+    }
+    let baseData = baseJpeg as Data
+    check(Array(baseData.prefix(2)) == [0xFF, 0xD8], "测试前提：基线 JPEG 以 SOI 开头")
+    // 再垫一段合法的 COM 注释把原图撑大：本节测的是方向烘焙，不是体积博弈，
+    // 垫够字节让「输出必须比原图小」这道门与画质参数无关地稳定成立。
+    let pad = [UInt8](repeating: 0x53, count: 4096)
+    var padded = Data(baseData.prefix(2))            // SOI
+    padded.append(app1)                              // APP1 EXIF 紧跟 SOI
+    padded.append(Data([0xFF, 0xFE,
+                        UInt8(((pad.count + 2) >> 8) & 0xFF), UInt8((pad.count + 2) & 0xFF)]))
+    padded.append(contentsOf: pad)
+    padded.append(baseData.dropFirst(2))
+    let exifPath = freshRoot("48-exif") + "/orient6.jpg"
+    makeFile(exifPath, Array(padded))
+    // 拼接产物必须能被读回，且 Orientation 正是 6：EXIF 拼错了，后面的断言全部失去意义。
+    guard let exifSource = CGImageSourceCreateWithData(padded as CFData, nil),
+          let exifProps = CGImageSourceCopyPropertiesAtIndex(exifSource, 0, nil) as? [CFString: Any] else {
+        check(false, "测试前提：拼好 EXIF 的 JPEG 该读得出源"); exit(1)
+    }
+    check((exifProps[kCGImagePropertyOrientation] as? NSNumber)?.intValue == 6,
+          "测试前提：读回的 Orientation 必须是 6（实际 \(exifProps[kCGImagePropertyOrientation] ?? "nil")）")
+    check(exifProps[kCGImagePropertyPixelWidth] as? Int == 32
+            && exifProps[kCGImagePropertyPixelHeight] as? Int == 20,
+          "测试前提：存储像素仍是 32×20（orientation 6 的躺倒图）")
+    check(detectImageType(of: padded) == "jpg", "测试前提：拼出来的仍被识别为 jpg")
+
+    // ── ③ 走 compressJPG 公开入口，断言方向烘进了像素 ────────────────────────
+    // orientation 6 的转正 = 存储像素顺时针转 90°：存储左半红变成显示上半红，
+    // 存储 (0,0) 的白标记落到显示坐标右上 (19,0)。输出 20×32，且不许再带方向元数据。
+    var jpgOptions = CompressOptions()
+    jpgOptions.quality = 75
+    let encoded = CompressionEngine.compressJPG(file: exifPath, options: jpgOptions)
+    check(encoded.success, "orientation 6 的 JPEG 压缩成功（algorithm=\(encoded.algorithm)）")
+    check(encoded.verdict == .candidate && encoded.compressed.count < padded.count,
+          "交回的是重新编码的产物：verdict=candidate 且小于原图（\(encoded.compressed.count) < \(padded.count)）")
+    func containsExifApp1(_ data: Data) -> Bool {
+        let needle: [UInt8] = [0xFF, 0xE1, 0x45, 0x78, 0x69, 0x66] // FFE1 + "Exif"
+        let bytes = [UInt8](data)
+        guard bytes.count >= needle.count else { return false }
+        return (0...(bytes.count - needle.count)).contains { offset in
+            Array(bytes[offset..<(offset + needle.count)]) == needle
+        }
+    }
+    check(!containsExifApp1(encoded.compressed), "输出字节里不再出现 EXIF 方向段（FFE1 \"Exif\"）")
+    guard let outSource = CGImageSourceCreateWithData(encoded.compressed as CFData, nil),
+          let outProps = CGImageSourceCopyPropertiesAtIndex(outSource, 0, nil) as? [CFString: Any] else {
+        check(false, "测试前提：输出 JPEG 该读得出源和属性"); exit(1)
+    }
+    check(outProps[kCGImagePropertyPixelWidth] as? Int == 20
+            && outProps[kCGImagePropertyPixelHeight] as? Int == 32,
+          "输出属性尺寸 20×32（横躺的存储像素已转正）")
+    let outOrientation = (outProps[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+    check(outOrientation == 1, "输出方向元数据缺席或为 1（实际 \(outOrientation)），正立像素不许再旋转")
+    guard let outImage = CGImageSourceCreateImageAtIndex(outSource, 0, nil) else {
+        check(false, "测试前提：输出该解得回 CGImage"); exit(1)
+    }
+    check(outImage.width == 20 && outImage.height == 32,
+          "输出解码尺寸 20×32（实际 \(outImage.width)×\(outImage.height)）")
+    // ── ④ 解码输出读像素：标记在右上、上半红下半蓝 ──────────────────────────
+    // 输出已无方向元数据，普通解码即正立；画进位图读 RGB（位图缓冲首行 = 顶行）。
+    guard let drawContext = CGContext(
+        data: nil, width: outImage.width, height: outImage.height,
+        bitsPerComponent: 8, bytesPerRow: outImage.width * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+        check(false, "测试前提：输出位图上下文该建得出"); exit(1)
+    }
+    drawContext.draw(outImage, in: CGRect(x: 0, y: 0,
+                                          width: CGFloat(outImage.width),
+                                          height: CGFloat(outImage.height)))
+    let outPixels = drawContext.data!.bindMemory(
+        to: UInt8.self, capacity: outImage.width * outImage.height * 4)
+    func pixel(_ x: Int, _ y: Int) -> (r: Int, g: Int, b: Int) {
+        let o = (y * outImage.width + x) * 4
+        return (Int(outPixels[o]), Int(outPixels[o + 1]), Int(outPixels[o + 2]))
+    }
+    let topLeft = pixel(0, 0)
+    check(topLeft.r >= 180 && topLeft.g <= 100 && topLeft.b <= 100,
+          "转正后左上是红：存储左半分栏随 90° 顺时针旋转变成上半（实测 \(topLeft)）")
+    let bottomLeft = pixel(0, 31)
+    check(bottomLeft.b >= 180 && bottomLeft.r <= 100 && bottomLeft.g <= 100,
+          "转正后左下是蓝（实测 \(bottomLeft)）")
+    let bottomRight = pixel(19, 31)
+    check(bottomRight.b >= 180 && bottomRight.r <= 100 && bottomRight.g <= 100,
+          "转正后右下是蓝：转错方向时这里会躺进标记（实测 \(bottomRight)）")
+    let markerPixels = [pixel(19, 0), pixel(18, 0), pixel(19, 1), pixel(18, 1)]
+    check(markerPixels.allSatisfy { min($0.r, $0.g, $0.b) >= 100 },
+          "标记像素已转到右上：2×2 标记区四点全部高亮近白（实测 \(markerPixels)）")
+}
+
 runContractVectors()
 
 print(failures == 0

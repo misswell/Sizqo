@@ -1,7 +1,17 @@
 use super::{plan::EncodePlan, probe::VideoProbe, MetadataPolicy}; use super::probe::VideoStream;
+use std::path::Path;
 
 /// §56 输出必须重新探测后逐项核对，不能把 ffmpeg 退出码当成成功。
-pub fn validate(source: &VideoProbe, output: &VideoProbe, plan: &EncodePlan) -> Result<(), String> {
+/// 媒体路径可选地传入：KeepAll 的附件内容对账需要真的解包文件（见
+/// `verify_attachments_content`）；纯 probe 级的调用（合成 probe 的单测）传 `None`
+/// 保持原语义 —— 名字+数量对账照旧，内容对账只在有路径时执行。
+pub fn validate(
+    source: &VideoProbe,
+    output: &VideoProbe,
+    plan: &EncodePlan,
+    source_path: Option<&Path>,
+    output_path: Option<&Path>,
+) -> Result<(), String> {
     if output.size_bytes == 0 {
         return Err("Empty encoded output".into());
     }
@@ -183,7 +193,7 @@ pub fn validate(source: &VideoProbe, output: &VideoProbe, plan: &EncodePlan) -> 
     if output.subtitles().count() != expected_subs {
         return Err("Encoded output lost subtitle tracks".into());
     }
-    validate_metadata(source, output, plan)?;
+    validate_metadata(source, output, plan, source_path, output_path)?;
     if plan.container == "mkv"
         && source
             .streams
@@ -209,6 +219,8 @@ fn validate_metadata(
     source: &VideoProbe,
     output: &VideoProbe,
     plan: &EncodePlan,
+    source_path: Option<&Path>,
+    output_path: Option<&Path>,
 ) -> Result<(), String> {
     match plan.metadata_policy {
         MetadataPolicy::KeepAll | MetadataPolicy::StripPrivate => {
@@ -222,6 +234,23 @@ fn validate_metadata(
                 keep_all_streams_match(source, output)?;
                 keep_all_chapters_match(source, output)?;
                 keep_all_attachments_match(source, output)?;
+                // 审查升级（T13）：附件除了名字与数量，还要内容 SHA256 一致 ——
+                // ffprobe 只看得到附件的文件名标签，看不到字节；同名附件里被换进
+                // 另一份内容，这一步才拦得住。解包需要真的媒体文件，路径没传
+                // （纯 probe 级单测）就不做内容对账，名字+数量的原语义保持不变。
+                if let (Some(source_path), Some(output_path)) = (source_path, output_path) {
+                    #[cfg(not(feature = "inproc-backends"))]
+                    {
+                        verify_attachments_content(source, output, source_path, output_path)?;
+                    }
+                    // inproc 轨禁用视频编码（capabilities.rs 硬禁），附件内容
+                    // 对账不可达；`process` 模块在该特征下不编译，解包助手
+                    // 同步按特征门控。这里只消化参数保持签名一致。
+                    #[cfg(feature = "inproc-backends")]
+                    {
+                        let _ = (source_path, output_path);
+                    }
+                }
             }
             if plan.metadata_policy == MetadataPolicy::StripPrivate {
                 // 隐私键要扫全部作用域：全局、每条流、每个章节、每个 program ——
@@ -396,32 +425,32 @@ mod tests {
             "10/1",
             "48000",
         );
-        let error = validate(&source, &leaked, &plan(MetadataPolicy::StripPrivate))
+        let error = validate(&source, &leaked, &plan(MetadataPolicy::StripPrivate), None, None)
             .expect_err("输出里还留着 location，隐私模式必须判失败");
         assert!(error.contains("location"));
-        assert!(validate(&source, &ordinary(), &plan(MetadataPolicy::StripPrivate)).is_ok());
+        assert!(validate(&source, &ordinary(), &plan(MetadataPolicy::StripPrivate), None, None).is_ok());
     }
 
     #[test]
     fn strip_all_refuses_retained_tags_or_chapters() {
         let source = probe(serde_json::json!({"title": "Keep me"}), true, "10/1", "48000");
         let retained = probe(serde_json::json!({"title": "Keep me"}), false, "10/1", "48000");
-        assert!(validate(&source, &retained, &plan(MetadataPolicy::StripAll))
+        assert!(validate(&source, &retained, &plan(MetadataPolicy::StripAll), None, None)
             .expect_err("title 还在，全部移除没有兑现")
             .contains("title"));
         let chapters_left = probe(serde_json::json!({}), true, "10/1", "48000");
-        assert!(validate(&source, &chapters_left, &plan(MetadataPolicy::StripAll))
+        assert!(validate(&source, &chapters_left, &plan(MetadataPolicy::StripAll), None, None)
             .expect_err("章节还在，全部移除没有兑现")
             .contains("chapters"));
         let clean = probe(serde_json::json!({}), false, "10/1", "48000");
-        assert!(validate(&source, &clean, &plan(MetadataPolicy::StripAll)).is_ok());
+        assert!(validate(&source, &clean, &plan(MetadataPolicy::StripAll), None, None).is_ok());
     }
 
     #[test]
     fn keep_all_refuses_a_lost_chapter() {
         let source = probe(serde_json::json!({"title": "Keep me"}), true, "10/1", "48000");
         let lost = probe(serde_json::json!({"title": "Keep me"}), false, "10/1", "48000");
-        assert!(validate(&source, &lost, &plan(MetadataPolicy::KeepAll))
+        assert!(validate(&source, &lost, &plan(MetadataPolicy::KeepAll), None, None)
             .expect_err("保留策略丢了章节")
             .contains("chapters"));
     }
@@ -430,11 +459,11 @@ mod tests {
     fn a_changed_sample_rate_or_frame_rate_is_a_failure() {
         let source = ordinary();
         let wrong_rate = probe(serde_json::json!({"title": "Keep me"}), true, "10/1", "44100");
-        assert!(validate(&source, &wrong_rate, &plan(MetadataPolicy::KeepAll))
+        assert!(validate(&source, &wrong_rate, &plan(MetadataPolicy::KeepAll), None, None)
             .expect_err("采样率被改了")
             .contains("sample rate"));
         let wrong_fps = probe(serde_json::json!({"title": "Keep me"}), true, "12/1", "48000");
-        assert!(validate(&source, &wrong_fps, &plan(MetadataPolicy::KeepAll))
+        assert!(validate(&source, &wrong_fps, &plan(MetadataPolicy::KeepAll), None, None)
             .expect_err("帧率被改了")
             .contains("frame rate"));
     }
@@ -454,14 +483,14 @@ mod tests {
         let mut output_root = source_root.clone();
         output_root["format"]["duration"] = serde_json::json!("7140"); // 丢 60 秒
         let output = VideoProbe::parse(output_root, 1000).unwrap();
-        let error = validate(&source, &output, &plan(MetadataPolicy::KeepAll))
+        let error = validate(&source, &output, &plan(MetadataPolicy::KeepAll), None, None)
             .expect_err("丢了 60 秒的 2 小时视频不许通过");
         assert!(error.contains("frame-interval tolerance"), "{error}");
         // 1 秒以内的容器取整误差照常放行。
         let mut close_root = source_root.clone();
         close_root["format"]["duration"] = serde_json::json!("7200.2");
         let close = VideoProbe::parse(close_root, 1000).unwrap();
-        assert!(validate(&source, &close, &plan(MetadataPolicy::KeepAll)).is_ok());
+        assert!(validate(&source, &close, &plan(MetadataPolicy::KeepAll), None, None).is_ok());
     }
 
     /// §5.4 输出多余的视频流必须失败，不许被"挑第一条"吞掉。
@@ -480,7 +509,7 @@ mod tests {
         });
         let source = VideoProbe::parse(root.clone(), 1000).unwrap();
         let output = VideoProbe::parse(root, 1000).unwrap();
-        assert!(validate(&source, &output, &plan(MetadataPolicy::KeepAll))
+        assert!(validate(&source, &output, &plan(MetadataPolicy::KeepAll), None, None)
             .expect_err("多余的视频流必须失败")
             .contains("exactly one video stream"));
     }
@@ -502,7 +531,7 @@ mod tests {
         let source = VideoProbe::parse(root.clone(), 1000).unwrap();
         root["streams"][0]["color_transfer"] = serde_json::json!("smpte2084");
         let relabeled = VideoProbe::parse(root, 1000).unwrap();
-        let error = validate(&source, &relabeled, &plan(MetadataPolicy::KeepAll))
+        let error = validate(&source, &relabeled, &plan(MetadataPolicy::KeepAll), None, None)
             .expect_err("换了色彩标签必须失败");
         assert!(error.contains("changed the source color transfer"), "{error}");
     }
@@ -523,7 +552,7 @@ mod tests {
         let source = VideoProbe::parse(root.clone(), 1000).unwrap();
         root["streams"][0]["color_transfer"] = serde_json::json!("");
         let stripped = VideoProbe::parse(root, 1000).unwrap();
-        assert!(validate(&source, &stripped, &plan(MetadataPolicy::KeepAll))
+        assert!(validate(&source, &stripped, &plan(MetadataPolicy::KeepAll), None, None)
             .expect_err("色彩传递函数被丢了")
             .contains("color transfer"));
     }
@@ -548,7 +577,7 @@ mod tests {
         let mut chapter_leak = source_root.clone();
         chapter_leak["programs"] = serde_json::json!([]);
         let leak = VideoProbe::parse(chapter_leak, 1000).unwrap();
-        assert!(validate(&source, &leak, &plan(MetadataPolicy::StripAll))
+        assert!(validate(&source, &leak, &plan(MetadataPolicy::StripAll), None, None)
             .expect_err("章节没清干净必须失败")
             .contains("chapters"));
         // 流级残留源键 → StripAll 失败（全局键早就扫，这里证的是流作用域）。
@@ -557,7 +586,7 @@ mod tests {
         stream_leak["programs"] = serde_json::json!([]);
         stream_leak["format"]["tags"] = serde_json::json!({});
         let leak = VideoProbe::parse(stream_leak, 1000).unwrap();
-        assert!(validate(&source, &leak, &plan(MetadataPolicy::StripAll))
+        assert!(validate(&source, &leak, &plan(MetadataPolicy::StripAll), None, None)
             .expect_err("流级残留源键必须失败")
             .contains("stream_title"));
         // program 级隐私键 → StripPrivate 失败。
@@ -575,13 +604,95 @@ mod tests {
             "programs": [{"program_id": 1, "tags": {"location": "+37.7-122.4/"}}]
         });
         let private_leak = VideoProbe::parse(program_privacy.clone(), 1000).unwrap();
-        assert!(validate(&source_clean, &private_leak, &plan(MetadataPolicy::StripPrivate))
+        assert!(validate(&source_clean, &private_leak, &plan(MetadataPolicy::StripPrivate), None, None)
             .expect_err("program 级隐私键必须失败")
             .contains("location"));
         // 干净输出放行（消掉 program_privacy 未用告警的写法）。
         program_privacy["programs"] = serde_json::json!([]);
         let clean = VideoProbe::parse(program_privacy, 1000).unwrap();
-        assert!(validate(&source_clean, &clean, &plan(MetadataPolicy::StripPrivate)).is_ok());
+        assert!(validate(&source_clean, &clean, &plan(MetadataPolicy::StripPrivate), None, None).is_ok());
+    }
+
+    /// 审查升级（T13）：附件内容 SHA256 对账必须有真实文件背书 —— probe 只给
+    /// 得出附件名字，给不出字节。需要 ffmpeg/ffprobe，显式运行：
+    /// `cargo test --lib real -- --ignored`
+    // inproc 轨禁用视频（`process` 模块不编译）：本测试依赖 ffmpeg 解包，
+    // 同步按特征门控。
+    #[cfg(not(feature = "inproc-backends"))]
+    #[test]
+    #[ignore = "requires ffmpeg/ffprobe; run explicitly for release validation"]
+    fn real_attachments_content_digests_are_reconciled() {
+        assert!(
+            crate::video::process::tool("ffmpeg").is_ok()
+                && crate::video::process::tool("ffprobe").is_ok(),
+            "需要 ffmpeg/ffprobe"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let attachment = dir.path().join("manual.txt");
+        std::fs::write(&attachment, "Sizqo attachment payload A\n").unwrap();
+        let source = dir.path().join("with-attachment.mkv");
+        let mut cmd = crate::video::process::command("ffmpeg").unwrap();
+        cmd.args([
+                "-hide_banner", "-v", "error", "-nostdin", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10:duration=0.5",
+                "-attach",
+            ])
+            .arg(&attachment)
+            .args(["-metadata:s:t:0", "mimetype=text/plain",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+            .arg(&source);
+        crate::video::process::capture(cmd, std::time::Duration::from_secs(120), 16 * 1024 * 1024)
+            .unwrap();
+        let source_probe = crate::video::probe::probe(&source).unwrap();
+        let source_attachment = source_probe
+            .streams
+            .iter()
+            .find(|s| s.codec_type == "attachment")
+            .expect("夹具必须真的带附件");
+        assert_eq!(source_attachment.tags["filename"], "manual.txt");
+
+        // 同一份文件对同一份文件：内容一致 → Ok。
+        verify_attachments_content(&source_probe, &source_probe, &source, &source)
+            .expect("同一份文件的附件内容指纹必须一致");
+
+        // 同名不同字节：内容对账必须拦下，绝不静默当作通过。
+        let forged = dir.path().join("manual-forged.txt");
+        std::fs::write(&forged, "Sizqo attachment payload FORGED\n").unwrap();
+        let encoded = dir.path().join("forged.mkv");
+        let mut cmd = crate::video::process::command("ffmpeg").unwrap();
+        cmd.args([
+                "-hide_banner", "-v", "error", "-nostdin", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10:duration=0.5",
+                "-attach",
+            ])
+            .arg(&forged)
+            .args(["-metadata:s:t:0", "mimetype=text/plain",
+                "-metadata:s:t:0", "filename=manual.txt",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"])
+            .arg(&encoded);
+        crate::video::process::capture(cmd, std::time::Duration::from_secs(120), 16 * 1024 * 1024)
+            .unwrap();
+        let encoded_probe = crate::video::probe::probe(&encoded).unwrap();
+        assert_eq!(
+            encoded_probe.streams.iter().find(|s| s.codec_type == "attachment").unwrap().tags["filename"],
+            "manual.txt",
+            "名字一致才能把差异逼到内容层"
+        );
+        let error =
+            verify_attachments_content(&source_probe, &encoded_probe, &source, &encoded)
+                .expect_err("同名附件换了字节必须失败");
+        assert!(error.contains("content differs"), "{error}");
+
+        // 名字被换掉（数量相同）：名字对不上时如实报错，不许拿错位当匹配。
+        let mut renamed = source_probe.clone();
+        for s in &mut renamed.streams {
+            if s.codec_type == "attachment" {
+                s.tags["filename"] = serde_json::json!("stolen.txt");
+            }
+        }
+        let error = verify_attachments_content(&source_probe, &renamed, &source, &source)
+            .expect_err("名字换了必须失败");
+        assert!(error.contains("manual.txt"), "{error}");
     }
 }
 
@@ -655,9 +766,99 @@ fn keep_all_chapters_match(source: &VideoProbe, output: &VideoProbe) -> Result<(
     Ok(())
 }
 
-/// KeepAll 的附件对账：数量 + 名字。附件内容指纹需要解包文件才算得出，
-/// ffprobe 不提供；这里如实以名字 + 数量为界，不装作验过内容
-/// （如实记录见 docs/HARDENING_ROADMAP_2026-11.md）。
+/// KeepAll 的附件内容对账（审查升级）：两侧附件按名字配对后，用 ffmpeg
+/// `-dump_attachment` 把每一份附件解包到独立临时目录，逐个算 SHA256 ——
+/// 同名不同字节 = 静默换内容，这里必须拦下。ffprobe 只能给出附件的名字，
+/// 看不到字节，所以这一步无法用 probe 完成；任何一步失败（ffmpeg 不可用、
+/// 解包失败、摘要算不出）都如实返回 Err，绝不静默当作通过。
+/// 名字/数量的匹配已由 `keep_all_attachments_match`（先于本函数）对账。
+#[cfg(not(feature = "inproc-backends"))]
+pub fn verify_attachments_content(
+    source: &VideoProbe,
+    output: &VideoProbe,
+    source_path: &Path,
+    output_path: &Path,
+) -> Result<(), String> {
+    let source_digests = extract_attachment_digests(source, source_path, "source")?;
+    let output_digests = extract_attachment_digests(output, output_path, "encoded output")?;
+    for (name, expected) in &source_digests {
+        let carried = output_digests.get(name).ok_or_else(|| {
+            format!("attachment {name} content could not be verified: the encoded output probe carries no attachment with that name")
+        })?;
+        if carried != expected {
+            return Err(format!(
+                "attachment {name} content differs ({expected} → {carried})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 解包一侧的全部附件并按名字返回内容 SHA256。没有附件时不启动 ffmpeg。
+/// 提取目标名用位置编号而不是附件名：附件名来自源文件内容，可能带路径分隔符。
+#[cfg(not(feature = "inproc-backends"))]
+fn extract_attachment_digests(
+    probe: &VideoProbe,
+    media: &Path,
+    label: &str,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let attachments: Vec<&VideoStream> = probe
+        .streams
+        .iter()
+        .filter(|s| s.codec_type == "attachment")
+        .collect();
+    if attachments.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let dir = tempfile::tempdir().map_err(|e| {
+        format!("{label}: cannot create a temp directory to extract attachments: {e}")
+    })?;
+    let mut digests = std::collections::BTreeMap::new();
+    for (position, stream) in attachments.iter().enumerate() {
+        let name = stream.tags["filename"].as_str().unwrap_or("").to_string();
+        if name.is_empty() {
+            return Err(format!(
+                "{label} attachment stream #{} has no filename tag; its content cannot be verified",
+                stream.index
+            ));
+        }
+        let target = dir.path().join(format!("att-{position}.bin"));
+        // `-dump_attachment` 是**输入侧**逐流选项，必须写在 `-i` 之前（实测：
+        // 写在输入之后根本不生效）；附件流指定符是 `t`（attachment）。
+        // 末尾的 `-c copy -f null -` 只解复用不解码 —— 没有输出目标时 ffmpeg
+        // 以"缺输出文件"错误退出，虽然附件已写出，但退出码不能当证据用。
+        let mut cmd = super::process::command("ffmpeg")
+            .map_err(|e| format!("ffmpeg unavailable while extracting {label} attachments: {e}"))?;
+        cmd.args(["-hide_banner", "-v", "error", "-nostdin", "-y"])
+            .arg(format!("-dump_attachment:t:{position}"))
+            .arg(&target)
+            .arg("-i")
+            .arg(media)
+            .args(["-c", "copy", "-f", "null", "-"]);
+        super::process::capture(cmd, std::time::Duration::from_secs(300), 64 * 1024).map_err(
+            |e| {
+                format!(
+                    "{label} attachment {name} could not be extracted from {}: {e}",
+                    media.display()
+                )
+            },
+        )?;
+        if !target.is_file() {
+            return Err(format!(
+                "{label} attachment {name} was not written by ffmpeg; extraction produced no file"
+            ));
+        }
+        let sha = crate::source_identity::sha256_of(&target).map_err(|e| {
+            format!("{label} attachment {name} digest failed after extraction: {e}")
+        })?;
+        digests.insert(name, sha);
+    }
+    Ok(digests)
+}
+
+/// KeepAll 的附件对账：数量 + 名字（内容指纹由紧随其后的
+/// `verify_attachments_content` 在有媒体路径时补齐 —— 解包文件才算得出，
+/// ffprobe 不提供字节视图）。
 fn keep_all_attachments_match(source: &VideoProbe, output: &VideoProbe) -> Result<(), String> {
     let source_att: Vec<&VideoStream> = source
         .streams

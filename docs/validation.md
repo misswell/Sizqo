@@ -2600,7 +2600,7 @@ macOS 真实媒体矩阵、R3–R5 未实施。本次只发预发布（pre-relea
 
 | 审查项 | 实施 | 证据 |
 | --- | --- | --- |
-| P2-6 EXIF Orientation | Rust：四个 `image::open` 裸解码点改 `ImageReader→into_decoder→orientation()→apply_orientation()` 烘焙；Swift：四点裸解码改 `uprightImage`（WithTransform + MaxPixelSize=max(w,h)），保留 metadata 时方向标签重写为 1 | 代码审阅 + 双侧接线；Orientation 1-8 真机矩阵待 macOS 真实媒体轮补齐（如实记录） |
+| P2-6 EXIF Orientation | ~~rc.11 本节曾误记两侧均已完成~~ 更正（rc.15）：Swift 侧在 rc.11 真实完成（四点裸解码改 `uprightImage`，WithTransform + MaxPixelSize=max(w,h)，保留 metadata 时方向标签重写为 1）；**Rust 侧 rc.11 并未实施**（本轮审查重核发现 engine.rs 仍为裸 `image::open`），rc.15 补齐：`engine.rs` 4 处 + `engine_inproc.rs` 6 处生产解码点统一走 `decode_with_orientation`（`ImageReader→into_decoder→orientation()→apply_orientation` 烘焙） | Rust：`tests/exif_orientation.rs`（APP1 EXIF 拼接夹具，1–8 八方向 + Orientation=6 端到端）；Swift：自检 §48 |
 | P2-7 视频完整性 | probe 增 `nbFrames`（`-count_frames` 实测，仅编码期两侧探测使用）；`validate` 增帧数对账（CFR 用户指定按目标帧率×时长，VFR 按实测帧数）；KeepAll 升级逐项对账（音轨/字幕 codec+语言+标题+disposition、章节起止+标题、附件名+数量） | `plan.rs`/`validation.rs` 单测；附件**内容** SHA 需解包，如实以名字+数量为界（下文"未完成"） |
 | P2-8 StripPrivate 作用域 | `private_keys_in_chapter_or_program_scopes` 一份定义两处共用；章节/program 级隐私键预检直接拒绝（FFmpeg 无法逐键清理这两个作用域，整体清空会违背"保留普通标签"承诺——失败关闭） | `plan.rs` 预检分支 |
 | P2-9 FLAC 预算 | copy/FLAC 预算改源实测音频码率；估不出如实警告"估计值"；`VideoResult` 增 `targetBytes/targetMet/targetDeviation`（serde default），targetSize 超出 5% 判未达成 + 警告；前端状态行呈现偏差与"未达标" | `plan.rs`/`ffmpeg_backend.rs`/`app.js` |
@@ -2684,8 +2684,27 @@ macOS 真实媒体矩阵、R3–R5 未实施。本次只发预发布（pre-relea
 
 ### 仍未完成（如实记录，继续挡正式发布门禁）
 
-- T11（EXIF Orientation 1–8）与 T12–T15 的**真实媒体端到端**用例：需要 macOS 真实媒体矩阵轮（brew ffmpeg + `--ignored` + VideoToolbox 实测）补齐；单测已覆盖逻辑分支。
-- 附件内容 SHA256：ffprobe 不提供附件内容，需 `-dump_attachment` 解包才可对账；本轮如实以"名字+数量"为界。
+### 0.3.6-rc.15（2026-11-08）：Goal 重跑核验——T11/T12/T13/T15/附件 SHA 闭合 + P2-6 Rust 侧补齐
+
+以同一份外部审查报告重跑 Goal：逐项核对 rc.14 后，本轮补齐四个残余缺口。
+
+| 项 | 实施 | 证据 |
+| --- | --- | --- |
+| P2-6 Rust 侧（rc.11 曾漏做，上文已更正） | `engine.rs` 4 处 + `engine_inproc.rs` 6 处生产解码点统一走 `decode_with_orientation`（`ImageReader→into_decoder→orientation()→apply_orientation`），尺寸上限路径同款 | `cargo test --test exif_orientation` |
+| T11 EXIF Orientation 1–8 | APP1 EXIF 拼接夹具（大端段长——首跑实证小端会解成 0x2200）× 8 方向：尺寸/标记像素/分栏位置三重钉住；Orientation=6 端到端（输出 20×32、无 EXIF 标签、像素转正） | `tests/exif_orientation.rs` 2 条全绿 |
+| T11 Swift 侧 | 自检 §48：32×20 分栏 + 2×2 白锚 + APP1 拼接（Orientation=6）→ `compressJPG` 全链路，输出 20×32、无 EXIF、像素逐点断言 | `test_swift_history.sh` 637 ok |
+| T12 VFR 帧数对账（真实端到端） | `setpts` 造 VFR MKV → 全链路 encode → 输出 nb_frames 与源相等 | `t12_real_vfr_frame_count_reconciliation` |
+| T13 KeepAll 多轨（真实端到端） | 2 音轨（aac+ac3，带语言/标题）+ 1 字幕 + 章节 + 附件 → KeepAll encode → 输出逐流/章节/附件对账 + 内容 SHA 显式复核 | `t13_real_keep_all_multi_track_roundtrip` |
+| T15 FLAC targetSize（真实端到端） | 320x240×6s 夹具（首跑实证 2s 小夹具会踩"未变小"跳过门）→ FLAC+targetSize 全链路 → `target_bytes/target_met/target_deviation` 如实回填且与实际偏差一致，未达标警告在场 | `t15_real_flac_target_size_reported_honestly` |
+| 附件内容 SHA256 | `verify_attachments_content`：`-dump_attachment`（输入侧逐流选项，写 `-i` 之后不生效——实测）解包两侧附件 → 逐名 SHA256 对账；`validate()` 增可选路径参数，KeepAll 分支接线；inproc 特征下 `process` 模块不编译，按特征门控（附件对账在该轨不可达） | `real_attachments_content_digests_are_reconciled`（同名换字节必拦、改名必报） |
+
+T14（章节/program 隐私标签）的**清理器语义**由预检拒绝实现（plan.rs，FFmpeg 无法逐键清理这两个作用域），真实章节标签夹具需要 mkv 工具链（mkvmerge 等）——单测以合成 probe 覆盖共享作用域定义，如实记录这一限制。
+
+本机回归读数：`cargo test --lib` 300 passed；`--features inproc-backends` 298；`--no-default-features --features inproc-backends` 298 + 集成全绿；`cargo test --lib real -- --ignored` 6 条全绿（真实 ffmpeg）；`--test exif_orientation` 2 条；前端 29 套 PASS；Swift 自检全绿。
+
+### 仍未完成（继续挡正式发布门禁）
+
+- T14 真实章节标签夹具（需 mkvmerge 等外部工具链）；macOS VideoToolbox 硬编实测。
 - FFmpeg GPL 对应源码与配置义务、许可审查；Direct Windows/Linux 包随包正确架构引擎；签名/公证/装订；验收矩阵全项。门禁未过，本轮仍只发预发布。
 
 ## Release gate (per [AGENTS.md](../AGENTS.md))

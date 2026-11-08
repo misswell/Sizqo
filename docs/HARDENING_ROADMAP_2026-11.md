@@ -156,6 +156,8 @@ rc.9 已完成（勿重复做）：三级无覆盖改名台阶（renamex_np(RENA
 - **P2-15**：`MAX_SINGLE_TASK_BYTES = 4 GiB` 两侧同值，超限任务按
   `resource_limit_exceeded` 明确拒绝；估算未知不拒（"不知道"不是"知道很大"）。
 
-如实记录的未竟项（继续挡发布门禁）：T11 与 T12–T15 的真实媒体端到端用例
-（等 macOS 真实媒体矩阵轮）、附件内容 SHA（需解包）、FFmpeg GPL 对应源码义务、
-Direct Windows/Linux 随包引擎、签名/公证/装订。
+如实记录的未竟项（继续挡发布门禁）：T12–T15 的真实媒体端到端用例、附件内容
+SHA（需解包）、FFmpeg GPL 对应源码义务、Direct Windows/Linux 随包引擎、
+签名/公证/装订。T11 于 rc.15 补齐——Rust 侧在 rc.11 曾漏做（validation.md 已
+更正失实记录），rc.15 以 APP1 EXIF 拼接夹具 1–8 八方向 + Orientation=6 端到端
+闭合（tests/exif_orientation.rs）。
