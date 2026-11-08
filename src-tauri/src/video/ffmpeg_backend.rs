@@ -376,11 +376,24 @@ mod tests {
         String::from_utf8_lossy(&out).trim().split(',').next()?.trim().parse().ok()
     }
     /// T12 的证据工具：视频流全部帧的 pts_time（秒）。
+    ///
+    /// 字段名必须**按 ffprobe 版本回退**：`pts_time` 是 ffmpeg 5.0 才加入帧级
+    /// 输出的名字，4.4 上每帧打印空串（rc.16 CI 实证：ubuntu 的夹具明明带着
+    /// 变间隔，探出来却全是空行）；两个版本都认的是
+    /// `best_effort_timestamp_time`，拿不到再退回 `pts_time`。
     fn frame_pts(media:&Path)->Vec<f64>{
+        let parse=|raw:&[u8]|->Vec<f64>{
+            String::from_utf8_lossy(raw).lines().filter_map(|l|l.trim().trim_end_matches(',').parse::<f64>().ok()).collect()
+        };
+        let mut cmd=super::super::process::command("ffprobe").unwrap();
+        cmd.args(["-v","error","-select_streams","v","-show_entries","frame=best_effort_timestamp_time","-of","csv=p=0"]).arg(media);
+        let out=super::super::process::capture(cmd,Duration::from_secs(300),4*1024*1024).unwrap();
+        let pts=parse(&out);
+        if !pts.is_empty(){return pts;}
         let mut cmd=super::super::process::command("ffprobe").unwrap();
         cmd.args(["-v","error","-select_streams","v","-show_entries","frame=pts_time","-of","csv=p=0"]).arg(media);
         let out=super::super::process::capture(cmd,Duration::from_secs(300),4*1024*1024).unwrap();
-        String::from_utf8_lossy(&out).lines().filter_map(|l|l.trim().trim_end_matches(',').parse::<f64>().ok()).collect()
+        parse(&out)
     }
     /// 夹具把第 60 帧之后的 PTS 翻倍：窗口内必须同时存在 ~1/30s 的均匀间隔
     /// 和 ≥2×（翻倍后）的变间隔 —— 这是"真的 VFR 材料"的直接证据。
@@ -411,14 +424,18 @@ mod tests {
         assert!(!timing.is_empty(),"这台 ffmpeg 既不认 -fps_mode 也不认 -vsync：时间轴语义无法保证");
         // setpts 把第 60 帧之后的 PTS 翻倍：前 2 秒均匀 30fps，之后间隔 66.7ms，
         // 帧数不变（120）—— 真正的 VFR 材料，不是丢帧。
+        // （rc.16 CI 的失败根本原因不在夹具：ubuntu 4.4 的 ffprobe 帧级字段名
+        // 是 best_effort_timestamp_time，pts_time 是 5.0 才有——探出来全是空行；
+        // frame_pts 现已按版本回退。本机 Docker ubuntu:22.04 实证 4.4.2 的
+        // best_effort 输出 1.967→4.000 的翻倍间隔。concat demuxer 方案实测会把
+        // 第二段时间戳被 muxer 钳制成一点，弃用。）
         let vfr=make_fixture(root,"vfr-source.mkv",&[
             "-f","lavfi","-i","testsrc2=duration=4:size=160x120:rate=30",
-            // 转义逗号而非单引号包裹：filtergraph 的标准转义写法，老版本 ffmpeg
-// （ubuntu 22.04 的 4.4）同样成立——rc.15 首跑在 CI 上实证过引号路径不稳。
             "-vf","setpts=if(gt(N\\,59)\\,PTS*2\\,PTS)",timing.as_str(),"vfr",
             "-c:v","libx264","-preset","ultrafast","-pix_fmt","yuv420p"]);
         let source_pts=frame_pts(&vfr);
-        assert!(pts_holds_a_doubled_gap(&source_pts),"夹具时间戳必须真的有变间隔（前 70 帧内同时存在 ~33ms 与 ≥67ms 间隔）");
+        assert!(pts_holds_a_doubled_gap(&source_pts),"夹具时间戳必须真的有变间隔（前 70 帧内同时存在 ~33ms 与 ≥67ms 间隔; 实际前 12 个 {:?}）",
+            source_pts.iter().take(12).collect::<Vec<_>>());
         let options=VideoOptions{encoder:"libx264".into(),mode:"crf".into(),crf:Some(23.0),preset:"veryfast".into(),audio_policy:"none".into(),metadata_policy:"preserve".into(),container:"mkv".into(),threads:2,..Default::default()};
         let result=encode_full_chain(root,&vfr,&options);
         assert!(result.success,"VFR passthrough 编码必须提交成功: {:?}",result.reason);
@@ -475,7 +492,8 @@ mod tests {
         assert_eq!(ac3.codec_name,"ac3","夹具第二音轨必须是 ac3");
         assert_eq!(ac3.tags["language"],"jpn");
         assert_eq!(ac3.tags["title"],"Secondary");
-        assert_eq!(source_probe.streams.iter().find(|s|s.codec_type=="attachment").unwrap().tags["filename"],"credits.txt");
+        // Windows 上 ffmpeg 存的是完整路径（rc.15 首跑实证）：按 basename 归一比对。
+        assert!(crate::video::validation::attachment_base_name(source_probe.streams.iter().find(|s|s.codec_type=="attachment").unwrap().tags["filename"].as_str().unwrap_or(""))=="credits.txt","附件名字丢了");
 
         let options=VideoOptions{encoder:"libx264".into(),mode:"crf".into(),crf:Some(23.0),preset:"veryfast".into(),audio_policy:"copy".into(),subtitle_policy:"copy".into(),metadata_policy:"preserve".into(),container:"mkv".into(),threads:2,..Default::default()};
         let result=encode_full_chain(root,&multi,&options);

@@ -862,7 +862,7 @@ fn extract_attachment_digests(
 /// 附件名字归一：Windows 上 ffmpeg/ffprobe 会把**完整路径**存进 filename 标签
 /// （反斜杠分隔符不被 ffmpeg 当作目录分隔裁剪——rc.15 首跑 CI 实证），
 /// 名字/内容对账必须按 basename 归一，两种分隔符都裁。
-fn attachment_base_name(tag: &str) -> &str {
+pub(crate) fn attachment_base_name(tag: &str) -> &str {
     tag.rsplit(['/', '\\']).next().unwrap_or(tag)
 }
 

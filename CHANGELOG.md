@@ -3,10 +3,11 @@
 Sizqo's versioning starts at 0.1.0. This file records user-visible changes;
 engineering rules live in [AGENTS.md](AGENTS.md).
 
-## 0.3.6-rc.16 — Goal 复核轮（预发布，2026-11-08）
+## 0.3.6-rc.17 — Goal 复核轮（预发布，2026-11-09）
 
-（rc.15 与 rc.16 同属一轮：rc.16 补两处 CI 实证的平台差异——Windows 附件名
-按 basename 归一、VFR 夹具 setpts 改标准转义；rc.15 的 Tests 有这两项红。）
+（rc.15/16/17 同属一轮：rc.16 补 Windows 附件名 basename 归一；rc.17 补真正的
+跨版本修复——ubuntu 4.4 的 ffprobe 帧级时间戳字段是 `best_effort_timestamp_time`，
+`pts_time` 在 4.4 上为空，T12 探测按版本回退；4.4.2 行为经 Docker 实证。）
 
 - 修正记录：0.3.6-rc.11 的发布说明曾把"EXIF 方向烘焙（Rust 侧）"记为已完成，
   实际当时只完成了 Swift 侧——本轮重核发现并如实更正，Rust 侧补齐

@@ -2706,7 +2706,7 @@ rc.15 CI 首跑再抓两处平台差异，当轮修复随 rc.16 落地（rc.15 t
 2. **Ubuntu（ffmpeg 4.4）VFR 夹具的 setpts 单引号包裹不稳**——改为 filtergraph
    标准转义写法 `setpts=if(gt(N\,59)\,PTS*2\,PTS)`。
 
-本机回归读数：`cargo test --lib` 300 passed；`--features inproc-backends` 298；`--no-default-features --features inproc-backends` 298 + 集成全绿；`cargo test --lib real -- --ignored` 6 条全绿（真实 ffmpeg）；`--test exif_orientation` 2 条；前端 29 套 PASS；Swift 自检全绿。
+本机回归读数（rc.17 终态）：`cargo test --lib` 300 passed；`--features inproc-backends` 298；`--no-default-features --features inproc-backends` 298 + 集成全绿；`cargo test --lib real -- --ignored` 6 条全绿（真实 ffmpeg，本机 7.x；4.4.2 行为经 Docker 实证）；`--test exif_orientation` 2 条；前端 29 套 PASS；Swift 自检全绿（637 ok）。
 
 ### 仍未完成（继续挡正式发布门禁）
 
