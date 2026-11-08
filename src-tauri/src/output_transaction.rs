@@ -835,7 +835,7 @@ pub fn publish_replace_if_identity_matches(
             // §28 审查修复（P1-4）：没有原子交换≠只能"看一眼指纹再 rename"。
             // 那条路既留着复核与改名之间的窗口，又允许 rename 盖掉窗口里
             // 外部新放的文件 —— 换成隔离改名 + 不覆盖占名。
-            return publish_replace_via_quarantine(staged, target, expected);
+            return publish_replace_via_quarantine(staged, target, expected, expected_candidate_sha256);
         }
         Err(error) => {
             return Err(SwapPublishError {
@@ -1330,6 +1330,7 @@ fn publish_via_quarantine(
     target: &Path,
     verify: impl Fn(&Path) -> Option<String>,
     expected_candidate_sha256: Option<&str>,
+    retain_swapped_out: bool,
 ) -> Result<SwapPublishOutcome, SwapPublishError> {
     let refused = |detail: String| SwapPublishError {
         swapped: false,
@@ -1409,24 +1410,34 @@ fn publish_via_quarantine(
         });
     }
 
-    // 覆盖已经成立：隔离名上的就是被换出的原图（刚复验过，备份里还有一份可信副本）。
-    // 本轮加固（P1-3）起不再删除 —— 这份字节就是事务管理的保留文件，路径交给调用方
-    // 记进历史、由用户明确清理。
+    // 覆盖已经成立。被换出的字节按调用方语义处置（本轮加固 P1-3）：
+    // - 用户原图（同格式覆盖）→ 保留成事务管理的保留文件，路径交给调用方记进历史、
+    //   由用户明确清理 —— 不再无条件删除；
+    // - 我们自己的 0 字节占位（跨格式/新建输出的占位凭证路线）→ 照旧删除，
+    //   那不是用户的字节，保留只会往用户目录里丢孤儿。
+    if retain_swapped_out {
+        return Ok(SwapPublishOutcome {
+            swapped_out_retained_at: Some(quarantine.path),
+        });
+    }
+    if let Err(error) = fs::remove_file(&quarantine.path) {
+        log::warn!("提交后占位清理失败（已无内容，交由调用方处置）: {error}");
+    }
     Ok(SwapPublishOutcome {
-        swapped_out_retained_at: Some(quarantine.path),
+        swapped_out_retained_at: None,
     })
 }
 
 /// 同格式覆盖的隔离路线：验的是**内容指纹**。
+/// `expected_candidate_sha256` 必须是调用方记账的产物凭证 —— 在这里按"当前
+/// staged 内容"现算等于给篡改过的候选重发凭证（T02 的教训），绝不允许。
 fn publish_replace_via_quarantine(
     staged: &Path,
     target: &Path,
     expected: &crate::source_identity::SourceIdentity,
+    expected_candidate_sha256: Option<&str>,
 ) -> Result<SwapPublishOutcome, SwapPublishError> {
     use crate::source_identity::SourceCheck;
-    // 隔离路线没有 StagedOutput 在手（入口是裸路径），候选指纹在这里补一遍：
-    // 交换前的 staged 内容就是即将落进目标位的内容。
-    let candidate_sha256 = crate::source_identity::sha256_of(staged).ok();
     publish_via_quarantine(
         staged,
         target,
@@ -1436,7 +1447,8 @@ fn publish_replace_via_quarantine(
             }
             SourceCheck::Unchanged => None,
         },
-        candidate_sha256.as_deref(),
+        expected_candidate_sha256,
+        true,
     )
 }
 
@@ -1461,6 +1473,9 @@ fn publish_claimed_via_quarantine(
             }
         },
         candidate_sha256.as_deref(),
+        // 被换出的是我们自己的 0 字节占位，不是用户字节：照旧清理（T 的跨平台
+        // 回归在 Windows 上抓到过把它当成保留文件留下的孤儿）。
+        false,
     )
     .map(|_| ())
     .map_err(|error| error.detail)
@@ -3529,8 +3544,13 @@ mod tests {
         fs::write(&staged, b"compressed-bytes").unwrap();
         let baseline = crate::source_identity::SourceIdentity::read_with_hash(&target).unwrap();
 
-        let outcome = publish_replace_via_quarantine(&staged, &target, &baseline)
-            .expect("身份一致时隔离改名发布必须成立");
+        let outcome = publish_replace_via_quarantine(
+            &staged,
+            &target,
+            &baseline,
+            Some(crate::source_identity::sha256_bytes(b"compressed-bytes").as_str()),
+        )
+        .expect("身份一致时隔离改名发布必须成立");
         assert_eq!(fs::read(&target).unwrap(), b"compressed-bytes");
         assert!(!staged.exists(), "候选的名字已改名进目标位");
         // 本轮加固（P1-3）：被换出的原图保留在隔离名上，路径随 outcome 交给历史。
@@ -3551,8 +3571,13 @@ mod tests {
         let stale = crate::source_identity::SourceIdentity::read_with_hash(&target).unwrap();
         fs::write(&target, b"external-new").unwrap();
 
-        let error = publish_replace_via_quarantine(&staged, &target, &stale)
-            .expect_err("基线不匹配必须拒绝提交");
+        let error = publish_replace_via_quarantine(
+            &staged,
+            &target,
+            &stale,
+            Some(crate::source_identity::sha256_bytes(b"compressed-bytes").as_str()),
+        )
+        .expect_err("基线不匹配必须拒绝提交");
         assert!(!error.swapped, "拒绝的现场里覆盖没有发生");
         assert_eq!(
             fs::read(&target).unwrap(),
@@ -3575,7 +3600,12 @@ mod tests {
         let baseline = crate::source_identity::SourceIdentity::read_with_hash(&target).unwrap();
 
         set_fault_in_install_window(1);
-        let outcome = publish_replace_via_quarantine(&staged, &target, &baseline);
+        let outcome = publish_replace_via_quarantine(
+            &staged,
+            &target,
+            &baseline,
+            Some(crate::source_identity::sha256_bytes(b"compressed-bytes").as_str()),
+        );
         set_fault_in_install_window(0);
 
         let error = outcome.expect_err("原位被外部占了必须拒绝提交");
@@ -3884,13 +3914,23 @@ mod tests {
         fs::remove_file(&foreign_path).unwrap();
         fs::write(&foreign_path, b"foreign-bytes-here").unwrap();
 
-        // 写入走的是我们自己持有的句柄；目录项已经被外部 unlink，unix 上写入前
-        // 的 nlink 检查让这次发布注定失败 —— 快速失败并说明，绝不把候选字节
-        // 写到路径上的外部文件里。
-        let write_error = staged
-            .write_synced(b"our-candidate-bytes")
-            .expect_err("目录项已消失：发布注定失败，必须提前拒绝");
-        assert!(write_error.contains("移除"), "{write_error}");
+        // 写入走的是我们自己持有的句柄。unix 上目录项已被 unlink，写入前的
+        // nlink 检查让发布注定失败 —— 快速失败并说明；Windows 没有这套
+        // nlink 语义（外部"删除+同名重建"在句柄存续期间本就抢不走名字），
+        // 写入进入被标记删除的孤儿句柄，同样不经过路径上的外部文件。
+        #[cfg(unix)]
+        {
+            let write_error = staged
+                .write_synced(b"our-candidate-bytes")
+                .expect_err("目录项已消失：发布注定失败，必须提前拒绝");
+            assert!(write_error.contains("移除"), "{write_error}");
+        }
+        #[cfg(not(unix))]
+        {
+            staged
+                .write_synced(b"our-candidate-bytes")
+                .expect("Windows：写入进入孤儿句柄，不经过路径上的外部文件");
+        }
         // 路径上的字节还是外部的：句柄写入没有经过路径。
         assert_eq!(fs::read(&foreign_path).unwrap(), b"foreign-bytes-here");
 
@@ -3928,10 +3968,31 @@ mod tests {
             Some(crate::source_identity::sha256_bytes(b"our-output").as_str()),
         )
         .expect_err("候选指纹对不上必须撤销提交");
-        assert!(!error.swapped, "换回成功 = 目标位没有被污染");
-        assert_eq!(fs::read(&target).unwrap(), b"true-original", "原图原样");
-        assert_eq!(fs::read(&staged).unwrap(), b"tampered!!!!",
-            "换回后改写过的候选字节停在原位，绝不当垃圾清掉");
+        assert!(!error.swapped, "目标位没有被污染成提交成功");
+        #[cfg(unix)]
+        {
+            // 有原子交换：候选换回临时路径，原图回到目标位。
+            assert_eq!(fs::read(&target).unwrap(), b"true-original", "原图原样");
+            assert_eq!(fs::read(&staged).unwrap(), b"tampered!!!!",
+                "换回后改写过的候选字节停在原位，绝不当垃圾清掉");
+        }
+        #[cfg(not(unix))]
+        {
+            // 没有原子交换（Windows）：绝不覆盖证明不了归属的目标位内容 ——
+            // 原图字节必须仍活在磁盘上（保留文件），改写过的候选留在目标位，
+            // 错误实话实说。原始字节一个都不许丢。
+            assert!(error.detail.contains("指纹") || error.detail.contains("对不上"), "{error:?}");
+            assert!(
+                holds(dir.path(), b"true-original"),
+                "原图字节必须活在磁盘上: {:?}",
+                bytes_on_disk(dir.path())
+            );
+            assert!(
+                holds(dir.path(), b"tampered!!!!"),
+                "改写过的候选也不许被悄悄清掉: {:?}",
+                bytes_on_disk(dir.path())
+            );
+        }
     }
 
     /// T03：输出占位 unlink 后 inode 复用 → release/归属门绝不认领外部文件。

@@ -168,21 +168,23 @@ pub fn commit(source:&Path,partial:&Path,target:&Path,o:&VideoOptions,probe:&Vid
 #[cfg(test)]mod tests{use super::*;
     /// T17（本轮加固 P2-12）：编码期间输出名被外部抢占 → 换下一个候选名发布，
     /// partial 复用不重新编码，外部文件分文不动，实际路径写进历史与结果。
+    /// 现场按跨平台语义构造：计划位被外部内容占住、占位凭证失效（claimed=None，
+    /// 等价于"认领已被偷换"）。Windows 上持有句柄的占位本就抢不走名字 ——
+    /// 那正是句柄占名的意义；unix 的真实偷换路径由 t03 覆盖。
     #[test]fn an_output_name_stolen_during_encoding_moves_to_the_next_candidate(){
         let dir=tempfile::tempdir().unwrap();
         let source=dir.path().join("clip.mp4");fs::write(&source,b"source-bytes").unwrap();
         let o=VideoOptions::default();
-        let mut claimed=claim_output(&source,&o,&[],None).unwrap().unwrap();
-        let planned=claimed.path().to_path_buf();
-        // 外部在长编码期间抢占计划位：删我们的占位、放自己的文件。
-        fs::remove_file(&planned).unwrap();fs::write(&planned,b"external-file").unwrap();
+        let planned=dir.path().join("clip_compressed.mp4");
+        // 外部在长编码期间把计划位占住。
+        fs::write(&planned,b"external-file").unwrap();
         let partial=dir.path().join("partial.mp4");fs::write(&partial,b"encoded-output-bytes").unwrap();
         let history=HistoryStore::new(dir.path().join("history")).unwrap();
         let transactions=TransactionStore::new(dir.path().join("transactions"));
         let identity=SourceIdentity::read(&source).unwrap();
         let probe=VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":16,"height":16,"codec_name":"h264","pix_fmt":"yuv420p","avg_frame_rate":"30/1"}],"format":{"duration":"10","format_name":"mp4"}}),13).unwrap();
         let mut result=VideoResult::pending("t1",&source,&o);
-        let mut claimed_slot=Some(claimed);
+        let mut claimed_slot=None;
         commit(&source,&partial,&planned,&o,&probe,&mut result,&history,&transactions,3,&identity,None,&mut claimed_slot).unwrap();
         // 计划位上的外部文件分文不动。
         assert_eq!(fs::read(&planned).unwrap(),b"external-file");
@@ -191,6 +193,25 @@ pub fn commit(source:&Path,partial:&Path,target:&Path,o:&VideoOptions,probe:&Vid
         assert_eq!(fs::read(&next).unwrap(),b"encoded-output-bytes");
         assert_eq!(result.output_path.as_deref(),Some(next.to_string_lossy().as_ref()));
         assert!(history.list().iter().any(|e|e.output_path.as_deref()==Some(next.to_string_lossy().as_ref())),"实际输出路径必须写进历史");
+    }
+
+    /// 认领仍然有效时的默认路径：commit 收回仍属于我们的占位，产物落在计划位。
+    #[test]fn an_intact_claim_is_released_and_the_product_lands_on_the_planned_slot(){
+        let dir=tempfile::tempdir().unwrap();
+        let source=dir.path().join("clip.mp4");fs::write(&source,b"source-bytes").unwrap();
+        let o=VideoOptions::default();
+        let mut claimed=claim_output(&source,&o,&[],None).unwrap().unwrap();
+        let planned=claimed.path().to_path_buf();
+        let partial=dir.path().join("partial.mp4");fs::write(&partial,b"encoded-output-bytes").unwrap();
+        let history=HistoryStore::new(dir.path().join("history")).unwrap();
+        let transactions=TransactionStore::new(dir.path().join("transactions"));
+        let identity=SourceIdentity::read(&source).unwrap();
+        let probe=VideoProbe::parse(serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":16,"height":16,"codec_name":"h264","pix_fmt":"yuv420p","avg_frame_rate":"30/1"}],"format":{"duration":"10","format_name":"mp4"}}),13).unwrap();
+        let mut result=VideoResult::pending("t1",&source,&o);
+        let mut claimed_slot=Some(claimed);
+        commit(&source,&partial,&planned,&o,&probe,&mut result,&history,&transactions,3,&identity,None,&mut claimed_slot).unwrap();
+        assert_eq!(fs::read(&planned).unwrap(),b"encoded-output-bytes");
+        assert_eq!(result.output_path.as_deref(),Some(planned.to_string_lossy().as_ref()));
     }
     #[test]fn suffix_conflicts_never_claim_source(){let d=tempfile::tempdir().unwrap();let s=d.path().join("clip.mp4");fs::write(&s,b"source").unwrap();fs::write(d.path().join("clip_compressed.mp4"),b"existing").unwrap();let p=destination(&s,&VideoOptions::default(),&[],None).unwrap();assert_eq!(p.file_name().unwrap(),"clip_compressed_1.mp4");assert_eq!(fs::read(s).unwrap(),b"source");}
     #[test]fn source_identity_detects_changes(){let d=tempfile::tempdir().unwrap();let s=d.path().join("clip");fs::write(&s,b"original").unwrap();let id=SourceIdentity::read(&s).unwrap();fs::write(&s,b"changed and longer").unwrap();assert_ne!(id,SourceIdentity::read(&s).unwrap());}

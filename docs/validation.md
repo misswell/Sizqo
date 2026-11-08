@@ -2630,7 +2630,7 @@ macOS 真实媒体矩阵、R3–R5 未实施。本次只发预发布（pre-relea
 
 | 命令 | 读数 |
 | --- | --- |
-| `cargo test --lib` | 299 passed / 0 failed（新增 T01/T02/T03/T05/T17/T18/T19/T20/T22 + 更新 4 条旧政策断言） |
+| `cargo test --lib` | 300 passed / 0 failed（新增 T01/T02/T03/T05/T17/T18/T19/T20/T22 + 更新 4 条旧政策断言；Windows CI 首轮抓到 4 处平台差异后按平台语义修复，见下） |
 | `cargo test --lib --features inproc-backends` | 297 passed / 0 failed |
 | `cargo test --no-default-features --features inproc-backends` | 全绿（crash_injection 3 处同步新签名） |
 | `cargo test --test dual_instance` | 双进程竞争全绿 |
@@ -2645,6 +2645,21 @@ macOS 真实媒体矩阵、R3–R5 未实施。本次只发预发布（pre-relea
 - `AppState.swift` + 新文件 `ViewModels/CancelBox.swift`：提交段原子登记（defer 解除）、占位凭证从句柄取、取消被拒如实提示、removed 行带产物结果恢复显示、硬上限前置拒绝。
 - `CompressionEngine.swift`：多帧统一检测 + 方向烘焙替换四处裸解码。
 - `HistoryStore.swift`：3 处 `StagedTemp.claim` 调用点同步（内核整份复制路径，句柄使命到认领为止）。
+
+### Windows CI 首轮抓到的 4 处平台差异（rc.11 tag 后立即修复，随 rc.12）
+
+1. `publish_claimed_via_quarantine`（无原子交换平台的占位凭证路线）被统一接到
+   "保留换出字节"的尾巴上——被换出的是**我们自己的 0 字节占位**，不是用户字节，
+   保留会在用户目录里丢孤儿。改为按调用方语义处置：原图保留、占位照旧清理。
+2. `publish_replace_via_quarantine` 在隔离路线里按"当前 staged 内容"现算候选指纹
+   ——等于给篡改过的候选重发凭证（T02 在 Windows 上实证）。改为必须传调用方
+   记账的凭证。
+3. T01/T02 的断言按平台语义分开写：unix 有 nlink 快速失败与原子换回；Windows
+   无原子交换时"换回"不可用，原图字节必须经保留文件活在磁盘上，绝不为换回
+   而覆盖证明不了归属的内容。
+4. T17 改为跨平台现场（占位凭证失效 + 计划位被外部占住 → 换号重试），另加
+   "认领完好 → 产物落计划位"的正向用例；Windows 上持有句柄的占位本就抢不走
+   名字，真实偷换路径由 T03 覆盖。
 
 ### 行为变化（有意，均如实呈现）
 
