@@ -3,7 +3,15 @@ use std::{collections::{HashMap,HashSet},path::{Path,PathBuf},sync::{Arc,Mutex,a
 use serde::{Serialize,Deserialize};
 use tauri::{AppHandle,State,Manager,Emitter};
 use crate::{commands::{AppState,AcquireOutcome},video::{self,VideoOptions,VideoResult,probe::VideoProbe,progress::VideoProgress}};
-#[derive(Default)]pub struct VideoRuntime {pub cancellations:Mutex<HashMap<(String,String),Arc<AtomicBool>>>}
+#[derive(Default)]pub struct VideoRuntime {pub cancellations:Mutex<HashMap<(String,String),VideoCancelEntry>>}
+/// 一个在册视频任务的取消凭证：令牌管「停掉正在跑的子进程」，规范路径是
+/// 取消/提交竞争账本（`TaskLedger`）的 key —— 两样合在一处，取消命令才能
+/// 同时覆盖"编码中"与"提交中"两种现场（TX-04）。
+pub struct VideoCancelEntry{pub token:Arc<AtomicBool>,pub source:String}
+/// 取消视频任务的结果。`accepted=false && committing=true` = 任务已进入
+/// 原子提交段，取消被拒绝 —— 前端必须如实告知"正在提交"，不能显示成已取消。
+#[derive(Serialize)]#[serde(rename_all="camelCase")]
+pub struct VideoCancelOutcome{pub accepted:bool,pub committing:bool}
 #[derive(Debug,Clone,Deserialize)]#[serde(rename_all="camelCase")]
 pub struct VideoTask {
     pub task_id:String,pub path:String,
@@ -22,13 +30,22 @@ pub struct ImportedMedia {path:String,name:String,size:u64,media_kind:String,vid
 #[derive(Serialize,Default,Debug)]#[serde(rename_all="camelCase")]
 pub struct ImportReport {
     pub scanned:usize,
+    /// PERF-6.1：目录与文件分开统计 —— 旧版把"扫过的目录"算进 unsupported。
+    pub directories:usize,
     pub imported:usize,
+    /// 分类计数：前端不必再拿 scanned 减法猜各了多少。
+    pub images:usize,
+    pub videos:usize,
     pub skipped:usize,
+    /// 真正的"既不是图片也没有媒体特征"的文件数（不再用 scanned-imported 减法）。
     pub unsupported:usize,
+    /// seen 去重丢掉的重复路径 —— 静默去重从此有账。
+    pub duplicates:usize,
     pub permission_denied:usize,
     pub canonicalize_failed:usize,
     pub read_directory_failed:usize,
     pub probe_failed:usize,
+    /// 列举之后、处理之前就消失的文件（metadata 读不出的替身）。
     pub disappeared:usize,
 }
 #[derive(Serialize)]#[serde(rename_all="camelCase")]
@@ -49,13 +66,13 @@ fn collect(root:&Path,path:&Path,seen:&mut HashSet<PathBuf>,out:&mut Vec<(PathBu
     // 会让"明明是子路径"的两个字符串对不上，相对路径就退化成文件名。
     let Ok(root)=root.canonicalize()else{report.canonicalize_failed+=1;return};
     let Ok(real)=path.canonicalize()else{report.canonicalize_failed+=1;report.disappeared+=1;return};
-    if !seen.insert(real.clone()){return;}
+    if !seen.insert(real.clone()){report.duplicates+=1;return;}
     // §8.1 默认不跟随指向根目录之外的符号链接：软链指去别的盘/别的目录时，
     // 导入的就成了链接目标而不是用户点开的那份树。目录循环本身由 seen 集合
     // （规范路径去重）兜住，这里再补一道"不许越界"。
     if real.starts_with(&root)==false {report.skipped+=1;return;}
     if real.is_dir(){
-        report.scanned+=1;
+        report.scanned+=1;report.directories+=1;
         match std::fs::read_dir(&real){
             Ok(children)=>{
                 let mut children:Vec<_>=children.flatten().map(|e|e.path()).collect();
@@ -117,13 +134,14 @@ pub async fn probe_media(paths:Vec<String>,state:State<'_,AppState>)->Result<Imp
         let mut slots:Vec<Option<ImportedMedia>>=Vec::with_capacity(files.len());
         let mut candidates:Vec<Candidate>=vec![];
         for (index,(path,root,relative)) in files.iter().enumerate(){
-            let size=std::fs::metadata(path).map(|m|m.len()).unwrap_or(0);
+            // PERF-6.1：列举之后消失的文件不再伪装成 size=0 照常入队。
+            let Ok(size)=std::fs::metadata(path).map(|m|m.len()) else {report.disappeared+=1;continue;};
             let name=path.file_name().unwrap_or_default().to_string_lossy().into_owned();
             let source_root=root.to_string_lossy().into_owned();
             let relative=relative.to_string_lossy().into_owned();
-            if image_header(path){slots.push(Some(ImportedMedia{path:path.to_string_lossy().into(),name,size,media_kind:"image".into(),video_probe:None,warning:None,source_root,relative_path:relative}));}
+            if image_header(path){report.images+=1;slots.push(Some(ImportedMedia{path:path.to_string_lossy().into(),name,size,media_kind:"image".into(),video_probe:None,warning:None,source_root,relative_path:relative}));}
             else if probe_candidate(path){slots.push(None);candidates.push(Candidate{index,path:path.clone(),name,source_root,relative,size});}
-            else{slots.push(None);}
+            else{report.unsupported+=1;slots.push(None);}
         }
         let workers=std::thread::available_parallelism().map(|n|n.get()).unwrap_or(2).min(4).max(1);
         if candidates.len()>1&&workers>1{
@@ -160,8 +178,10 @@ pub async fn probe_media(paths:Vec<String>,state:State<'_,AppState>)->Result<Imp
         // 实际导入结果，"看起来全进来了"必须由后端的数字背书。
         let media:Vec<ImportedMedia>=slots.into_iter().flatten().collect();
         report.imported=media.len();
+        report.videos=media.iter().filter(|m|m.media_kind=="video").count();
         report.probe_failed=media.iter().filter(|m|m.media_kind=="video"&&m.video_probe.is_none()).count();
-        report.unsupported=report.scanned.saturating_sub(files.len());
+        // 注意：report.unsupported 在分类循环里逐个记账；扫描层（collect）的
+        // skipped/canonicalize_failed/permission_denied 等都各有自己的计数。
         Ok::<_,String>(ImportedMediaBatch{media,report})
     }).await.map_err(|e|e.to_string())?
 }
@@ -240,9 +260,18 @@ pub fn save_video_preset(name:String,options:VideoOptions,app:AppHandle)->Result
     if entries.len()>=100&&!entries.contains_key(&name){return Err("Preset limit reached".into());}entries.insert(name,options);crate::history::write_atomic(&path,&serde_json::to_vec_pretty(&entries).map_err(|e|e.to_string())?)
 }
 #[tauri::command]
-pub fn cancel_video_task(task_id:String,session_id:String,app:AppHandle,state:State<'_,AppState>)->bool{
+pub fn cancel_video_task(task_id:String,session_id:String,app:AppHandle,state:State<'_,AppState>)->VideoCancelOutcome{
     let runtime=app.state::<VideoRuntime>();let tokens=runtime.cancellations.lock().unwrap();
-    if let Some(token)=tokens.get(&(session_id,task_id)){token.store(true,Ordering::Release);state.compression.wake_waiters();true}else{false}
+    let Some(entry)=tokens.get(&(session_id,task_id)) else {return VideoCancelOutcome{accepted:false,committing:false}};
+    // TX-04：取消与提交竞争同一本账（图片线 TaskLedger 同款）。
+    // 提交段内的取消被拒绝 —— 赢了才置位令牌去停子进程。
+    let (accepted,committing)={
+        let mut ledger=state.task_ledger.lock().unwrap();
+        let accepted=ledger.request_cancel(&entry.source);
+        (accepted,!accepted&&ledger.is_committing(&entry.source))
+    };
+    if accepted{entry.token.store(true,Ordering::Release);state.compression.wake_waiters();}
+    VideoCancelOutcome{accepted,committing}
 }
 async fn video_batch(app:&AppHandle,state:&AppState,tasks:Vec<VideoTask>,options:VideoOptions,session:String,revision:u64,roots:Vec<String>)->Result<Vec<VideoResult>,String>{
     // 任何早退（canonicalize 失败、能力获取失败、app_data_dir 失败……）都不许把
@@ -281,14 +310,17 @@ async fn video_batch_inner(app:&AppHandle,state:&AppState,tasks:Vec<VideoTask>,o
     let (ready,mut results)=resolve_video_tasks(tasks,&options);
     let mut tokens=vec![];
     for (task,path) in ready{let token=Arc::new(AtomicBool::new(false));
-        runtime.cancellations.lock().unwrap().insert((session.to_string(),task.task_id.clone()),token.clone());tokens.push((task,path,token));}
+        // 取消/提交账本的 key 与提交门用的是同一个规范路径（TX-04）。
+        let source=path.to_string_lossy().into_owned();
+        runtime.cancellations.lock().unwrap().insert((session.to_string(),task.task_id.clone()),VideoCancelEntry{token:token.clone(),source:source.clone()});
+        tokens.push((task,path,token,source));}
     // 就地失败的条目当场把终态播出去：前端不必等会话返回就能落定这一行。
     for result in &results{let mut event=VideoProgress::new(&result.task_id,session,revision,"failed");event.result=Some(result.clone());let _=app.emit("video-progress",event);}
     let caps=get_video_capabilities().await?;
-    for (task,path,cancel) in tokens {
+    for (task,path,cancel,source) in tokens {
         let emit=|event|{let _=app.emit("video-progress",event);};
         emit(VideoProgress::new(&task.task_id,session,revision,"queued"));
-        let permit=match state.compression.acquire(||cancel.load(Ordering::Acquire)||state.task_ledger.lock().unwrap().is_cancelled(&task.path)).await{
+        let permit=match state.compression.acquire(||cancel.load(Ordering::Acquire)||state.task_ledger.lock().unwrap().is_cancelled(&source)).await{
             AcquireOutcome::Acquired(p)=>p,
             AcquireOutcome::Stopped=>{emit(VideoProgress::new(&task.task_id,session,revision,"deferred"));runtime.cancellations.lock().unwrap().remove(&(session.to_string(),task.task_id.clone()));continue;},
             AcquireOutcome::Cancelled=>{emit(VideoProgress::new(&task.task_id,session,revision,"cancelled"));runtime.cancellations.lock().unwrap().remove(&(session.to_string(),task.task_id.clone()));continue;},
@@ -303,6 +335,7 @@ async fn video_batch_inner(app:&AppHandle,state:&AppState,tasks:Vec<VideoTask>,o
             let roots_for_task:Vec<String>=task.source_root.clone().filter(|r|!r.is_empty()).map(|r|vec![r]).unwrap_or_else(||roots.clone());
             let relative_for_task:Option<String>=task.relative_path.clone().filter(|r|!r.is_empty());
             let app=app.clone();let task_id=task.task_id.clone();let access=state.access.clone();
+            let commit_gate=Some(state.task_ledger.clone());let gate_source=source.clone();
             tauri::async_runtime::spawn_blocking(move||{
                 // 守卫拿不到授权就立刻失败：把拒绝前置，而不是让 ffmpeg 在半路
                 // 以 IO 错误的姿势撞上沙盒（AGENTS 规则 12：守卫必须覆盖编码全程）。
@@ -317,7 +350,7 @@ async fn video_batch_inner(app:&AppHandle,state:&AppState,tasks:Vec<VideoTask>,o
                         return r;
                     }
                 };
-                video::ffmpeg_backend::encode(&task_id,&path,&options,&caps,&session,revision,&roots_for_task,relative_for_task.as_deref(),&history,&transactions,retention,budget,&logs,cancel,&|event|{let _=app.emit("video-progress",event);})
+                video::ffmpeg_backend::encode(&task_id,&path,&options,&caps,&session,revision,&roots_for_task,relative_for_task.as_deref(),&history,&transactions,retention,budget,&logs,cancel,commit_gate,&gate_source,&|event|{let _=app.emit("video-progress",event);})
             }).await.map_err(|e|e.to_string())?
         };
         #[cfg(feature="inproc-backends")]
@@ -352,26 +385,29 @@ pub async fn open_media_file(path:String,app:AppHandle,state:State<'_,AppState>)
     if !path.is_file(){return Err("Media file no longer exists".into());}app.opener().open_path(path.to_string_lossy(),None::<&str>).map_err(|e|e.to_string())
 }
 #[tauri::command]
-pub async fn preview_video_frame(path:String,time_us:u64,state:State<'_,AppState>)->Result<String,String>{
-    let access=state.access.clone();tauri::async_runtime::spawn_blocking(move||frame(&path,time_us,access.as_ref())).await.map_err(|e|e.to_string())?
+pub async fn preview_video_frame(path:String,time_us:u64,probe:Option<VideoProbe>,state:State<'_,AppState>)->Result<String,String>{
+    let access=state.access.clone();tauri::async_runtime::spawn_blocking(move||frame_with(&path,time_us,probe.as_ref(),access.as_ref())).await.map_err(|e|e.to_string())?
 }
 #[cfg(not(feature="inproc-backends"))]
-fn frame(path:&str,time_us:u64,access:&dyn crate::sandbox_access::FileAccess)->Result<String,String>{
+fn frame_with(path:&str,time_us:u64,cached:Option<&VideoProbe>,access:&dyn crate::sandbox_access::FileAccess)->Result<String,String>{
     use base64::Engine;let path=Path::new(path).canonicalize().map_err(|e|e.to_string())?;let _scope=access.acquire(&path,&mut||false).ok_or("Video access denied")?;
-    let p=video::probe::probe(&path)?;let t=time_us.min(p.duration_us.map(|d|d.saturating_sub(1000)).unwrap_or(time_us));
+    // PERF-6.2：导入时已经探测过的视频直接复用缓存 probe，不再为每张封面
+    // 多付一次完整 ffprobe；没有缓存（历史/对比窗口）才现场探。
+    let p=match cached{Some(p)=>p.clone(),None=>video::probe::probe(&path)?};
+    let t=time_us.min(p.duration_us.map(|d|d.saturating_sub(1000)).unwrap_or(time_us));
     let mut cmd=video::process::command("ffmpeg")?;
     cmd.args(["-hide_banner","-v","error","-nostdin","-protocol_whitelist","file,pipe","-threads","1","-ss"]).arg(format!("{:.6}",t as f64/1e6)).arg("-i").arg(path)
         .args(["-map","0:v:0","-frames:v","1","-filter_threads","1","-vf","scale=1280:1280:force_original_aspect_ratio=decrease","-threads","1","-f","image2pipe","-vcodec","mjpeg","pipe:1"]);
     let b=video::process::capture(cmd,std::time::Duration::from_secs(30),4*1024*1024)?;if b.is_empty(){return Err("Preview frame unavailable".into());}Ok(format!("data:image/jpeg;base64,{}",base64::engine::general_purpose::STANDARD.encode(b)))
 }
 #[cfg(feature="inproc-backends")]
-fn frame(_path:&str,_time:u64,_access:&dyn crate::sandbox_access::FileAccess)->Result<String,String>{Err(video::capabilities::NATIVE_UNAVAILABLE.into())}
+fn frame_with(_path:&str,_time:u64,_cached:Option<&VideoProbe>,_access:&dyn crate::sandbox_access::FileAccess)->Result<String,String>{Err(video::capabilities::NATIVE_UNAVAILABLE.into())}
 #[tauri::command]
 pub async fn compare_video_frames(source_path:String,output_path:String,time_us:u64,state:State<'_,AppState>)->Result<serde_json::Value,String>{
     let access=state.access.clone();tauri::async_runtime::spawn_blocking(move||{
         let a=video::probe::probe(Path::new(&source_path))?;let b=video::probe::probe(Path::new(&output_path))?;
         let time=time_us.min(a.duration_us.unwrap_or(time_us).min(b.duration_us.unwrap_or(time_us)).saturating_sub(1000));
-        let source_frame=frame(&source_path,time,access.as_ref())?;let output_frame=frame(&output_path,time,access.as_ref())?;
+        let source_frame=frame_with(&source_path,time,None,access.as_ref())?;let output_frame=frame_with(&output_path,time,None,access.as_ref())?;
         Ok::<_,String>(serde_json::json!({"sourceFrame":source_frame,"outputFrame":output_frame,"timeUs":time}))
     }).await.map_err(|e|e.to_string())?
 }
@@ -457,7 +493,41 @@ mod import_tests {
         assert_eq!(files[0].2, PathBuf::from("2026/a.jpg"));
     }
 
-    /// §5.3 单文件错误隔离：一个失效路径只产生一条 failed 结果，绝不连坐整批；
+    /// PERF-6.1：导入报告逐类记账 —— 目录/文件分开、图片/视频分开、
+    /// 重复去重有账、既不是图片也不是媒体的文件按 unsupported 记（不再是
+    /// scanned-imported 的减法猜数）。
+    #[test]
+    fn the_import_report_counts_every_class_separately() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("media");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        // 两张图、一个视频魔数、一个文本、一份重复路径。
+        let png_a = root.join("a.png");
+        fs::write(&png_a, b"\x89PNG\r\n\x1a\nnot-really").unwrap();
+        let jpg = nested.join("b.jpg");
+        fs::write(&jpg, b"\xff\xd8\xff\xe0jpeg-ish").unwrap();
+        let mkv = root.join("c.mkv");
+        fs::write(&mkv, &[0x1a, 0x45, 0xdf, 0xa3, 0x01, 0x00]).unwrap();
+        fs::write(root.join("notes.txt"), b"just text").unwrap();
+        let mut seen = HashSet::new();
+        let mut files = vec![];
+        let mut report = ImportReport::default();
+        collect(&root, &root, &mut seen, &mut files, &mut report);
+        assert_eq!(report.directories, 2, "根目录 + nested 都要记账");
+        assert_eq!(files.len(), 4, "去重后 4 个文件");
+        // 同一个根第二次进来：在根上就被 seen 记账收走 —— 重复不再静默。
+        collect(&root, &root, &mut seen, &mut files, &mut report);
+        assert_eq!(report.duplicates, 1, "重复路径必须有账，不许静默丢弃");
+        // 分类对账：2 图片 + 1 视频候选 + 1 unsupported = 文件总数（无减法）。
+        let images = files.iter().filter(|(p, _, _)| image_header(p)).count();
+        let candidates = files.iter().filter(|(p, _, _)| probe_candidate(p)).count();
+        assert_eq!(images, 2);
+        assert_eq!(candidates, 1);
+        assert_eq!(report.scanned, report.directories + files.len(), "scanned = 目录 + 去重后的文件");
+    }
+
+    /// §5.3 单文件错误隔离：一个失效路径只产生一条 failed 结果，绝不连坐整批；    /// §5.3 单文件错误隔离：一个失效路径只产生一条 failed 结果，绝不连坐整批；
     /// 同批重复路径只保留第一次；有效任务的顺序保持不变。
     #[test]
     fn a_missing_video_fails_alone_and_never_sinks_the_batch() {

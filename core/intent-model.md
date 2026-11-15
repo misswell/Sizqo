@@ -122,3 +122,30 @@ tracks instead of comparing raw control defaults. `tests/app-slices.cjs` marker
 comments in `frontend/app.js` are load-bearing and must survive the rewrite. The
 Swift icon library is regenerated from the rewritten HTML sprite. Three-track
 build plus the full acceptance matrix remain the release gate.
+
+## Video parameter states (Intent / Preset / Options)
+
+The image-side rules above apply to video with one difference: video presets
+come from the backend (`video/presets.rs`), so presets and intents are two
+different entry points into the same options snapshot. The enforced contract:
+
+1. The UI summary, the submitted request and the saved settings are three views
+   of one options snapshot. A non-custom intent's snapshot is its compiled
+   request; `videoCustom`'s snapshot is the live control state.
+2. First launch shows the default intent's compiled options and **no** preset
+   selection (the preset dropdown offers an explicit "no preset" entry). It
+   never claims a preset it is not sending.
+3. Applying a preset updates the preset id **and** the intent state: the intent
+   switches back only when the merged options exactly equal that intent's
+   compiled request; otherwise it honestly switches to `videoCustom`.
+4. Switching intents re-derives the preset selection from the resulting options
+   (matching preset or none). No stale preset name survives a parameter change.
+5. `null`/empty option values clear their controls; the stale value can no
+   longer leak back through the control read-back into the next submission.
+6. Restarts restore the saved options and preset id verbatim; the saved intent
+   is restored too, and non-custom intents re-render their compiled request.
+   A saved preset therefore survives restarts.
+7. A running batch uses the options snapshot captured when it started; later UI
+   edits affect only the next batch.
+8. The frontend fallback preset label table uses the backend preset ids
+   (`quick/balanced/quality/smallest/compatible/target`) as the canonical keys.

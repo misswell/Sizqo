@@ -22,13 +22,16 @@
     threads: 0,
   });
 
+  // CFG-01：fallback 键名与后端 presets.rs 的预设 id 一致（quick/balanced/…）。
+  // 旧表（fast/highQuality/extreme/…）与后端 id 对不上，靠 name 字段兜底是
+  // 意外生还，不是契约。
   const PRESET_LABELS = Object.freeze({
-    fast: '快速',
+    quick: '快速',
     balanced: '均衡',
-    highQuality: '高质量压缩',
-    extreme: '极致体积',
-    compatibility: '兼容优先',
-    targetSize: '自定义目标大小',
+    quality: '高质量压缩',
+    smallest: '极致体积',
+    compatible: '兼容优先',
+    target: '自定义目标大小',
   });
 
   function normalizeOptions(value) {

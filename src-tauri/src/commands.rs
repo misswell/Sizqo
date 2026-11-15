@@ -64,6 +64,12 @@ impl TaskLedger {
         self.committing.remove(file_path);
     }
 
+    /// 该文件是否正处于提交段（TX-04：视频取消命令据此如实告知
+    /// "正在提交，无法取消"，而不是静默假装取消成功）。
+    pub fn is_committing(&self, file_path: &str) -> bool {
+        self.committing.contains(file_path)
+    }
+
     pub fn is_cancelled(&self, file_path: &str) -> bool {
         self.cancelled.contains(file_path)
     }
@@ -87,7 +93,7 @@ impl TaskLedger {
 /// Shared app state.
 pub struct AppState {
     /// 单文件取消 / 提交竞争账本（`TaskLedger`，同一把锁）。
-    pub task_ledger: Mutex<TaskLedger>,
+    pub task_ledger: std::sync::Arc<Mutex<TaskLedger>>,
     /// 主窗口打开对比时暂存的待渲染载荷，compare 窗口加载完成后取走。
     pub pending_compare: Mutex<Option<serde_json::Value>>,
     pub compression: std::sync::Arc<CompressionScheduler>,
@@ -1471,6 +1477,9 @@ fn commit_output(
                 Ok(crate::history::BackupVerification::LegacyUnverified)
             )
         }),
+        // TX-01：图片线同样落状态机 —— 记账时刻覆盖尚未发生，备份凭证已过验。
+        stage: output_transaction::TransactionStage::BackupVerified,
+        retired_original_path: None,
     };
     // ③记账先于动手：写不进日志就还不许碰用户文件，占好的名字也得收回去。
     if let Err(detail) = placement.journal(transactions, &txn) {
@@ -3538,6 +3547,68 @@ mod tests {
             AcquireOutcome::Acquired(_) => "acquired",
             AcquireOutcome::Cancelled => "cancelled",
             AcquireOutcome::Stopped => "stopped",
+        }
+    }
+
+    /// TX-04 场景 A：RUNNING → 用户取消成功 → 提交请求被拒。
+    /// 取消与提交竞争同一本账（同一把锁），不存在"已取消还照常落盘"的中间态。
+    #[test]
+    fn tx04_scenario_a_cancel_wins_and_commit_is_refused() {
+        let mut ledger = TaskLedger::default();
+        assert!(ledger.request_cancel("/v/clip.mp4"), "RUNNING 中取消必须成功");
+        assert!(
+            !ledger.try_begin_commit("/v/clip.mp4"),
+            "取消已认领这次收场，提交必须被拒"
+        );
+        assert!(!ledger.is_committing("/v/clip.mp4"), "提交段没有登记");
+    }
+
+    /// TX-04 场景 B：任务赢下提交权（COMMITTING）→ 用户点击取消被拒 → 提交完成。
+    #[test]
+    fn tx04_scenario_b_commit_wins_and_cancel_is_refused() {
+        let mut ledger = TaskLedger::default();
+        assert!(ledger.try_begin_commit("/v/clip.mp4"), "提交必须赢下竞争");
+        assert!(
+            !ledger.request_cancel("/v/clip.mp4"),
+            "COMMITTING 中的取消必须被拒（前端据此告知『正在提交』）"
+        );
+        assert!(ledger.is_committing("/v/clip.mp4"), "提交段保持登记到 end_commit");
+        ledger.end_commit("/v/clip.mp4");
+        assert!(!ledger.is_committing("/v/clip.mp4"));
+        // 提交收尾后，同一文件的下一个任务照常可以取消。
+        assert!(ledger.request_cancel("/v/clip.mp4"));
+    }
+
+    /// TX-04：取消与提交从两个线程原子竞争 —— 200 轮里每一轮恰好一方赢，
+    /// 绝无"双方都赢/双方都输"的中间态（Swift 侧 T08 已有同款并发断言）。
+    #[test]
+    fn tx04_cancel_and_commit_race_never_has_two_winners() {
+        let ledger = std::sync::Arc::new(std::sync::Mutex::new(TaskLedger::default()));
+        for round in 0..200u32 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let mut handles = vec![];
+            for which in 0..2u8 {
+                let ledger = ledger.clone();
+                let barrier = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut ledger = ledger.lock().unwrap();
+                    if which == 0 {
+                        ledger.request_cancel("p")
+                    } else {
+                        ledger.try_begin_commit("p")
+                    }
+                }));
+            }
+            let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(
+                results.iter().filter(|won| **won).count(),
+                1,
+                "第 {round} 轮必须恰好一方赢，实际 {results:?}"
+            );
+            let mut ledger = ledger.lock().unwrap();
+            ledger.clear_cancelled();
+            ledger.end_commit("p");
         }
     }
 

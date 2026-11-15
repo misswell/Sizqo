@@ -68,6 +68,19 @@ image operations cannot be removed or weakened to accommodate video.
     silent tone mapping, lost tracks, format-incompatible copy or fake controls.
 12. All security-scoped access guards cover probe, encode, temporary writes,
     commit, history and rollback. An unavailable native backend never spawns.
+13. Both tracks arbitrate cancel and commit on one shared ledger: a cancelled
+    task refuses to commit, a committing task refuses cancellation and reports
+    "committing" honestly; commit-segment failures are failures, never
+    "cancelled". No check-then-act cancel gate.
+14. The video transaction journal records a `stage` state machine and the
+    retained path of the swapped-out original; history is "written" only when
+    the entry reads back, and rollback failure keeps the journal, backup and
+    retained files. Image and video share one retention/restore semantics for
+    retired originals.
+15. Metadata-promise conflicts (KeepAll × dropping audio/subtitles or
+    re-encoding audio) are rejected at plan time. Frame-count reconciliation is
+    fail-closed: missing actual decoded frame counts refuse the commit.
+    Attachments reconcile per stream position (name + size + SHA-256).
 
 ## Session and CPU contract
 

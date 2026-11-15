@@ -2719,3 +2719,63 @@ Before any tag/Release: full three-track build, signed Direct runtime check,
 signed sandbox check, real fixture video matrix (AGENTS.md §11 items 1–12),
 FFmpeg licensing review. A local commit is not a GitHub push; every published
 tag must link its artifacts here with the exact commands used.
+
+
+## 0.3.6-rc.18 — 全仓库可靠性复核轮（2026-11-15）
+
+基准 f1b59f9（rc.17），macOS arm64（darwin 27.2.0）。每条命令都是本轮实际
+执行并得到的读数；没有跑的项如实标注"未跑"。
+
+### 自动化检查
+
+| 检查 | 命令 | 结果 |
+|-------|---------|--------|
+| Rust lib + 全部集成测试（Direct） | `cargo test`（src-tauri） | ✅ lib 311 passed / 0 failed；compression_test 6、crash_injection 8、dual_instance 1、exif_orientation 2、real_media_matrix 5 全绿 |
+| 共享进程内引擎 | `cargo test --features inproc-backends` | ✅ lib 309 passed / 0 failed + 集成全绿 |
+| App Store 特性集 | `cargo test --no-default-features --features inproc-backends` | ✅ lib 309 passed / 0 failed + 集成全绿 |
+| Swift 历史检查（含契约向量 32 条） | `bash scripts/test_swift_history.sh` | ✅ 全部通过 |
+| 前端全量（31 个套件，含本轮新增 2 个） | `npm run test:frontend` | ✅ 全部通过 |
+| 真实媒体矩阵（本机 ffmpeg 9.0.2） | `cargo test --lib -- --ignored` | ✅ metadata_policies_hold / s11_real_media_matrix / t12_vfr / t13_keepall / t15_flac_target 五条全绿 |
+
+本轮新增测试（名称 → 覆盖的缺口）：
+
+- `video::transaction::tests::a_history_write_failure_after_replace_restores_the_original`
+  —— TX-01：历史写入失败（故障注入）→ 回滚原图、销账、换出副本按指纹收走。
+- `video::transaction::tests::a_failed_rollback_keeps_the_full_recovery_scene`
+  —— TX-01：回滚失败（故障注入）→ 日志/备份/换出文件全部保留；故障清除后
+  `recover()` 接着收口，二次恢复幂等。
+- `video::transaction::tests::the_swapped_out_original_is_recorded_for_history_management`
+  —— TX-02：换出路径进历史；清空历史按身份收走。
+- `video::transaction::tests::a_journal_update_failure_never_orphans_the_output` /
+  `a_history_failure_in_suffix_mode_removes_the_uncommitted_output`
+  —— TX-03：日志更新失败 / 历史失败 → 产物按指纹门收走，无孤儿。
+- `video::transaction::tests::the_job_dir_sweep_only_takes_directories_it_can_prove`
+  —— REC-01：作业目录清扫只认内容自证；混入未知文件的目录保留。
+- `video::transaction::tests::a_missed_target_is_committed_as_target_unmet`
+  —— RES-01/02：历史记 `target_unmet` + 实际参数快照 + 目标对账三字段。
+- `commands::tests::tx04_scenario_a/b_*` + `tx04_cancel_and_commit_race_never_has_two_winners`
+  —— TX-04：取消/提交竞争（200 轮双线程）。
+- `video_commands::import_tests::the_import_report_counts_every_class_separately`
+  —— PERF-6.1：导入报告逐类记账。
+- `tests/video-covers.cjs` —— PERF-6.2：懒加载/串行/LRU/取消清理/probe 复用。
+- `tests/video-config-consistency.cjs` —— CFG-01：首启、null 清空、预设同步意图、
+  重启一致、前后端预设 id 对齐。
+- `tests/crash_injection.rs` 6 → 8 阶段：`video_after_publish_retired`（换出
+  文件 + 状态机字段恢复）、`video_after_history_persisted`（历史在案只销账）。
+
+真实矩阵运行注记：本轮把测试助手与生产对齐（源/产物探测统一带 `-count_frames`），
+并由此暴露并修正了两条真实语义缺口——`is_muxer_generated` 补 `handler_name` /
+`vendor_id` / `language`（muxer 结构字段，s11 真实矩阵实证）；T12/T11 之外的
+VFR 用例改用 strip 元数据策略（KeepAll × 移除音频现在是预检拒绝的组合，正是
+VAL-01a 的预期行为）。
+
+### 已知边界（如实记录，不冒充完成）
+
+- macOS 真实 FFmpeg 矩阵在本机（brew ffmpeg 9.0.2）通过；Windows（NTFS 句柄
+  行为）与 Linux（原子交换降级路径）依赖 CI 对应作业，本轮本机未跑。
+- `Sizqo-video-*` 作业目录清扫发生在下一次编码进入同一目录时；启动时不扫描
+  用户媒体目录（禁止按前缀盲扫）。崩溃发生在"占名成功、journal 落账之前"的
+  窗口时，0 字节占位仍无从记账——它只会让命名序列跳到下一个候选，不构成
+  数据风险。
+- 双实例抢占、VideoToolbox 实测、签名/公证/装订仍未纳入本轮验证范围
+  （继承 rc.11 起的发布门禁清单）。

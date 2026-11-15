@@ -1,14 +1,20 @@
 //! Direct FFmpeg engine: streaming IO, bounded diagnostics, independent cancellation.
-use std::{fs,io::{Read,Write,BufRead,BufReader},path::Path,sync::{Arc,atomic::{AtomicBool,Ordering}},time::{Instant,Duration},process::Stdio};
+use std::{fs,io::{Read,Write,BufRead,BufReader},path::Path,sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},time::{Instant,Duration},process::Stdio};
 use super::{VideoOptions,VideoResult,capabilities::CapabilityMatrix,probe,plan,progress::{VideoProgress,ProgressParser},transaction};
-use crate::{history::HistoryStore,output_transaction::TransactionStore};
+use crate::{history::HistoryStore,output_transaction::TransactionStore,commands::TaskLedger};
 use crate::result_model::{ReasonCode,ResultOutcome};
+/// TX-04 提交门拒绝提交时的哨兵错误：错误分类据此给出 Cancelled，
+/// 与"提交段里的真实失败"（Failed）严格分开。
+const CANCELLED_BEFORE_COMMIT:&str="cancelled-before-commit-gate";
 #[allow(clippy::too_many_arguments)]
-pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMatrix,session:&str,revision:u64,roots:&[String],per_task_relative:Option<&str>,history:&HistoryStore,transactions:&TransactionStore,retention:u32,budget:usize,logs:&Path,cancel:Arc<AtomicBool>,emit:&(dyn Fn(VideoProgress)+Sync))->VideoResult{
+pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMatrix,session:&str,revision:u64,roots:&[String],per_task_relative:Option<&str>,history:&HistoryStore,transactions:&TransactionStore,retention:u32,budget:usize,logs:&Path,cancel:Arc<AtomicBool>,commit_gate:Option<Arc<Mutex<TaskLedger>>>,gate_path:&str,emit:&(dyn Fn(VideoProgress)+Sync))->VideoResult{
     let started=Instant::now();let mut result=VideoResult::pending(task_id,source,options);
     // 占位认领在闭包里发生，但它的生命周期必须贯穿整个任务（成功收走、其余归还）：
     // 声明提到闭包外。
     let mut claimed_output:Option<crate::output_transaction::ClaimedOutput>=None;
+    // TX-04：是否赢下了提交门（进入原子提交段）。提交段内的失败一律是 Failed
+    // —— 不再看 cancel 旗标分类，取消在门上就已被拒，这里没有"取消"可言。
+    let mut commit_phase=false;
     let outcome=(||->Result<(),String>{
         let source=source.canonicalize().map_err(|e|e.to_string())?;
         // §3.2 覆盖模式必须先算出内容指纹：事务凭证、崩溃恢复、备份复用
@@ -23,6 +29,20 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
         // `-count_frames` 实测帧数（帧数对账的输入）。大文件探测放宽到 300s，
         // 与产物复探同一档 —— count_frames 要多解一遍全片。
         let source_probe=probe::probe_cancellable(&source,Duration::from_secs(300),Some(&cancel),true)?;
+        // RES-01：源文件已经在目标体积之内，再编码只是烧 CPU —— 按图片线同款
+        // 语义跳过（SkippedAlreadyUnderTarget），不是成功也不是失败。
+        if options.mode=="targetSize"{
+            if let Some(target_mib)=options.target_mi_b{
+                let target=target_mib*1024.0*1024.0;
+                if target>0.0&&(source_probe.size_bytes as f64)<=target*1.05{
+                    result.stage="completed".into();
+                    result.outcome=Some(ResultOutcome::SkippedAlreadyUnderTarget);
+                    result.reason_code=Some(ReasonCode::AlreadyUnderTarget);
+                    result.reason=Some(format!("Source is already within the target size ({} <= {} bytes)",source_probe.size_bytes,target.round() as u64));
+                    return Ok(());
+                }
+            }
+        }
         let plan=plan::build(options,&source_probe,caps,budget)?;
         result.encoder_actual=plan.encoder.clone();result.warnings=plan.warnings.clone();
         // 本轮加固（P2-12 / T17）：编码前独占认领输出名 —— 0 字节占位 + 句柄凭证
@@ -50,6 +70,8 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
         let id=crate::history::HistoryEntry::new_id(&source);
         let log_path=logs.join(format!("{id}.log"));
         result.diagnostics_log_path=Some(log_path.to_string_lossy().into());
+        // REC-01：编码进场先清扫上次崩溃遗留的作业目录（内容自证，不按前缀盲删）。
+        transaction::sweep_stale_video_job_dirs(parent);
         let job=tempfile::Builder::new().prefix(&format!(".sizqo-video-{id}-")).tempdir_in(parent).map_err(|e|e.to_string())?;
         let partial=job.path().join(format!("output.partial.{}",plan.container));
         let stats=job.path().join("pass-stats");
@@ -65,7 +87,9 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
         // 产物复探给足时间（编码刚完成，同一份大文件慢卷上不止 45 秒）。
         // 复探同样可取消 + count_frames：产物帧数与源帧数在 validate 里对账。
         let encoded=probe::probe_cancellable(&partial,Duration::from_secs(300),Some(&cancel),true)?;
-        super::validation::validate(&source_probe,&encoded,&plan,Some(&source),Some(&partial))?;
+        // RES-02：产物复探摘要随结果/历史落盘，历史详情不重新 ffprobe 也能还原输出。
+        result.output_probe=Some(serde_json::json!({"width":encoded.width,"height":encoded.height,"frameRate":encoded.frame_rate,"durationUs":encoded.duration_us,"sizeBytes":encoded.size_bytes,"frameCount":encoded.video().and_then(|v|v.nb_frames)}));
+        super::validation::validate(&source_probe,&encoded,&plan,Some(&source),Some(&partial),Some(&cancel))?;
         // Decode the entire output to null. Exit 0 and a progress=end record alone are insufficient.
         let mut verify=super::process::command("ffmpeg")?;
         verify.args(["-hide_banner","-v","error","-xerror","-nostdin","-protocol_whitelist","file,pipe","-threads"]).arg(plan.threads.to_string())
@@ -99,15 +123,58 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
         }
         if encoded.size_bytes>=source_probe.size_bytes{result.warnings.push("Larger output retained by explicit professional-mode choice".into());}
         result.elapsed_ms=started.elapsed().as_millis()as u64;
-        transaction::commit(&source,&partial,&target,options,&source_probe,&mut result,history,transactions,retention,&identity,backup.as_deref(),&mut claimed_output)?;
-        result.success=true;result.stage="completed".into();result.outcome=Some(ResultOutcome::Committed);Ok(())
+        // TX-04：取消与提交在**同一本账**上原子竞争。赢下 try_begin_commit 才允许
+        // 进提交段；输了 = 用户先取消了（CANCELLED_BEFORE_COMMIT）。进了提交段，
+        // cancel_video_task 会在账本上被拒绝 —— 这里没有"再查一次取消"的竞态窗口。
+        if let Some(ledger)=&commit_gate{
+            let won=ledger.lock().unwrap().try_begin_commit(gate_path);
+            if !won{return Err(CANCELLED_BEFORE_COMMIT.into());}
+            commit_phase=true;
+        }
+        let commit_result=transaction::commit(&source,&partial,&target,options,&source_probe,&mut result,history,transactions,retention,&identity,backup.as_deref(),&mut claimed_output);
+        // 提交租约解除：成功失败都要解除，否则同路径的下一个任务再也取消不了。
+        if commit_phase{
+            if let Some(ledger)=&commit_gate{ledger.lock().unwrap().end_commit(gate_path);}
+            commit_phase=false;
+        }
+        commit_result?;
+        // RES-01：targetSize 未达成不是普通 Committed —— 产物有效、已提交、
+        // 可保存可恢复，但必须明确显示"未达到目标"。
+        result.success=true;result.stage="completed".into();
+        if result.target_met==Some(false){
+            result.outcome=Some(ResultOutcome::TargetUnmet);
+            result.reason_code=Some(ReasonCode::TargetUnmet);
+        }else{
+            result.outcome=Some(ResultOutcome::Committed);
+        }
+        Ok(())
     })();
     // 占位归还：只有 commit 成功那条路会收走 `ClaimedOutput`（commit 里 take）。
     // 其余一切收场（有效未变小跳过 / 失败 / 取消）都到这里把名字还回去，
     // 不给用户目录留 0 字节孤儿 —— 归属门保证被外部偷换的路径分文不动。
     if let Some(claimed)=claimed_output.take(){claimed.release();}
     result.elapsed_ms=started.elapsed().as_millis()as u64;
-    if let Err(error)=outcome {let cancelled=cancel.load(Ordering::Acquire);result.stage=if cancelled{"cancelled"}else{"failed"}.into();result.outcome=Some(if cancelled{ResultOutcome::Cancelled}else{ResultOutcome::Failed});result.reason_code=Some(if cancelled{ReasonCode::Cancelled}else{ReasonCode::Unknown});result.reason=Some(error);}
+    if let Err(error)=outcome {
+        if error==CANCELLED_BEFORE_COMMIT{
+            result.stage="cancelled".into();
+            result.outcome=Some(ResultOutcome::Cancelled);
+            result.reason_code=Some(ReasonCode::Cancelled);
+            result.reason=Some("Cancelled by user before commit; original was not overwritten".into());
+        }else if commit_phase{
+            // TX-04 分类修正：提交段里的失败（含回滚失败）就是 Failed ——
+            // 旧代码看 cancel 旗标，把提交期的 IO 错误谎报成"已取消"。
+            result.stage="failed".into();
+            result.outcome=Some(ResultOutcome::Failed);
+            result.reason_code=Some(ReasonCode::TransactionFailed);
+            result.reason=Some(error);
+        }else{
+            let cancelled=cancel.load(Ordering::Acquire);
+            result.stage=if cancelled{"cancelled"}else{"failed"}.into();
+            result.outcome=Some(if cancelled{ResultOutcome::Cancelled}else{ResultOutcome::Failed});
+            result.reason_code=Some(if cancelled{ReasonCode::Cancelled}else{ReasonCode::Unknown});
+            result.reason=Some(error);
+        }
+    }
     result
 }
 fn run(args:&[String],log:&Path,cancel:&AtomicBool,emit:impl Fn(&ProgressParser)+Sync)->Result<(),String>{let mut cmd=super::process::command("ffmpeg")?;cmd.args(args);run_command(cmd,log,cancel,emit)}
@@ -175,8 +242,10 @@ mod tests {
             let args=plan.argv(source,&out,pass,&dir.join(format!("{policy}-{container}-stats")));
             run(&args,&log,&cancel,|_|{}).unwrap();
         }
-        let encoded=probe::probe(&out).unwrap();
-        validation::validate(source_probe,&encoded,&plan,None,None).expect("输出必须通过 §56 全量校验");
+        // 与生产 encode() 同款：复探带 -count_frames —— 帧数对账 fail-closed 的
+        // 前提就是两侧探测都带实测帧数（快速探测没有，validate 会如实拒绝）。
+        let encoded=probe::probe_cancellable(&out,Duration::from_secs(300),None,true).unwrap();
+        validation::validate(source_probe,&encoded,&plan,None,None,None).expect("输出必须通过 §56 全量校验");
         encoded
     }
 
@@ -188,7 +257,8 @@ mod tests {
         assert!(super::super::process::tool("ffmpeg").is_ok()&&super::super::process::tool("ffprobe").is_ok(),"需要内置 ffmpeg/ffprobe");
         let dir=tempfile::tempdir().unwrap();
         let source=fixture(dir.path(),"mkv");
-        let source_probe=probe::probe(&source).unwrap();
+        // 源侧同样用生产的 count_frames 探测：validate 的帧数对账 fail-closed。
+        let source_probe=probe::probe_cancellable(&source,Duration::from_secs(300),None,true).unwrap();
         assert_eq!(source_probe.chapters.len(),1,"夹具必须真的带章节");
         assert_eq!(source_probe.format_tags["title"],"Sizqo Metadata Test");
         assert_eq!(source_probe.format_tags["LOCATION"],"+37.7749-122.4194/");
@@ -216,7 +286,7 @@ mod tests {
 
         // MP4 的章节轨道是 data/text 流：真实文件必须能进 plan，章节必须能活过编码。
         let mp4=fixture(dir.path(),"mp4");
-        let mp4_probe=probe::probe(&mp4).unwrap();
+        let mp4_probe=probe::probe_cancellable(&mp4,Duration::from_secs(300),None,true).unwrap();
         assert!(mp4_probe.streams.iter().any(|s|s.is_chapter_carrier()),"夹具应含 MP4 章节载体");
         assert_eq!(mp4_probe.chapters.len(),1);
         let mp4_kept=encode_policy(dir.path(),&mp4,&mp4_probe,&caps,"preserve","mp4");
@@ -225,7 +295,7 @@ mod tests {
 
     fn encode_with(dir:&Path,source:&Path,options:&VideoOptions)->super::super::probe::VideoProbe{
         let caps=capabilities::capabilities();
-        let source_probe=probe::probe(source).unwrap();
+        let source_probe=probe::probe_cancellable(source,Duration::from_secs(300),None,true).unwrap();
         let plan=plan::build(options,&source_probe,&caps,2).unwrap();
         let out=dir.join(format!("out-{}.{}",std::process::id(),options.container));
         let cancel=AtomicBool::new(false);
@@ -233,8 +303,8 @@ mod tests {
             let args=plan.argv(source,&out,pass,&dir.join(format!("stats-{}-{}",std::process::id(),pass)));
             run(&args,&dir.join(format!("matrix-{}.log",std::process::id())),&cancel,|_|{}).unwrap();
         }
-        let encoded=probe::probe(&out).unwrap();
-        validation::validate(&source_probe,&encoded,&plan,None,None).expect("输出必须通过 §56 全量校验");
+        let encoded=probe::probe_cancellable(&out,Duration::from_secs(300),None,true).unwrap();
+        validation::validate(&source_probe,&encoded,&plan,None,None,None).expect("输出必须通过 §56 全量校验");
         encoded
     }
 
@@ -275,7 +345,7 @@ mod tests {
             "-c:v","libx264","-preset","ultrafast","-pix_fmt","yuv420p",
             "-c:a","aac","-c:s","webvtt",
             "-map_chapters","3","-map_metadata","3","-shortest"]);
-        let multi_probe=probe::probe(&multi).unwrap();
+        let multi_probe=probe::probe_cancellable(&multi,Duration::from_secs(300),None,true).unwrap();
         assert_eq!(multi_probe.audio().count(),2,"夹具必须真的有双音轨");
         assert_eq!(multi_probe.subtitles().count(),1,"夹具必须真的有字幕");
         assert_eq!(multi_probe.chapters.len(),1,"夹具必须真的有章节");
@@ -293,9 +363,11 @@ mod tests {
             "-f","lavfi","-i","testsrc2=size=160x120:rate=30:duration=2",
             "-vf","select='not(mod(n\\,5))'",timing,"passthrough",
             "-c:v","libx264","-preset","ultrafast"]);
-        let vfr_probe=probe::probe(&vfr).unwrap();
+        let vfr_probe=probe::probe_cancellable(&vfr,Duration::from_secs(300),None,true).unwrap();
         assert!(vfr_probe.variable_frame_rate,"夹具必须真的是 VFR（r≠avg）");
-        let mut vfr_options=base.clone();vfr_options.audio_policy="none".into();vfr_options.container="mp4".into();
+        // VAL-01a：KeepAll + 移除音频是预检拒绝的组合 —— VFR 段的主题是时间轴，
+        // 元数据用 strip。
+        let mut vfr_options=base.clone();vfr_options.audio_policy="none".into();vfr_options.container="mp4".into();vfr_options.metadata_policy="strip".into();
         let vfr_plan=plan::build(&vfr_options,&vfr_probe,&caps,2).unwrap();
         let vfr_argv=vfr_plan.argv(&vfr,&root.join("vfr-out.mp4"),1,&root.join("stats"));
         assert!(vfr_argv.windows(2).any(|w|w[0]==timing&&w[1]=="passthrough"),"VFR 源必须用这台引擎认得的名字保留时间戳（探测结果 {timing}）");
@@ -365,7 +437,7 @@ mod tests {
         let roots=vec![root.to_string_lossy().into_owned()];
         let cancel=Arc::new(AtomicBool::new(false));
         let emit=|_event:VideoProgress|{};
-        encode("real-e2e-task",source,options,&caps,"real-e2e-session",1,&roots,None,&history,&transactions,30,2,&logs,cancel,&emit)
+        encode("real-e2e-task",source,options,&caps,"real-e2e-session",1,&roots,None,&history,&transactions,30,2,&logs,cancel,None,"",&emit)
     }
 
     /// T12 的证据工具：直接 ffprobe（绕开 probe.rs），拿 `-count_frames` 实测解码帧数。
@@ -436,7 +508,9 @@ mod tests {
         let source_pts=frame_pts(&vfr);
         assert!(pts_holds_a_doubled_gap(&source_pts),"夹具时间戳必须真的有变间隔（前 70 帧内同时存在 ~33ms 与 ≥67ms 间隔; 实际前 12 个 {:?}）",
             source_pts.iter().take(12).collect::<Vec<_>>());
-        let options=VideoOptions{encoder:"libx264".into(),mode:"crf".into(),crf:Some(23.0),preset:"veryfast".into(),audio_policy:"none".into(),metadata_policy:"preserve".into(),container:"mkv".into(),threads:2,..Default::default()};
+        // VAL-01a：KeepAll 与删除音轨互相矛盾，预检直接拒绝 —— 本测试的主题是
+        // 帧数对账，元数据策略用 strip（无音轨可保），不再借 KeepAll 撞预检枪口。
+        let options=VideoOptions{encoder:"libx264".into(),mode:"crf".into(),crf:Some(23.0),preset:"veryfast".into(),audio_policy:"none".into(),metadata_policy:"strip".into(),container:"mkv".into(),threads:2,..Default::default()};
         let result=encode_full_chain(root,&vfr,&options);
         assert!(result.success,"VFR passthrough 编码必须提交成功: {:?}",result.reason);
         assert_eq!(result.outcome,Some(ResultOutcome::Committed));
@@ -519,7 +593,7 @@ mod tests {
         assert!(out_name.ends_with("credits.txt"),"附件名字丢了: {out_name}");
         // encode 内部的 KeepAll validate 已带路径跑过内容 SHA256 对账；
         // 这里把两侧真实文件再显式对一次，作为独立证据。
-        validation::verify_attachments_content(&source_probe,&out,&multi,&output)
+        validation::verify_attachments_content(&source_probe,&out,&multi,&output,None)
             .expect("附件内容 SHA256 必须一致");
     }
 

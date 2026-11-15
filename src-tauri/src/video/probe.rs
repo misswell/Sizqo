@@ -54,8 +54,11 @@ impl VideoProbe {
                 bit_rate:Some(uint(s,"bit_rate")).filter(|n|*n>0),channels:uint(s,"channels") as u32,
                 sample_rate:uint(s,"sample_rate") as u32,
                 frame_rate:rational(&text(s,"avg_frame_rate")),
-                nb_frames:Some(uint(s,"nb_read_frames")).filter(|n|*n>0)
-                    .or_else(||Some(uint(s,"nb_frames")).filter(|n|*n>0)),
+                nb_frames:Some(uint(s,"nb_read_frames")).filter(|n|*n>0),
+                // VAL-01d：这一字段只装**实测解码帧数**（-count_frames 的 nb_read_frames）。
+                // 容器声明的 nb_frames 不是"实际解出来的帧数" —— 流损坏时声明值照旧
+                // 满编，拿它冒充实测就是 fail-open。导入档快速探测没有 count_frames，
+                // 这里就是 None（诚实），validate 的帧数对账因此 fail-closed。
                 time_base:text(s,"time_base"),color_transfer:text(s,"color_transfer"),
                 color_primaries:text(s,"color_primaries"),color_space:text(s,"color_space"),field_order:text(s,"field_order"),
                 tags:s["tags"].clone(),disposition:s["disposition"].clone(),side_data:s["side_data_list"].clone(),raw:s.clone() });

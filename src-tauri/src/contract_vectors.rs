@@ -113,6 +113,8 @@ fn v2_replace_txn_with_output(
         mode: TransactionMode::ReplaceExisting,
         schema_version: SCHEMA_VERSION,
         backup_legacy_unverified: false,
+        stage: crate::output_transaction::TransactionStage::Preparing,
+        retired_original_path: None,
     }
 }
 
@@ -136,6 +138,8 @@ fn legacy_txn(source: &Path, backup: &Path, history_id: &str) -> ReplaceTransact
         mode: TransactionMode::ReplaceExisting,
         schema_version: 0,
         backup_legacy_unverified: false,
+        stage: crate::output_transaction::TransactionStage::Preparing,
+        retired_original_path: None,
     }
 }
 

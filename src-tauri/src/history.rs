@@ -499,6 +499,8 @@ impl HistoryStore {
             .root
             .join(format!("history.corrupt-{}.json", now_millis()));
         fs::rename(&path, &stamped).map_err(|e| e.to_string())?;
+        // §2.5：改名是目录项变更，断电后必须仍然可见 —— 隔离现场保留才有意义。
+        sync_dir(&self.root).map_err(|e| format!("隔离损坏历史文件后目录落盘失败: {e}"))?;
         Ok(stamped)
     }
 
@@ -509,6 +511,12 @@ impl HistoryStore {
 
     /// 覆盖磁盘写入 + 内存快照：写失败时内存保持磁盘上那份可信内容。
     fn store(&self, entries: Vec<HistoryEntry>) -> Result<(), String> {
+        // TX-01 故障注入：历史写入失败（磁盘满/权限被撤/写一半）的替身。
+        #[cfg(test)]
+        if TEST_FAULT_FAIL_NEXT_HISTORY_STORE.with(std::cell::Cell::get) > 0 {
+            TEST_FAULT_FAIL_NEXT_HISTORY_STORE.with(|flag| flag.set(flag.get() - 1));
+            return Err("injected history write failure".into());
+        }
         self.write_raw(&entries)?;
         let mut cache = self.cache.lock().unwrap();
         self.ensure_loaded(&mut cache);
@@ -1741,6 +1749,16 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
 thread_local! {
     pub(crate) static TEST_FAULT_EDIT_SOURCE_AFTER_COPY: std::cell::Cell<bool>
         = const { std::cell::Cell::new(false) };
+    /// TX-01 故障注入：接下来 N 次 history store() 落盘直接失败（磁盘满 /
+    /// 权限被撤/写一半断电的替身）。thread-local 同款理由：并行测试互不污染。
+    pub(crate) static TEST_FAULT_FAIL_NEXT_HISTORY_STORE: std::cell::Cell<u32>
+        = const { std::cell::Cell::new(0) };
+}
+
+/// 测试用：注入 history 落盘失败（剩余次数）。
+#[cfg(test)]
+pub(crate) fn set_fault_fail_next_history_store(times: u32) {
+    TEST_FAULT_FAIL_NEXT_HISTORY_STORE.with(|flag| flag.set(times));
 }
 
 /// 测试用：开关"复制后改写源文件"的故障注入（只影响当前测试线程）。

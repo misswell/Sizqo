@@ -205,8 +205,41 @@ var videoPresets = [];
 var selectedVideoPresetId = 'balanced';
 var currentVideoOptions = window.SizqoVideo.normalizeOptions();
 var videoCompareState = null;
-var videoCoverQueue = [];
-var videoCoverBusy = false;
+// PERF-6.2：封面改为视口懒加载 + 有界并发 + LRU 缓存（frontend/video-covers.js）。
+// 旧实现"导入即全量排队抽帧、封面 data URL 终身挂在队列项上"在千级导入下
+// 既拖慢导入又吃内存。现在只有用户看得见的行才发起抽帧，缓存有双上限，
+// 淘汰时同步清掉行上的引用。
+// 测试沙盒只装 app.js 的切片、不装伴生模块：SizqoVideoCovers 缺席时退化为
+// 无操作管理器 —— 行为保持"没有封面"，绝不抛错。
+var videoCovers = (window.SizqoVideoCovers || { create: function() {
+  return { requestCover: function() {}, getCached: function() { return undefined; }, forget: function() {}, clear: function() {} };
+} }).create({
+  invoke: function(cmd, args) { return invoke(cmd, args); },
+  stillQueued: function(path) {
+    var item = queueItems.get(path);
+    return !!item && item.mediaKind === 'video';
+  },
+  onPaint: function(path) {
+    var item = queueItems.get(path);
+    if (!item) return;
+    item.coverUrl = videoCovers.getCached(path);
+    paintQueueRow(path);
+  },
+  onEvict: function(path) {
+    var item = queueItems.get(path);
+    if (item) { item.coverUrl = null; paintQueueRow(path); }
+  },
+});
+var videoCoverObserver = typeof IntersectionObserver === 'function'
+  ? new IntersectionObserver(function(entries) {
+      entries.forEach(function(entry) {
+        if (!entry.isIntersecting) return;
+        var path = entry.target.getAttribute('data-file');
+        var item = path && queueItems.get(path);
+        if (item && item.mediaKind === 'video' && item.videoProbe) videoCovers.requestCover(item);
+      });
+    }, { rootMargin: '320px' })
+  : null;
 
 // DOM Elements
 const dropzone = document.getElementById('dropzone');
@@ -308,8 +341,48 @@ function setVideoIntent(id) {
   videoIntent.intent = id;
   // 切意图 = 换一套真实生效的参数：把控件摆成这套参数，别留上一套的假象。
   applyVideoOptions(videoRequestFromIntent().options);
+  // CFG-01：预设选择跟着真实参数走 —— 编译结果恰好等于某个预设就选中它，
+  // 否则清空。旧写法留着上一个预设的名字，界面三个地方各说各话。
+  selectedVideoPresetId = matchVideoPresetForOptions(currentVideoOptions);
+  renderVideoCapabilities();
   renderIntentBar();
   saveVideoSettings();
+}
+
+/// 编码参数的比对键：输出方式是正交项，不参与预设/意图匹配。
+var VIDEO_OPTION_MATCH_KEYS = ['encoder','mode','crf','bitrateKbps','targetMiB','preset','resolution','frameRate','audioPolicy','subtitlePolicy','metadataPolicy','container','threads','pixelFormat'];
+function videoEncodingOptionsEqual(a, b) {
+  return VIDEO_OPTION_MATCH_KEYS.every(function(key) {
+    var left = a[key] === undefined || a[key] === null ? '' : a[key];
+    var right = b[key] === undefined || b[key] === null ? '' : b[key];
+    return String(left) === String(right);
+  });
+}
+
+/// CFG-01：参数 ↔ 预设的反向匹配。没有任何预设与当前编码参数一致就返回 ''。
+function matchVideoPresetForOptions(options) {
+  var normalized = window.SizqoVideo.normalizeOptions(options);
+  var found = (videoPresets || []).find(function(preset) {
+    if (!preset || !preset.options || preset.available === false) return false;
+    return videoEncodingOptionsEqual(normalized, window.SizqoVideo.normalizeOptions(preset.options));
+  });
+  return found ? window.SizqoVideo.presetId(found) : '';
+}
+
+/// CFG-01：参数 ↔ 意图的反向匹配（预设应用后同步意图状态）。
+/// 完全相等才回到那个意图；"看起来像"不算 —— 与 classifyImage 同一条纪律。
+function matchVideoIntentForOptions(options) {
+  var normalized = window.SizqoVideo.normalizeOptions(options);
+  var intents = (window.SizqoIntents && window.SizqoIntents.VIDEO_INTENTS) || [];
+  for (var i = 0; i < intents.length; i++) {
+    var intent = intents[i];
+    if (intent.id === 'videoCustom') continue;
+    var compiled = window.SizqoIntents.compileVideo(
+      { intent: intent.id, targetMiB: normalized.targetMiB },
+      window.SizqoVideo.DEFAULT_OPTIONS, window.SizqoVideo);
+    if (videoEncodingOptionsEqual(normalized, compiled.options)) return intent.id;
+  }
+  return 'videoCustom';
 }
 
 /// 把意图编译出来的参数写回原始控件，让「更多参数」显示的就是此刻真正在跑的值。
@@ -685,9 +758,14 @@ function videoOptionsFromControls() {
 /// 「覆盖原文件」换成「加后缀」——落盘归用户决定，不归意图决定。
 function applyVideoOptions(options, pushOutput) {
   currentVideoOptions = window.SizqoVideo.normalizeOptions(options);
+  // CFG-01：null/undefined/空串必须**清空**控件 —— 旧写法跳过 null，
+  // "帧率从数值改回跟随源"清不掉旧值，随后 syncVideoSettingsControls 从控件
+  // 读回，陈旧的 fps 就漏进下一次提交并跨意图残留。
   var setValue = function(id, value) {
     var element = document.getElementById(id);
-    if (element && value != null) element.value = String(value);
+    if (!element) return;
+    if (value === null || value === undefined || value === '') { element.value = ''; return; }
+    element.value = String(value);
   };
   setValue('videoEncoder', currentVideoOptions.encoder);
   setValue('videoMode', currentVideoOptions.mode);
@@ -764,12 +842,16 @@ function loadVideoSettings() {
   var saved = null;
   try { saved = JSON.parse(localStorage.getItem('sizqo-video-settings') || 'null'); } catch (_) {}
   if (saved && saved.options) {
-    selectedVideoPresetId = saved.selectedPresetId || 'balanced';
+    // CFG-01：预设 ID 只在真的选过预设时才回填；'' = 没选预设（意图条说了算）。
+    selectedVideoPresetId = saved.selectedPresetId || '';
     applyVideoOptions(saved.options, true);
     return true;
   }
-  selectedVideoPresetId = 'balanced';
-  applyVideoOptions(saved || window.SizqoVideo.DEFAULT_OPTIONS, true);
+  // CFG-01：首次启动的参数 = 默认意图编译结果（videoSmall）。预设下拉不再
+  // 预选 balanced —— 旧写法让 chip 显示 CRF28/MP4、提交的也是 CRF28/MP4，
+  // 预设框却指着 balanced（auto/abr）：三处各说各话。
+  selectedVideoPresetId = '';
+  applyVideoOptions(window.SizqoVideo.DEFAULT_OPTIONS, true);
   return false;
 }
 
@@ -788,7 +870,16 @@ function applyVideoPreset(presetId) {
     metadataPolicy: previous.metadataPolicy,
     subtitlePolicy: previous.subtitlePolicy,
   });
+  // CFG-01 规则 6：应用预设后同步预设 ID **和**意图状态 —— 意图编译结果与
+  // 预设参数一致才回到那个意图，否则如实切到自定义。绝不让意图条继续宣称
+  // 一套控件里根本没有的参数。
+  var matchedIntent = matchVideoIntentForOptions(options);
+  if (videoIntent.intent !== matchedIntent) {
+    videoIntent.intent = matchedIntent;
+    renderIntentBar();
+  }
   applyVideoOptions(options);
+  renderVideoCapabilities();
   saveVideoSettings();
   return true;
 }
@@ -844,6 +935,12 @@ function renderVideoCapabilities() {
   }
   if (presetSelect) {
     presetSelect.innerHTML = '';
+    // CFG-01：'' = 没选预设（意图条是参数的唯一来源）。空选项必须存在，
+    // 否则浏览器会保留上一次的选中项假装还在。
+    var noneOption = document.createElement('option');
+    noneOption.value = '';
+    noneOption.textContent = localizeUiText('不使用预设（跟随意图）');
+    presetSelect.appendChild(noneOption);
     (videoPresets || []).forEach(function(preset) {
       var id = window.SizqoVideo.presetId(preset);
       if (!id) return;
@@ -855,14 +952,14 @@ function renderVideoCapabilities() {
     });
     if (!videoPresets.length) {
       var unavailablePreset = document.createElement('option');
-      unavailablePreset.value = 'balanced';
+      unavailablePreset.value = '';
       unavailablePreset.textContent = videoCapabilities.loading ? localizeUiText('正在检测视频编码能力…') : localizeUiText('视频预设不可用');
       unavailablePreset.disabled = true;
       presetSelect.appendChild(unavailablePreset);
     }
   }
   if (encoderSelect && currentVideoOptions.encoder) encoderSelect.value = currentVideoOptions.encoder;
-  if (presetSelect && selectedVideoPresetId) presetSelect.value = selectedVideoPresetId;
+  if (presetSelect) presetSelect.value = selectedVideoPresetId || '';
   syncVideoSettingsControls();
 }
 
@@ -1275,10 +1372,6 @@ function handleFilePaths(filePaths) {
     updateQueueSummary();
     renderFileQueue();
     if (typeof updateMediaWorkspace === 'function') updateMediaWorkspace();
-    added.forEach(function(filePath) {
-      var item = queueItems.get(filePath);
-      if (item && item.mediaKind === 'video' && item.videoProbe) queueVideoCover(item);
-    });
     // 导入之后详情列不该是空的：默认落到第一个新来的文件，用户一眼能看到"它到底多大"。
     if (added.length > 0) selectQueueFile(added[0]);
     var scroller = document.querySelector('.list-scroll');
@@ -1298,6 +1391,7 @@ function handleFilePaths(filePaths) {
       if (importReport.readDirectoryFailed) failedBits.push(importReport.readDirectoryFailed + ' 个目录读取失败');
       if (importReport.canonicalizeFailed || importReport.disappeared) failedBits.push((importReport.canonicalizeFailed + importReport.disappeared) + ' 个文件无法解析或已消失');
       if (importReport.unsupported) failedBits.push(importReport.unsupported + ' 个不支持的文件');
+      if (importReport.duplicates) failedBits.push(importReport.duplicates + ' 个重复文件（只收一次）');
       if (importReport.probeFailed) failedBits.push(importReport.probeFailed + ' 个视频探测失败（已入队待重试）');
       if (failedBits.length > 0) {
         showToast(localizeUiText('导入完成（' + importReport.imported + ' 个），但：') + failedBits.join('；'));
@@ -2138,6 +2232,8 @@ function createQueueRow(filePath) {
   row.className = 'media-item' + (isVideo ? ' media-kind-video' : '');
   row.dataset.mediaKind = isVideo ? 'video' : 'image';
   row.dataset.file = filePath;
+  // PERF-6.2：视频行进视口才抽帧（懒加载）。隐藏行不会触发 IntersectionObserver。
+  if (isVideo && videoCoverObserver) videoCoverObserver.observe(row);
   row.innerHTML =
     '<span class="media-thumb">' + iconMarkup(isVideo ? 'video' : 'image', true) + '</span>' +
     '<span class="media-title">' +
@@ -2386,28 +2482,11 @@ function appendVideoAction(actions, action, title, icon, callback) {
   return button;
 }
 
+/// 兼容入口：详情面板/既有调用点显式点名要一张封面。
+/// 视口里的行由 IntersectionObserver 自动触发（见 videoCoverObserver）。
 function queueVideoCover(item) {
-  if (!item || item.mediaKind !== 'video' || item.coverRequested) return;
-  item.coverRequested = true;
-  videoCoverQueue.push(item);
-  if (!videoCoverBusy) drainVideoCoverQueue();
-}
-
-async function drainVideoCoverQueue() {
-  videoCoverBusy = true;
-  while (videoCoverQueue.length) {
-    var item = videoCoverQueue.shift();
-    if (!item || queueItems.get(item.path) !== item) continue;
-    try {
-      var frame = await invoke('preview_video_frame', { path: item.path, timeUs: 0 });
-      var dataUrl = typeof frame === 'string' ? frame : frame && (frame.dataUrl || frame.frame);
-      if (typeof dataUrl === 'string' && dataUrl.startsWith('data:image/')) {
-        item.coverUrl = dataUrl;
-        paintQueueRow(item.path);
-      }
-    } catch (_) { /* A missing thumbnail never blocks importing or encoding. */ }
-  }
-  videoCoverBusy = false;
+  if (!item || item.mediaKind !== 'video' || !item.videoProbe) return;
+  videoCovers.requestCover(item);
 }
 
 async function openMediaFile(filePath) {
@@ -2429,7 +2508,14 @@ async function cancelCurrentVideo(taskId) {
   target.cancelRequested = true;
   paintQueueRow(target.path);
   try {
-    await invoke('cancel_video_task', { taskId: taskId, sessionId: executionSession.id });
+    // TX-04：后端用同一本账仲裁取消与提交。accepted=false && committing=true
+    // = 任务已进入原子提交段 —— 必须如实告知"正在提交"，绝不显示成已取消。
+    var outcome = await invoke('cancel_video_task', { taskId: taskId, sessionId: executionSession.id });
+    if (outcome && outcome.committing) {
+      target.cancelRequested = false;
+      paintQueueRow(target.path);
+      showToast(localizeUiText('正在提交结果，无法取消；完成后会显示在队列里'));
+    }
   } catch (error) {
     target.cancelRequested = false;
     paintQueueRow(target.path);
@@ -2946,6 +3032,8 @@ function clearAllFiles() {
 function resetQueue() {
   files = [];
   inputPaths = [];
+  // 封面缓存跟着队列一起清（惰性守卫：测试切片只装 resetQueue 一段）。
+  if (typeof videoCovers !== 'undefined' && videoCovers.clear) videoCovers.clear();
   queueItems = new Map();
   fileRows = {};
   // 行缓存的顺序表跟着行本体一起清：留着只有一堆已删文件的空壳。
@@ -3559,6 +3647,11 @@ function selectQueueFile(filePath) {
   if (previous && previous !== selectedQueueFile) paintQueueRow(previous);
   if (selectedQueueFile) paintQueueRow(selectedQueueFile);
   renderDetailPane();
+  // 详情列正在展示这份视频：它就是用户此刻看得见的那一行，直接点名要封面。
+  if (selectedQueueFile) {
+    var item = queueItems.get(selectedQueueFile);
+    if (item && item.mediaKind === 'video' && item.videoProbe) videoCovers.requestCover(item);
+  }
 }
 
 function detailSection(parent, className) {

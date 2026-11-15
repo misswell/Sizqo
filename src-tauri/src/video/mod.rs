@@ -142,6 +142,9 @@ pub struct VideoResult {
     #[serde(default)] pub target_bytes: Option<f64>,
     #[serde(default)] pub target_met: Option<bool>,
     #[serde(default)] pub target_deviation: Option<f64>,
+    /// RES-02：产物复探摘要（分辨率/帧率/时长），随历史一起落盘，
+    /// 重启后历史详情不需要重新 ffprobe 也能还原真实输出。
+    #[serde(default)] pub output_probe: Option<serde_json::Value>,
 }
 impl VideoResult {
     pub fn pending(task_id: &str, path: &Path, options: &VideoOptions) -> Self {
@@ -151,7 +154,7 @@ impl VideoResult {
             savings: None, reason: None, warnings: vec![], diagnostics_log_path: None,
             output_mode: options.output_mode.clone(), history_id: None, stage: "failed".into(),
             outcome: None, reason_code: None,
-            target_bytes: None, target_met: None, target_deviation: None }
+            target_bytes: None, target_met: None, target_deviation: None, output_probe: None }
     }
 }
 pub fn is_video_extension(path:&Path) -> bool {

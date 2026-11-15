@@ -32,6 +32,14 @@ captures pending target paths at start; later imports are for a later session.
 
 The scheduler checks **cancel → stop → pause/parallelism**. Stop emits `deferred`
 for unstarted work, never `cancelled`. Only explicit removal emits `cancelled`.
+
+Commit-time cancellation is arbitrated by one shared ledger (`TaskLedger`):
+`request_cancel` and `try_begin_commit` race on the same lock, so exactly one of
+them wins. A cancelled task refuses to commit; a committing task refuses to be
+cancelled and finishes its commit. Entering the commit segment is recorded
+(`committing`) and released when the commit attempt ends, success or failure.
+Both tracks (image and video) use this one mechanism; video additionally refuses
+to classify commit-segment failures as cancellations.
 Automatic compression may open another session for newly imported pending items
 after normal completion. Explicit stop suppresses that automatic continuation.
 

@@ -93,6 +93,15 @@ pub struct ReplaceTransaction {
     /// 旧问题借默认值复活。RC.2 起写入方总是显式落这个字段。
     #[serde(default = "default_backup_legacy_unverified")]
     pub backup_legacy_unverified: bool,
+    /// 事务状态机（TX-01）：见 `TransactionStage`。老日志缺字段按 Preparing 读。
+    #[serde(default = "default_stage")]
+    pub stage: TransactionStage,
+    /// 覆盖模式原子交换把原图换出后的保留路径（`.sizqo-retire-*.keep`）。
+    /// TX-02：这条路径必须进事务日志与历史（`HistoryEntry.retired_original_path`），
+    /// 回滚成功后按内容指纹收走，清空历史时按身份安全清理。None = 交换未发生
+    /// 或换出内容已按凭证降级删除。
+    #[serde(default)]
+    pub retired_original_path: Option<String>,
 }
 
 /// RC.1 迁移默认值：缺字段按"未验证"处理（保守）。
@@ -102,6 +111,38 @@ fn default_backup_legacy_unverified() -> bool {
 
 fn default_mode() -> TransactionMode {
     TransactionMode::ReplaceExisting
+}
+
+/// 事务生命周期状态机（本轮加固 TX-01）。journal 里这条事务此刻走到哪一步
+/// 是**落盘的事实**：调用方手里的 `claimed_output` / `replaced` 布尔只反映
+/// 单次函数调用的局部视角，崩溃恢复与错误分支的判定依据必须是它 + 内容指纹。
+///
+/// 状态推进只有单向（Preparing → … → HistoryPersisted），任何一阶段失败，
+/// 恢复动作按当前 stage 与 mode 决定；`stage` 缺省（老日志）按 Preparing 处理，
+/// 真实归属仍由指纹与凭证回答 —— stage 是状态记录，不是归属证明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransactionStage {
+    /// 已记账，备份/候选验证尚未完成；覆盖尚未发生。
+    Preparing,
+    /// 原图备份已就绪并通过凭证验证。
+    BackupVerified,
+    /// 候选产物已落盘（编码完成）。
+    Encoded,
+    /// 候选已通过内容指纹/媒体校验，覆盖尚未发生。
+    OutputValidated,
+    /// 原子交换/安装**进行中**：崩溃恢复见到它时，覆盖是否发生必须靠
+    /// 源位置的内容指纹判定（describe_pending 的职责），不能假设。
+    Committing,
+    /// 目标位上已是本次产物：此后任何失败都必须走回滚（ReplaceExisting）
+    /// 或产物收走（CreateNew），绝不允许销账了事。
+    OutputPublished,
+    /// 历史记录已持久化且经读取确认，只欠销账。
+    HistoryPersisted,
+}
+
+fn default_stage() -> TransactionStage {
+    TransactionStage::Preparing
 }
 
 /// 当前落账格式版本。`SCHEMA_VERSION` 及以上的记录在 `prepare` 时强制校验凭证。
@@ -254,8 +295,44 @@ impl TransactionStore {
     }
 
     /// 事务已完整提交（历史也写成了）：销账。
+    /// §2.5：销账本身也是目录项变更 —— 删完日志必须把目录落盘，
+    /// 否则崩溃后"日志还在、历史也有"的重复恢复只是白做，但
+    /// "日志消失证据丢了"会让 has_pending 判断失真。
     pub fn finish(&self, id: &str) {
         let _ = fs::remove_file(self.path_of(id));
+        if let Err(error) = crate::history::sync_dir(&self.root) {
+            log::warn!("事务日志销账后目录落盘失败（不影响正确性，仅影响断电后的收口速度）: {error}");
+        }
+    }
+
+    /// 状态机推进（TX-01）：把 journal 里的 stage 更新为当前事实。
+    /// 覆盖发生**前后**的推进是恢复判定的分界线 —— OutputPublished 之后的
+    /// 失败必须回滚，之前的失败只需清残骸。日志不在（已销账）时是空操作。
+    pub fn update_stage(&self, id: &str, stage: TransactionStage) -> Result<(), String> {
+        self.patch(id, |txn| txn.stage = stage)
+    }
+
+    /// 记录原子交换换出的原图保留路径（TX-02）：崩溃后恢复据此识别
+    /// 尚未完成归属登记的保留文件（回滚成功按指纹收走，归属不明保留）。
+    pub fn update_retired_path(&self, id: &str, retired: &Path) -> Result<(), String> {
+        self.patch(id, |txn| {
+            txn.retired_original_path = Some(retired.to_string_lossy().into_owned())
+        })
+    }
+
+    /// 读-改-写一条日志。日志读取失败时**不改写**：半截写坏的日志交给
+    /// `list()` 的 `.unparsed` 通道保留现场，这里不覆盖它。
+    fn patch(&self, id: &str, apply: impl FnOnce(&mut ReplaceTransaction)) -> Result<(), String> {
+        let path = self.path_of(id);
+        let Ok(raw) = fs::read_to_string(&path) else {
+            // 日志已经不在（finish 过了）就没有可推进的：调用方按无事务收尾。
+            return Ok(());
+        };
+        let mut txn: ReplaceTransaction = serde_json::from_str(&raw)
+            .map_err(|error| format!("事务日志读取失败（{error}），保持原样"))?;
+        apply(&mut txn);
+        let json = serde_json::to_string(&txn).map_err(|e| e.to_string())?;
+        write_atomic(&path, json.as_bytes())
     }
 
     /// 产物落进的目标位与记账时的计划位不同（编码期间输出名被抢 → 换号重试，
@@ -263,16 +340,14 @@ impl TransactionStore {
     /// 崩在"已安装、历史没写"窗口里的恢复会拿着计划路径去找产物 —— 内容指纹
     /// 归属门虽然保证不误删，但实际位置上那份产物就没人认领了。
     pub fn update_output_path(&self, id: &str, actual: &Path) -> Result<(), String> {
-        let path = self.path_of(id);
-        let Ok(raw) = fs::read_to_string(&path) else {
-            // 日志已经不在（finish 过了）就没有可更新的：调用方按无事务收尾。
-            return Ok(());
-        };
-        let mut txn: ReplaceTransaction = serde_json::from_str(&raw)
-            .map_err(|error| format!("事务日志读取失败（{error}），保持原样"))?;
-        txn.output_path = actual.to_string_lossy().into_owned();
-        let json = serde_json::to_string(&txn).map_err(|e| e.to_string())?;
-        write_atomic(&path, json.as_bytes())
+        // TX-03 故障注入：模拟"日志更新失败"（磁盘满/权限被撤）。
+        #[cfg(test)]
+        if TEST_FAULT_UPDATE_OUTPUT_PATH.with(std::cell::Cell::get) {
+            return Err("injected journal update failure".into());
+        }
+        self.patch(id, |txn| {
+            txn.output_path = actual.to_string_lossy().into_owned();
+        })
     }
 
     pub fn list(&self) -> Vec<ReplaceTransaction> {
@@ -504,6 +579,7 @@ pub fn manual_restore(
     }
     HistoryStore::write_backup_back_to_source(&backup, &source)?;
     remove_generated_output(txn);
+    retire_swapped_out_copy(txn);
     Ok(())
 }
 
@@ -575,11 +651,13 @@ pub fn rollback(txn: &ReplaceTransaction) -> Result<(), String> {
                 };
                 write_back_verified(&backup, &source, &expected)?;
                 remove_generated_output(txn);
+                retire_swapped_out_copy(txn);
                 return Ok(());
             }
             if txn.original_sha256.as_deref() == Some(current.as_str()) {
                 // 源文件还是没动过的原图：什么都没有被覆盖，只需清掉自己的残骸。
                 remove_generated_output(txn);
+                retire_swapped_out_copy(txn);
                 return Ok(());
             }
             if txn.output_sha256.is_none() && txn.original_sha256.is_none() {
@@ -593,6 +671,7 @@ pub fn rollback(txn: &ReplaceTransaction) -> Result<(), String> {
                 };
                 if backup_bytes == current {
                     remove_generated_output(txn);
+                    retire_swapped_out_copy(txn);
                     return Ok(());
                 }
                 return Err(format!(
@@ -634,7 +713,7 @@ fn verify_backup_voucher(txn: &ReplaceTransaction, backup: &Path) -> Result<(), 
 /// **体积不构成所有权证明**（本轮加固 P1-4）：老日志没有产物指纹时，与
 /// `expected_output_size` 恰好同大的文件可能是用户后来放进这个路径的自己的内容 ——
 /// 大小对上一律保留，宁留孤儿不误删。
-fn remove_generated_output(txn: &ReplaceTransaction) {
+pub(crate) fn remove_generated_output(txn: &ReplaceTransaction) {
     let source = PathBuf::from(&txn.source_path);
     if txn.cross_format || !crate::history::same_file(&PathBuf::from(&txn.output_path), &source) {
         let output = Path::new(&txn.output_path);
@@ -742,6 +821,34 @@ fn protected_marker_path(temp: &Path) -> PathBuf {
     let mut name = temp.as_os_str().to_os_string();
     name.push(".protected");
     PathBuf::from(name)
+}
+
+/// TX-02：交换换出的原图保留文件（`.sizqo-retire-*.keep`）。回滚成功后它与
+/// 备份内容重复 —— 按内容指纹收走这份副本；大小或指纹对不上就原样保留
+/// （宁留一份可恢复的副本，也不删证明不了归属的字节）。幂等：文件不在就无事可做。
+fn retire_swapped_out_copy(txn: &ReplaceTransaction) {
+    let Some(retired) = txn.retired_original_path.as_deref() else {
+        return;
+    };
+    let path = PathBuf::from(retired);
+    let Ok(meta) = fs::metadata(&path) else {
+        return;
+    };
+    let ours = meta.len() == txn.original_size
+        && txn
+            .original_sha256
+            .as_deref()
+            .is_some_and(|expected| {
+                crate::source_identity::sha256_of(&path).ok().as_deref() == Some(expected)
+            });
+    if ours {
+        let _ = fs::remove_file(&path);
+    } else if meta.len() != txn.original_size {
+        log::warn!(
+            "交换换出的原图保留文件与记账大小不符，证明不了归属，已原样保留: {}",
+            path.display()
+        );
+    }
 }
 
 /// 这条临时路径是否被显式声明为"外部字节所在"。
@@ -959,6 +1066,12 @@ pub(crate) fn write_back_verified(
     target: &Path,
     expected: &crate::source_identity::SourceIdentity,
 ) -> Result<(), String> {
+    // TX-01 故障注入：回滚写回失败的替身（磁盘错误）。注入位在复制之前 ——
+    // 现场必须保持"产物在源位、备份原样、日志未销账"的可恢复状态。
+    #[cfg(test)]
+    if TEST_FAULT_ROLLBACK_WRITE_BACK.with(std::cell::Cell::get) {
+        return Err("injected rollback write-back failure".into());
+    }
     let staged = StagedOutput::copy_staged(backup, target)?;
     let expected_sha = staged.written_sha256();
     match publish_replace_if_identity_matches(&staged.temp, target, expected, expected_sha.as_deref())
@@ -1717,6 +1830,13 @@ fn restore_over_occupied(quarantine: &Path, original: &Path) -> Restored {
 /// 4 = 复验**通过之后**才写：用户上一轮问的那个极窄窗口（改名不让别人的 fd 失效）。
 #[cfg(test)]
 thread_local! {
+    /// TX-03 故障注入：update_output_path（换号重试后的记账路径更新）拒绝写入。
+    pub(crate) static TEST_FAULT_UPDATE_OUTPUT_PATH: std::cell::Cell<bool>
+        = const { std::cell::Cell::new(false) };
+    /// TX-01 故障注入：回滚的写回步骤失败（磁盘错误替身），验证"回滚失败
+    /// 保留全部恢复现场"。
+    pub(crate) static TEST_FAULT_ROLLBACK_WRITE_BACK: std::cell::Cell<bool>
+        = const { std::cell::Cell::new(false) };
     pub(crate) static TEST_FAULT_IN_RETIRE_WINDOW: std::cell::Cell<u8>
         = const { std::cell::Cell::new(0) };
     /// 目标位空出来之后、候选放进去之前：外部把这份空位占了。
@@ -1729,6 +1849,18 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_fault_in_retire_window(mode: u8) {
     TEST_FAULT_IN_RETIRE_WINDOW.with(|cell| cell.set(mode));
+}
+
+/// 测试用：开关"换号重试后日志路径更新失败"的故障注入（TX-03）。
+#[cfg(test)]
+pub(crate) fn set_fault_update_output_path(active: bool) {
+    TEST_FAULT_UPDATE_OUTPUT_PATH.with(|cell| cell.set(active));
+}
+
+/// 测试用：开关"回滚写回失败"的故障注入（TX-01 回滚失败分支）。
+#[cfg(test)]
+pub(crate) fn set_fault_rollback_write_back(active: bool) {
+    TEST_FAULT_ROLLBACK_WRITE_BACK.with(|cell| cell.set(active));
 }
 
 #[cfg(test)]
@@ -2311,9 +2443,20 @@ impl StagedOutput {
     }
 
     /// 把已经 fsync 的临时文件原子改名到目标。改名之前该核的都必须已经核过。
+    ///
+    /// §2.5（TX-05）：rename 成功只说明内核改了目录项，断电后 rename 可能整个
+    /// 消失。所以每一次暂存发布（history.json、事务日志、设置文件、备份写回……
+    /// 全部走这里）都在改名后把**目标目录**落盘 —— 目录 fsync 只在
+    /// `history::sync_dir` 一处实现，调用方不再各自散落。
     pub fn publish(&self, target: &Path) -> Result<(), String> {
         fs::rename(&self.temp, target)
-            .map_err(|e| format!("{} → {}: {e}", self.temp.display(), target.display()))
+            .map_err(|e| format!("{} → {}: {e}", self.temp.display(), target.display()))?;
+        let parent = target
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        crate::history::sync_dir(parent)
+            .map_err(|e| format!("{} 发布后目录落盘失败: {e}", target.display()))
     }
 
     /// 带**占位凭证**的提交：目标路径上必须还是我们认领的那个 inode 才允许 rename。
@@ -2494,6 +2637,8 @@ mod tests {
             mode: TransactionMode::ReplaceExisting,
             schema_version: 0,
             backup_legacy_unverified: false,
+            stage: crate::output_transaction::TransactionStage::Preparing,
+            retired_original_path: None,
         }
     }
 
@@ -2910,6 +3055,8 @@ mod tests {
             mode: TransactionMode::CreateNew,
             schema_version: 0,
             backup_legacy_unverified: false,
+            stage: crate::output_transaction::TransactionStage::Preparing,
+            retired_original_path: None,
         }
     }
 

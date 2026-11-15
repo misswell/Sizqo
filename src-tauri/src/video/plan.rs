@@ -18,6 +18,21 @@ pub fn build(options:&VideoOptions,probe:&VideoProbe,caps:&CapabilityMatrix,budg
     member(&options.audio_policy,&["copy","aac","opus","mp3","flac","none"],"audio policy")?;
     member(&options.subtitle_policy,&["copy","drop"],"subtitle policy")?;
     let metadata_policy=MetadataPolicy::parse(&options.metadata_policy).ok_or_else(||format!("Invalid metadata policy: {}",options.metadata_policy))?;
+    // VAL-01a：KeepAll 的承诺是"原样带过去"，与删除音轨/字幕、转码音轨的策略
+    // 互相矛盾。旧版本放它们通过预检，靠编码后的验证器拦下 —— 那等于白烧几十
+    // 分钟 CPU 才换来一条必然失败。互相矛盾的参数必须在计划阶段就给出可理解的
+    // 拒绝理由。
+    if metadata_policy==MetadataPolicy::KeepAll{
+        if options.audio_policy=="none"{return Err("KeepAll (preserve all metadata and streams) conflicts with removing audio; pick an audio policy, or use StripPrivate/StripAll".into());}
+        if options.subtitle_policy=="drop"{return Err("KeepAll (preserve all metadata and streams) conflicts with dropping subtitles; pick a subtitle policy, or use StripPrivate/StripAll".into());}
+        // KeepAll 的逐流对账要求 audio codec 原样（T13 契约）；音频策略却要把
+        // 音轨转成另一种 codec 时，编码完必然失败 —— 源里只要有一条不匹配就拒绝。
+        if let Some(target)=match options.audio_policy.as_str(){"aac"|"opus"|"mp3"|"flac"=>Some(options.audio_policy.as_str()),_=>None}{
+            if let Some(offender)=probe.audio().find(|a|a.codec_name!=target){
+                return Err(format!("KeepAll promises stream preservation but the audio policy would re-encode {} audio into {target}; use \"copy\", or pick StripPrivate/StripAll",offender.codec_name));
+            }
+        }
+    }
     if options.output_mode=="directory"||options.output_mode=="folder" {if options.output_dir.as_deref().filter(|s|!s.is_empty()).is_none(){return Err("Select an output directory".into());}}
     let video=probe.video().ok_or("No video stream")?;
     // §5.1 §5.2 位深 / Alpha / 浮点 / HDR / 隔行 / BT.2020-SDR 全部由能力分类器

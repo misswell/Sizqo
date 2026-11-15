@@ -11,7 +11,7 @@
 
 use sizqo_lib::history::{HistoryEntry, HistoryStore, HistoryStatus};
 use sizqo_lib::output_transaction::{
-    TransactionStore, ReplaceTransaction, TransactionMode, SCHEMA_VERSION,
+    TransactionStore, ReplaceTransaction, TransactionMode, TransactionStage, SCHEMA_VERSION,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,6 +62,8 @@ fn run_crash_child(phase: &str, workdir: &Path) -> ! {
         mode: TransactionMode::ReplaceExisting,
         schema_version: SCHEMA_VERSION,
         backup_legacy_unverified: false,
+        stage: TransactionStage::Preparing,
+        retired_original_path: None,
     };
 
     // §9.1 审查修复（本轮真正落地）：现场改由**生产代码**铺陈 ——
@@ -148,6 +150,69 @@ fn run_crash_child(phase: &str, workdir: &Path) -> ! {
                 };
                 history.add(entry).unwrap();
             }
+            // TX-01/02 视频线：真实原子交换后崩溃，journal 记录 stage=OutputPublished
+            // 与换出的原图保留路径。恢复必须回滚原图并按指纹收走保留文件。
+            "video_after_publish_retired" => {
+                txn.original_sha256 = Some(original_hash.clone());
+                txn.stage = TransactionStage::OutputPublished;
+                transactions.prepare_durable(&txn).unwrap();
+                fs::write(&partial, COMPRESSED).unwrap();
+                let settled = sizqo_lib::output_transaction::publish_replace_if_identity_matches(
+                    &partial, &source, &identity,
+                    Some(compressed_hash.as_str()),
+                )
+                .expect("生产交换必须成功");
+                if let Some(retained) = &settled.swapped_out_retained_at {
+                    sizqo_lib::output_transaction::TransactionStore::new(
+                        history_root.join("transactions"),
+                    )
+                    .update_retired_path(&txn.id, retained)
+                    .unwrap();
+                }
+            }
+            // TX-01 视频线：历史已落盘（stage=HistoryPersisted），恢复只该销账。
+            "video_after_history_persisted" => {
+                txn.original_sha256 = Some(original_hash.clone());
+                txn.stage = TransactionStage::HistoryPersisted;
+                transactions.prepare_durable(&txn).unwrap();
+                fs::write(&partial, COMPRESSED).unwrap();
+                let settled = sizqo_lib::output_transaction::publish_replace_if_identity_matches(
+                    &partial, &source, &identity,
+                    Some(compressed_hash.as_str()),
+                )
+                .expect("生产交换必须成功");
+                let entry = HistoryEntry {
+                    media_kind: "video".into(),
+                    video_metadata: None,
+                    retired_original_path: settled
+                        .swapped_out_retained_at
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    id: "crash-1".into(),
+                    created_at: sizqo_lib::history::now_millis(),
+                    expires_at: sizqo_lib::history::now_millis() + 86_400_000,
+                    source_path: source.to_string_lossy().into(),
+                    output_path: Some(source.to_string_lossy().into()),
+                    file_name: "photo.png".into(),
+                    output_mode: "replace".into(),
+                    original_size: ORIGINAL.len() as u64,
+                    compressed_size: COMPRESSED.len() as u64,
+                    savings: 50.0,
+                    out_type: "png".into(),
+                    algorithm: "test".into(),
+                    backup_path: Some(real.to_string_lossy().into()),
+                    status: HistoryStatus::Compressed,
+                    restored_at: None,
+                    output_modified_at: sizqo_lib::history::file_mtime_millis(&source),
+                    source_sha256: Some(hex(ORIGINAL)),
+                    output_sha256: Some(compressed_hash.clone()),
+                    backup_sha256: Some(hex(ORIGINAL)),
+                    source_exists: true,
+                    backup_exists: true,
+                    output_exists: true,
+                };
+                history.add(entry).unwrap();
+            }
             other => panic!("unknown crash phase: {other}"),
         }
         real
@@ -194,6 +259,8 @@ fn main() {
         ("after_rename", "restored"),
         ("after_history", "committed"),
         ("legacy_after_rename", "preserved"),
+        ("video_after_publish_retired", "video_restored_with_retired"),
+        ("video_after_history_persisted", "video_committed_with_retired"),
     ];
     for (phase, expectation) in phases {
         let workdir = parent.path().join(phase);
@@ -244,6 +311,36 @@ fn main() {
                 assert_eq!(fs::read(&backup).unwrap(), ORIGINAL, "{phase}: 备份保留");
                 assert!(transactions.has_pending(), "{phase}: 事务日志留在现场");
             }
+            "video_restored_with_retired" => {
+                assert_eq!(report.rolled_back, 1, "{phase}: stage=OutputPublished 必须回滚");
+                assert_eq!(fs::read(&source).unwrap(), ORIGINAL, "{phase}: 原图必须被恢复");
+                assert!(!transactions.has_pending(), "{phase}: 回滚成功销账");
+                let keep_files: Vec<_> = fs::read_dir(workdir)
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| e.file_name().to_string_lossy().contains(".sizqo-retire-"))
+                    .collect();
+                for keep in keep_files {
+                    let bytes = fs::read(keep.path()).unwrap();
+                    assert_ne!(bytes, ORIGINAL, "{phase}: 原图的保留副本必须按指纹收走");
+                }
+            }
+            "video_committed_with_retired" => {
+                assert_eq!(report.committed, 1, "{phase}: 历史已记录 = 补删日志");
+                assert_eq!(fs::read(&source).unwrap(), COMPRESSED, "{phase}: 提交产物保持");
+                assert!(!transactions.has_pending(), "{phase}: 日志销账");
+                // 换出的原图保留文件仍归历史管理（retiredOriginalPath），不许丢。
+                let history_entry = history
+                    .list()
+                    .into_iter()
+                    .find(|e| e.id == "crash-1")
+                    .expect("历史条目在场");
+                let retired = history_entry.retired_original_path.expect("retired 路径必须入历史");
+                let retired_bytes = fs::read(&retired).unwrap_or_else(|e| {
+                    panic!("{phase}: 历史登记的保留文件必须还在磁盘上: {retired} ({e})")
+                });
+                assert_eq!(retired_bytes, ORIGINAL, "{phase}: 保留文件就是原图字节");
+            }
             other => panic!("{other}"),
         }
 
@@ -268,5 +365,5 @@ fn main() {
             report.rolled_back, report.committed
         );
     }
-    println!("崩溃注入 6 个阶段（每阶段 SIGKILL + 两次恢复）全部通过");
+    println!("崩溃注入 8 个阶段（每阶段 SIGKILL + 两次恢复）全部通过");
 }

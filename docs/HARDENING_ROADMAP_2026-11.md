@@ -161,3 +161,42 @@ SHA（需解包）、FFmpeg GPL 对应源码义务、Direct Windows/Linux 随包
 签名/公证/装订。T11 于 rc.15 补齐——Rust 侧在 rc.11 曾漏做（validation.md 已
 更正失实记录），rc.15 以 APP1 EXIF 拼接夹具 1–8 八方向 + Orientation=6 端到端
 闭合（tests/exif_orientation.rs）。
+
+### 复核轮 —— 0.3.6-rc.18（2026-11-15）
+
+以《全仓库可靠性修复与完整验收任务书》为基准、在 f1b59f9（rc.17）上由四个
+只读审计代理逐项回证后实施。逐条结论与测试证据见 docs/validation.md 的
+0.3.6-rc.18 节。要点（只列本轮**新闭合**的缺口）：
+
+- **TX-01**：视频覆盖成功后 `history.add` 失败不回滚、事务日志反被销账的缺口
+  闭合。`ReplaceTransaction` 新增 `stage` 状态机（serde default 兼容旧日志）与
+  `retired_original_path`；"历史写成"以 `contains_committed` 读回为准；回滚
+  失败保留日志/备份/换出文件（`TEST_FAULT_ROLLBACK_WRITE_BACK` 故障注入背书）。
+  拒绝任务书提出的"新建 13 态状态机"，按既定裁定（本文件冲突裁定 #2）以
+  journal 增量字段实现同等语义。
+- **TX-02**：`SwapPublishOutcome.swapped_out_retained_at` 接线到事务日志与
+  `HistoryEntry.retiredOriginalPath`；回滚成功按内容指纹收走换出副本；清空
+  历史按身份清理；恢复幂等（崩溃注入 8 阶段背书）。
+- **TX-03**：非覆盖模式"先装产物、后置占用"的顺序倒置闭合——`update_output_path`
+  失败时产物按指纹门收走，不留孤儿；占位身份 `(dev,ino)` 随事务日志入账。
+- **TX-04**：视频接入图片线的 TaskLedger 提交门（同一把锁两本账）；
+  `cancel_video_task` 在提交段拒绝并返回 committing 状态；提交段失败不再被
+  cancel 旗标误分类。场景 A/B + 200 轮双线程竞争断言（Swift T08 已有同款）。
+- **TX-05**：`StagedOutput::publish` 统一目录 fsync（history.json / 事务日志 /
+  设置 / 备份写回一处修全类）；`TransactionStore::finish` 销账后目录落盘；
+  视频覆盖分支与换出保留的 rename 后目录落盘。
+- **CFG-01**：首启不再预选 balanced；应用预设同步意图状态（完全匹配才回意图，
+  否则如实切 videoCustom）；切意图清预设选择；frameRate null 真的清空控件；
+  重启按存档恢复；fallback 预设名表与后端 presets.rs 的 id 对齐。
+- **RES-01**：视频 targetMet=false → `TargetUnmet`（历史与结果同一知情点回填）；
+  targetSize 且源已在目标内 → `SkippedAlreadyUnderTarget`。
+- **RES-02**：历史 `videoMetadata` 补齐实际参数快照 / 目标对账三字段 / outcome /
+  reasonCode / 产物复探摘要。
+- **VAL**：KeepAll × 移除音轨/字幕/转码音轨在 plan 阶段拒绝；StripPrivate 逐流/
+  逐章节/逐附件对账保留面；附件按流位置逐个对账（同名不覆盖）；帧数对账
+  fail-closed（`nb_frames` 不再拿容器声明值冒充实测）。
+- **REC-01**：编码作业目录按内容自证清扫；占位身份入账恢复；换出保留文件
+  恢复路径闭合；崩溃注入 6→8 阶段。
+- **PERF**：导入报告 directories/images/videos/duplicates/unsupported/disappeared
+  逐类记账；封面懒加载（IntersectionObserver + 串行 + LRU 双上限 + probe 复用 +
+  队列清空清缓存）；附件解包/SHA 校验接入取消令牌。
