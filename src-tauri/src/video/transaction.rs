@@ -622,6 +622,8 @@ pub(crate) fn set_fault_no_space(active:bool){
         let history_json=history_root.join("history.json");
         // 首次写入前 history.json 可能还不存在（惰性创建）：缺省就是 None。
         let before=fs::read(&history_json).ok();
+        // Windows 分支要比较残骸字节：旧历史存在时用它，不存在时空表。
+        let before_bytes=before.clone().unwrap_or_default();
         let mut result=VideoResult::pending("t1",&source,&o);
         let mut claimed_slot=None;
         crate::output_transaction::set_fault_staged_write_midway_for(Some(history_json.clone()));
@@ -630,11 +632,22 @@ pub(crate) fn set_fault_no_space(active:bool){
         assert!(error.contains("original was restored"),"写一半失败按历史失败回滚: {error}");
         assert_eq!(fs::read(&source).unwrap(),ORIGINAL,"原图字节恢复");
         assert_eq!(fs::read(&history_json).ok(),before,"旧历史一个字节没变（rename 未发生）");
-        // 暂存残骸被归属门收走：history 根下不留 .sizqo-write-* 半成品。
+        // 暂存残骸按归属门处置：unix 上 inode 凭证对得上 → 收走；Windows 没有
+        // (dev,ino) 凭证、内容又只剩写一半（与承诺指纹对不上）→ 证明不了归属
+        // 就**保留**（宁留残骸不删未知字节 —— 那正是归属门的意义）。两个平台
+        // 共同的硬断言是：目标 history.json 未被 rename、旧内容原封不动。
         let leftovers:Vec<String>=fs::read_dir(&history_root).unwrap().flatten()
             .map(|e|e.file_name().to_string_lossy().into_owned())
             .filter(|n|n.contains(".sizqo-write-")).collect();
-        assert!(leftovers.is_empty(),"写一半的暂存残骸必须被收走: {leftovers:?}");
+        if cfg!(unix){
+            assert!(leftovers.is_empty(),"unix 上写一半的暂存残骸必须被收走: {leftovers:?}");
+        }else{
+            for name in &leftovers{
+                let leftover=history_root.join(name);
+                assert_ne!(fs::read(&leftover).unwrap(),before_bytes,"残骸只许是写一半的字节，不许是完整旧历史");
+                let _=fs::remove_file(&leftover);// 测试自清理（非生产路径断言）
+            }
+        }
     }
 
     /// 8.1-历史目录权限被撤销：history 根只读（staged 建不出来）——
