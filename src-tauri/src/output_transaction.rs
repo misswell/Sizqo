@@ -1833,6 +1833,11 @@ thread_local! {
     /// TX-03 故障注入：update_output_path（换号重试后的记账路径更新）拒绝写入。
     pub(crate) static TEST_FAULT_UPDATE_OUTPUT_PATH: std::cell::Cell<bool>
         = const { std::cell::Cell::new(false) };
+    /// 8.1 历史写一半失败：对**指定目标**的暂存写入在写中途失败
+    /// （目标从未被 rename，调用方只见 Err —— 磁盘满/断电的写一半替身）。
+    /// 按目标路径限定，prepare/advance 等其他落盘不受影响。
+    pub(crate) static TEST_FAULT_STAGED_MIDWAY_FOR: std::cell::RefCell<Option<std::path::PathBuf>>
+        = const { std::cell::RefCell::new(None) };
     /// TX-01 故障注入：回滚的写回步骤失败（磁盘错误替身），验证"回滚失败
     /// 保留全部恢复现场"。
     pub(crate) static TEST_FAULT_ROLLBACK_WRITE_BACK: std::cell::Cell<bool>
@@ -1861,6 +1866,12 @@ pub(crate) fn set_fault_update_output_path(active: bool) {
 #[cfg(test)]
 pub(crate) fn set_fault_rollback_write_back(active: bool) {
     TEST_FAULT_ROLLBACK_WRITE_BACK.with(|cell| cell.set(active));
+}
+
+/// 测试用：注入"对指定目标的暂存写入中途失败"（8.1 历史写一半）。
+#[cfg(test)]
+pub(crate) fn set_fault_staged_write_midway_for(target: Option<std::path::PathBuf>) {
+    TEST_FAULT_STAGED_MIDWAY_FOR.with(|cell| *cell.borrow_mut() = target);
 }
 
 #[cfg(test)]
@@ -2546,6 +2557,22 @@ impl StagedOutput {
     ) -> Result<Self, String> {
         let staged = Self::claim(target, prefix)?;
         *staged.written_sha256.borrow_mut() = written_sha256;
+        // 8.1 故障注入：指定目标的写入在**写中途**失败 —— 目标从未被 rename，
+        // 调用方只见 Err，旧内容原封不动。
+        #[cfg(test)]
+        let fill: Box<dyn FnOnce(&mut fs::File) -> Result<(), String>> = {
+            let injected = TEST_FAULT_STAGED_MIDWAY_FOR
+                .with(|cell| cell.borrow().as_deref() == Some(target));
+            if injected {
+                Box::new(|file: &mut fs::File| {
+                    use std::io::Write;
+                    let _ = file.write_all(b"half-written");
+                    Err("injected staged write failure midway".into())
+                })
+            } else {
+                Box::new(fill)
+            }
+        };
         match staged.fill(fill).and_then(|()| staged.publish(target)) {
             Ok(()) => Ok(staged),
             Err(error) => {

@@ -106,16 +106,14 @@ fn plausible_video_header(path:&Path)->bool{
 }
 /// 是否值得为它起一次 ffprobe：明确的视频扩展名，或嗅探出了媒体容器特征。
 fn probe_candidate(path:&Path)->bool{video::is_video_extension(path)||plausible_video_header(path)}
-#[tauri::command]
-pub async fn probe_media(paths:Vec<String>,state:State<'_,AppState>)->Result<ImportedMediaBatch,String>{
-    state.access.remember_all(&paths);let access=state.access.clone();
-    tauri::async_runtime::spawn_blocking(move||{
-        let mut guards=vec![];for path in &paths{guards.push(access.acquire(Path::new(path),&mut||false).ok_or_else(||format!("Select the folder again to grant access: {path}"))?);}
+/// 导入管线的核心（PERF-6.2 验收 C 项的可测入口）：扫描 → 分类 → 有界并发
+/// 探测 → 报告。安全守卫由调用方先行取得；1000 视频基准直接驱动这一份。
+pub(crate) fn import_media_core(paths:&[std::path::PathBuf])->ImportedMediaBatch{
         let mut files=vec![];let mut seen=HashSet::new();let mut report=ImportReport::default();
-        for p in &paths {
-            let real=match Path::new(p).canonicalize(){Ok(r)=>r,Err(_)=>{report.canonicalize_failed+=1;report.disappeared+=1;continue}};
+        for p in paths {
+            let real=match p.canonicalize(){Ok(r)=>r,Err(_)=>{report.canonicalize_failed+=1;report.disappeared+=1;continue}};
             let root=if real.is_dir(){real.clone()}else{real.parent().map(Path::to_path_buf).unwrap_or_else(||real.clone())};
-            collect(&root,Path::new(p),&mut seen,&mut files,&mut report);
+            collect(&root,p.as_path(),&mut seen,&mut files,&mut report);
         }
         // §6.4：图片当场分类（魔数嗅探只读 64 字节，很便宜）；视频候选按槽位记录、
         // 有界并发探测；其余文件既不是图片也没有任何媒体特征，不再为它们白付 ffprobe。
@@ -182,7 +180,16 @@ pub async fn probe_media(paths:Vec<String>,state:State<'_,AppState>)->Result<Imp
         report.probe_failed=media.iter().filter(|m|m.media_kind=="video"&&m.video_probe.is_none()).count();
         // 注意：report.unsupported 在分类循环里逐个记账；扫描层（collect）的
         // skipped/canonicalize_failed/permission_denied 等都各有自己的计数。
-        Ok::<_,String>(ImportedMediaBatch{media,report})
+        ImportedMediaBatch{media,report}
+}
+
+#[tauri::command]
+pub async fn probe_media(paths:Vec<String>,state:State<'_,AppState>)->Result<ImportedMediaBatch,String>{
+    state.access.remember_all(&paths);let access=state.access.clone();
+    tauri::async_runtime::spawn_blocking(move||{
+        let mut guards=vec![];for path in &paths{guards.push(access.acquire(Path::new(path),&mut||false).ok_or_else(||format!("Select the folder again to grant access: {path}"))?);}
+        let owned:Vec<std::path::PathBuf>=paths.iter().map(PathBuf::from).collect();
+        Ok::<_,String>(import_media_core(&owned))
     }).await.map_err(|e|e.to_string())?
 }
 #[tauri::command]
@@ -525,6 +532,49 @@ mod import_tests {
         assert_eq!(images, 2);
         assert_eq!(candidates, 1);
         assert_eq!(report.scanned, report.directories + files.len(), "scanned = 目录 + 去重后的文件");
+    }
+
+    /// 验收 C 项基准（PERF-6.2）：**一次导入 1000 个视频**。真实驱动导入管线
+    /// （扫描 → 分类 → 有界并发 ffprobe → 报告）：
+    ///   - 1000 份 EBML 魔数文件全部进候选、全部探测失败如实入账（probe_failed）
+    ///     —— 同时证明 6.1 的"全部失败也必须给出完整报告"；
+    ///   - 全程不因探测失败提前返回；封面在真应用里走视口懒加载
+    ///     （tests/video-covers.cjs 有 1000 项规模证据），导入本身零封面开销。
+    /// 需要 ffmpeg/ffprobe（探测真实失败路径），显式运行：
+    /// `cargo test --lib -- --ignored --nocapture import_one_thousand_videos_benchmark`
+    #[cfg(not(feature = "inproc-backends"))]
+    #[test]
+    #[ignore = "1000-video import benchmark; run explicitly for acceptance evidence"]
+    fn import_one_thousand_videos_benchmark() {
+        assert!(crate::video::process::tool("ffprobe").is_ok(), "需要 ffprobe");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("library");
+        // 10 个目录 × 每目录 100 个视频文件（目录树扫描 + 分类 + 探测全走真实路径）。
+        for d in 0..10 {
+            let sub = root.join(format!("season-{d:02}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for i in 0..100 {
+                // EBML 魔数 + 无效段：ffprobe 快速失败（真实失败路径），文件仍入队。
+                std::fs::write(sub.join(format!("clip-{d:02}-{i:03}.mkv")),
+                    [0x1au8, 0x45, 0xdf, 0xa3, 0x01, 0x00, 0x00, 0x00]).unwrap();
+            }
+        }
+        let paths = vec![root.clone()];
+        let started = std::time::Instant::now();
+        let batch = import_media_core(&paths);
+        let elapsed = started.elapsed();
+        let report = &batch.report;
+        assert_eq!(batch.media.len(), 1000, "1000 个视频必须全部入队（探测失败也入队带原因）");
+        assert_eq!(report.scanned, 1011, "根目录 + 10 子目录 + 1000 文件");
+        assert_eq!(report.directories, 11);
+        assert_eq!(report.probe_failed, 1000, "全部探测失败必须逐个记账，不许静默");
+        assert_eq!(report.imported, 1000);
+        // 无 early-return：哪怕全军覆没，报告也完整返回（6.1 的硬性要求）。
+        assert_eq!(report.unsupported, 0, "没有任何文件被当作不支持 —— 全部按视频候选处理");
+        println!("1000 视频导入基准：总耗时 {:.2?}（扫描+分类+1000 次 ffprobe 失败路径，≤4 并发），                 scanned={}/dirs={}/imported={}/probeFailed={}",
+            elapsed, report.scanned, report.directories, report.imported, report.probe_failed);
+        // 放宽到 CI 安全的上界：本机实测个位数秒；超过 60s 视为回归。
+        assert!(elapsed.as_secs() < 60, "1000 视频导入必须在 60s 内（实际 {elapsed:?}）");
     }
 
     /// §5.3 单文件错误隔离：一个失效路径只产生一条 failed 结果，绝不连坐整批；    /// §5.3 单文件错误隔离：一个失效路径只产生一条 failed 结果，绝不连坐整批；

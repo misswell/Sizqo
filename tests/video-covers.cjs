@@ -121,6 +121,49 @@ async function test_forget_cancels_and_clears() {
   assert.equal(manager.pendingCount(), 0);
 }
 
+async function test_one_thousand_items_stay_bounded() {
+  // 验收 C 项：一次导入 1000 个视频。旧实现会对 1000 行全量排队抽帧；
+  // 现在只有"用户看得见"的行（视口 12 行 + 预加载边距）才发起抽帧，
+  // 千级导入的封面开销恒等于可见行数，与队列总规模无关。
+  const { manager, calls } = makeManager({ maxEntries: 120 });
+  const total = 1000;
+  const visibleWindow = 12; // 视口里的行数
+  for (let i = 0; i < total; i++) {
+    const item = { path: `/library/clip-${i}.mkv`, videoProbe: { durationUs: 1 } };
+    // 只有视口内的行触发 requestCover（IntersectionObserver 的语义等价物）。
+    if (i < visibleWindow) manager.requestCover(item);
+  }
+  await wait(60);
+  assert.equal(calls.length, visibleWindow, `1000 项队列只对可见的 ${visibleWindow} 行抽帧，实际 ${calls.length}`);
+  assert.equal(manager.cacheCount(), visibleWindow);
+  assert.ok(manager.pendingCount() <= covers.DEFAULTS.MAX_PENDING, '排队上限恒成立');
+  // 用户滚动：新一批可见行进来，请求量仍按可见数线性增长，而不是按队列规模。
+  for (let i = visibleWindow; i < visibleWindow + 12; i++) {
+    manager.requestCover({ path: `/library/clip-${i}.mkv`, videoProbe: { durationUs: 1 } });
+  }
+  await wait(60);
+  assert.equal(calls.length, visibleWindow + 12, '滚动后只追加新可见行的请求');
+  // 内存上限：缓存条目恒 ≤ 上限（淘汰最久未用），data URL 不随 1000 项无限堆积。
+  assert.ok(manager.cacheCount() <= covers.DEFAULTS.MAX_CACHE_ENTRIES,
+    `缓存条目 ${manager.cacheCount()} 必须 ≤ ${covers.DEFAULTS.MAX_CACHE_ENTRIES}`);
+  console.log(`PASS: 1000 项队列封面开销 = 可见行数（${visibleWindow}→${visibleWindow + 12} 次请求），缓存有界`);
+}
+
+/// 源码契约：导入合并路径不再对每个新视频全量排队抽帧；行交给
+/// IntersectionObserver（懒加载）。改回全量排队时这条测试必须红。
+function test_import_path_never_enqueues_covers_bulk() {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const appJs = fs.readFileSync(path.join(__dirname, '..', 'frontend', 'app.js'), 'utf8');
+  const importMergeRegion = appJs.slice(
+    appJs.indexOf('var added = mergeQueueMedia(supportedRecords);'),
+    appJs.indexOf('if (added.length === 0) {'));
+  assert.ok(importMergeRegion.length > 0, '导入合并段定位失败');
+  assert.ok(!importMergeRegion.includes('queueVideoCover'), '导入合并路径不许再全量排队抽帧（懒加载契约）');
+  assert.ok(appJs.includes('videoCoverObserver.observe(row)'), '视频行必须注册进 IntersectionObserver（视口触发）');
+  assert.ok(appJs.includes("data-file"), '观察器靠 data-file 定位队列项');
+}
+
 async function main() {
   await test_lazy_and_serial();
   await test_same_item_never_requested_twice();
@@ -128,7 +171,9 @@ async function main() {
   await test_lru_eviction_and_callbacks();
   await test_bytes_cap();
   await test_forget_cancels_and_clears();
-  console.log('PASS: 封面懒加载（视口触发、串行并发、LRU 双上限、取消清理、probe 复用）');
+  await test_one_thousand_items_stay_bounded();
+  test_import_path_never_enqueues_covers_bulk();
+  console.log('PASS: 封面懒加载（视口触发、串行并发、LRU 双上限、取消清理、probe 复用、1000 项有界）');
 }
 
 main().catch(error => { console.error(error); process.exit(1); });

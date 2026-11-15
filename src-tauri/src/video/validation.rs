@@ -733,7 +733,94 @@ mod tests {
             .expect_err("名字换了必须失败");
         assert!(error.contains("manual.txt"), "{error}");
     }
+
+    /// VAL-01c 决定性回归：**两份同名附件**（basename 相同、内容不同）。
+    /// 旧实现拿附件名当 Map key —— 两份摘要互相覆盖，把"位置 0/1 的内容互换"
+    /// 静默放行。按流位置逐项对账后：原样拷贝必须通过；互换内容的产物必须被拦下。
+    /// 需要 ffmpeg/ffprobe，显式运行：`cargo test --lib real -- --ignored`
+    #[cfg(not(feature = "inproc-backends"))]
+    #[test]
+    #[ignore = "requires ffmpeg/ffprobe; run explicitly for release validation"]
+    fn same_name_attachments_reconcile_per_position_not_per_name() {
+        assert!(
+            crate::video::process::tool("ffmpeg").is_ok()
+                && crate::video::process::tool("ffprobe").is_ok(),
+            "需要 ffmpeg/ffprobe"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        // 同名不同内容的两份附件（不同目录、相同 basename —— MKV 允许重名附件）。
+        let dir_a = dir.path().join("A");
+        let dir_b = dir.path().join("B");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let payload_x = dir_a.join("credits.txt");
+        let payload_y = dir_b.join("credits.txt");
+        std::fs::write(&payload_x, "attachment payload X
+").unwrap();
+        std::fs::write(&payload_y, "attachment payload Y
+").unwrap();
+
+        let mux = |first: &std::path::Path, second: &std::path::Path, name: &str| {
+            let path = dir.path().join(name);
+            let mut cmd = crate::video::process::command("ffmpeg").unwrap();
+            cmd.args([
+                "-hide_banner", "-v", "error", "-nostdin", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=10:duration=0.5",
+                "-attach",
+            ])
+            .arg(first)
+            .arg("-attach")
+            .arg(second)
+            .args([
+                "-metadata:s:t:0", "mimetype=text/plain",
+                "-metadata:s:t:1", "mimetype=text/plain",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            ])
+            .arg(&path);
+            crate::video::process::capture(cmd, std::time::Duration::from_secs(120), 16 * 1024 * 1024)
+                .unwrap_or_else(|e| panic!("夹具 {name} 生成失败: {e}"));
+            path
+        };
+
+        // 源：位置 0 = X，位置 1 = Y。两份附件 basename 相同 —— 旧 Map key 会塌缩。
+        let source = mux(&payload_x, &payload_y, "same-name-source.mkv");
+        let source_probe = crate::video::probe::probe(&source).unwrap();
+        let attachments: Vec<&VideoStream> = source_probe
+            .streams
+            .iter()
+            .filter(|s| s.codec_type == "attachment")
+            .collect();
+        assert_eq!(attachments.len(), 2, "夹具必须真的有两份附件");
+        let name_of = |s: &VideoStream| {
+            attachment_base_name(s.tags["filename"].as_str().unwrap_or("")).to_string()
+        };
+        assert_eq!(name_of(attachments[0]), "credits.txt");
+        assert_eq!(name_of(attachments[1]), "credits.txt", "两份附件必须同名（塌缩前提）");
+
+        // 原样拷贝：按位置逐项对账必须通过。
+        let copied = dir.path().join("same-name-copy.mkv");
+        let mut cmd = crate::video::process::command("ffmpeg").unwrap();
+        cmd.args(["-hide_banner", "-v", "error", "-nostdin", "-y", "-i"])
+            .arg(&source)
+            .args(["-map", "0", "-c", "copy"])
+            .arg(&copied);
+        crate::video::process::capture(cmd, std::time::Duration::from_secs(120), 16 * 1024 * 1024).unwrap();
+        let copied_probe = crate::video::probe::probe(&copied).unwrap();
+        verify_attachments_content(&source_probe, &copied_probe, &source, &copied, None)
+            .expect("同名附件原样拷贝必须逐位置通过");
+
+        // 内容互换的产物（位置 0 = Y、位置 1 = X，名字照旧）：
+        // 旧按名对账会因 Map 塌缩而放行，按位置对账必须拦下。
+        let swapped = mux(&payload_y, &payload_x, "same-name-swapped.mkv");
+        let swapped_probe = crate::video::probe::probe(&swapped).unwrap();
+        let error =
+            verify_attachments_content(&source_probe, &swapped_probe, &source, &swapped, None)
+                .expect_err("同名附件内容互换必须失败（按位置对账）");
+        assert!(error.contains("content differs"), "{error}");
+    }
 }
+
+/// 逐流对账（KeepAll 与 StripPrivate 共用）：源里第 N 条 audio/subtitle 必须在
 
 /// 逐流对账（KeepAll 与 StripPrivate 共用）：源里第 N 条 audio/subtitle 必须在
 /// 输出里仍是同一条（同语言、同标题、同 disposition 语义位）。`require_codec`

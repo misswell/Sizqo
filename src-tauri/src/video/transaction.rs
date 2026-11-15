@@ -286,6 +286,28 @@ pub fn commit(source:&Path,partial:&Path,target:&Path,o:&VideoOptions,probe:&Vid
     result.reason_code=if target_unmet{Some(crate::result_model::ReasonCode::TargetUnmet)}else{None};
     result.output_path=Some(final_target.to_string_lossy().into());result.backup_path=backup.map(|p|p.to_string_lossy().into());result.history_id=Some(id);Ok(())
 }
+/// §3.2 编码前的空间守卫：输出与备份分盘复核。TEST_FAULT_NO_SPACE 注入
+/// "磁盘空间耗尽"（8.1-12）—— 守卫在任何字节落盘之前失败，源文件分文不动。
+pub fn space_guard(parent:&Path,needed:u64,what:&str)->Result<(),String>{
+    #[cfg(test)]
+    if TEST_FAULT_NO_SPACE.with(std::cell::Cell::get){
+        return Err(format!("Insufficient disk space for {what}: reserve at least {needed} bytes (injected)"));
+    }
+    if available_space(parent)?<needed{
+        return Err(format!("Insufficient disk space for {what}: reserve at least {needed} bytes"));
+    }
+    Ok(())
+}
+#[cfg(test)]
+thread_local!{
+    /// 8.1-12 故障注入：下一次空间守卫直接失败（磁盘满替身）。
+    pub(crate) static TEST_FAULT_NO_SPACE: std::cell::Cell<bool>
+        = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) fn set_fault_no_space(active:bool){
+    TEST_FAULT_NO_SPACE.with(|cell|cell.set(active));
+}
 #[cfg(test)]mod tests{use super::*;
     use crate::output_transaction::TransactionStage;
 
@@ -494,6 +516,152 @@ pub fn commit(source:&Path,partial:&Path,target:&Path,o:&VideoOptions,probe:&Vid
         assert!(foreign.exists(),"含未知内容的作业目录必须保留");
         assert!(foreign.join("user-note.txt").exists());
         assert!(user.exists(),"用户目录分文不动");
+    }
+
+    // ── 8.1 故障注入补充（备份/空间/fsync/权限/写一半）────────────────────
+
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// 8.1-2 备份 SHA 验证失败：备份在长编码之后字节被换过 —— commit 必须在
+    /// 覆盖之前拒绝，原图一个字节不动。
+    #[test]
+    fn a_tampered_backup_refuses_the_commit_before_any_overwrite(){
+        let dir=tempfile::tempdir().unwrap();let root=dir.path();
+        let source=root.join("clip.mkv");fs::write(&source,ORIGINAL).unwrap();
+        let o=VideoOptions{output_mode:"replace".into(),container:"mkv".into(),..Default::default()};
+        let history=HistoryStore::new(root.join("history")).unwrap();
+        let transactions=TransactionStore::new(root.join("transactions"));
+        let identity=SourceIdentity::read_with_hash(&source).unwrap();
+        let backup=history.ensure_backup_verified(&source,identity.sha256.as_deref()).unwrap();
+        // 外部在提交前把备份换成了别的内容。
+        fs::write(&backup,b"tampered-bytes").unwrap();
+        let partial=root.join("partial.mkv");fs::write(&partial,ENCODED).unwrap();
+        let mut result=VideoResult::pending("t1",&source,&o);
+        let mut claimed_slot=None;
+        let error=commit(&source,&partial,&source,&o,&probe(),&mut result,&history,&transactions,3,&identity,Some(&backup),&mut claimed_slot).unwrap_err();
+        assert!(error.contains("backup failed verification"),"必须先验备份再覆盖: {error}");
+        assert_eq!(fs::read(&source).unwrap(),ORIGINAL,"原图分文不动");
+        assert!(!transactions.has_pending(),"覆盖未发生，事务销账");
+        assert!(history.list().is_empty());
+    }
+
+    /// 8.1-1 备份创建失败：备份目录读不了/写不进 —— 覆盖模式的编码在备份处
+    /// 就必须停（encode 的备份在 commit 之前建立，ensure_backup_verified 的
+    /// 失败让整条任务失败），原图分文不动。root 用户绕过 chmod，测试跳过。
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_creation_failure_stops_the_job_before_encoding_sides(){
+        if running_as_root(){return;}
+        use std::os::unix::fs::PermissionsExt;
+        let dir=tempfile::tempdir().unwrap();let root=dir.path();
+        let source=root.join("clip.mkv");fs::write(&source,ORIGINAL).unwrap();
+        let history=HistoryStore::new(root.join("history")).unwrap();
+        let backups=root.join("history").join(crate::history::BACKUPS_DIR);
+        fs::create_dir_all(&backups).unwrap();
+        if fs::set_permissions(&backups,std::fs::Permissions::from_mode(0o555)).is_err(){return;}
+        let identity=SourceIdentity::read_with_hash(&source).unwrap();
+        let outcome=history.ensure_backup_verified(&source,identity.sha256.as_deref());
+        fs::set_permissions(&backups,std::fs::Permissions::from_mode(0o755)).ok();
+        assert!(outcome.is_err(),"备份建不出来就必须失败关闭，绝不裸覆盖");
+        assert_eq!(fs::read(&source).unwrap(),ORIGINAL,"原图分文不动");
+    }
+
+    /// 8.1-5 磁盘空间不足：守卫在任何字节落盘之前失败。注入位验证失败关闭；
+    /// 真实目录照常放行。
+    #[test]
+    fn a_space_shortage_is_refused_before_any_write(){
+        let dir=tempfile::tempdir().unwrap();
+        crate::video::transaction::set_fault_no_space(true);
+        let error=space_guard(dir.path(),u64::MAX,"the encoded output").unwrap_err();
+        crate::video::transaction::set_fault_no_space(false);
+        assert!(error.contains("Insufficient disk space"),"{error}");
+        // 无注入时同一目录照常通过（真实 statvfs 路径，CI 三平台都要答得出数）。
+        space_guard(dir.path(),0,"the encoded output").unwrap();
+    }
+
+    /// 8.1-9 目录 fsync 失败：history.json 已 rename、目录项落不了盘 ——
+    /// write_atomic 如实报错，commit 按历史失败回滚原图（宁可回滚也不把
+    /// "没持久化的提交"当成完成）。
+    #[test]
+    fn a_directory_fsync_failure_after_history_write_rolls_back(){
+        let dir=tempfile::tempdir().unwrap();let root=dir.path();
+        let source=root.join("clip.mkv");fs::write(&source,ORIGINAL).unwrap();
+        let o=VideoOptions{output_mode:"replace".into(),container:"mkv".into(),..Default::default()};
+        let history_root=root.join("history");
+        let history=HistoryStore::new(history_root.clone()).unwrap();
+        let transactions=TransactionStore::new(root.join("transactions"));
+        let identity=SourceIdentity::read_with_hash(&source).unwrap();
+        let backup=history.ensure_backup_verified(&source,identity.sha256.as_deref()).unwrap();
+        let partial=root.join("partial.mkv");fs::write(&partial,ENCODED).unwrap();
+        let mut result=VideoResult::pending("t1",&source,&o);
+        let mut claimed_slot=None;
+        crate::history::set_fault_fail_dir_fsync_for(Some(history_root.clone()));
+        let error=commit(&source,&partial,&source,&o,&probe(),&mut result,&history,&transactions,3,&identity,Some(&backup),&mut claimed_slot).unwrap_err();
+        crate::history::set_fault_fail_dir_fsync_for(None);
+        assert!(error.contains("original was restored"),"目录 fsync 失败按历史失败回滚: {error}");
+        assert_eq!(fs::read(&source).unwrap(),ORIGINAL,"原图字节恢复");
+        assert!(backup.exists(),"备份保留");
+    }
+
+    /// 8.1-历史文件写入中途失败：对 history.json 的暂存写入在写一半时失败 ——
+    /// rename 从未发生，旧历史原封不动；commit 按历史失败回滚。
+    #[test]
+    fn a_midway_history_write_failure_rolls_back_without_touching_the_old_history(){
+        let dir=tempfile::tempdir().unwrap();let root=dir.path();
+        let source=root.join("clip.mkv");fs::write(&source,ORIGINAL).unwrap();
+        let o=VideoOptions{output_mode:"replace".into(),container:"mkv".into(),..Default::default()};
+        let history_root=root.join("history");
+        let history=HistoryStore::new(history_root.clone()).unwrap();
+        let transactions=TransactionStore::new(root.join("transactions"));
+        let identity=SourceIdentity::read_with_hash(&source).unwrap();
+        let backup=history.ensure_backup_verified(&source,identity.sha256.as_deref()).unwrap();
+        let partial=root.join("partial.mkv");fs::write(&partial,ENCODED).unwrap();
+        let history_json=history_root.join("history.json");
+        // 首次写入前 history.json 可能还不存在（惰性创建）：缺省就是 None。
+        let before=fs::read(&history_json).ok();
+        let mut result=VideoResult::pending("t1",&source,&o);
+        let mut claimed_slot=None;
+        crate::output_transaction::set_fault_staged_write_midway_for(Some(history_json.clone()));
+        let error=commit(&source,&partial,&source,&o,&probe(),&mut result,&history,&transactions,3,&identity,Some(&backup),&mut claimed_slot).unwrap_err();
+        crate::output_transaction::set_fault_staged_write_midway_for(None);
+        assert!(error.contains("original was restored"),"写一半失败按历史失败回滚: {error}");
+        assert_eq!(fs::read(&source).unwrap(),ORIGINAL,"原图字节恢复");
+        assert_eq!(fs::read(&history_json).ok(),before,"旧历史一个字节没变（rename 未发生）");
+        // 暂存残骸被归属门收走：history 根下不留 .sizqo-write-* 半成品。
+        let leftovers:Vec<String>=fs::read_dir(&history_root).unwrap().flatten()
+            .map(|e|e.file_name().to_string_lossy().into_owned())
+            .filter(|n|n.contains(".sizqo-write-")).collect();
+        assert!(leftovers.is_empty(),"写一半的暂存残骸必须被收走: {leftovers:?}");
+    }
+
+    /// 8.1-历史目录权限被撤销：history 根只读（staged 建不出来）——
+    /// commit 按历史失败回滚。记账挪到可写的独立目录，让失败精确落在
+    /// 历史写入这一步。root 用户绕过 chmod，测试跳过。
+    #[cfg(unix)]
+    #[test]
+    fn a_revoked_history_permission_rolls_back_after_the_swap(){
+        if running_as_root(){return;}
+        use std::os::unix::fs::PermissionsExt;
+        let dir=tempfile::tempdir().unwrap();let root=dir.path();
+        let source=root.join("clip.mkv");fs::write(&source,ORIGINAL).unwrap();
+        let o=VideoOptions{output_mode:"replace".into(),container:"mkv".into(),..Default::default()};
+        let history_root=root.join("history");
+        let history=HistoryStore::new(history_root.clone()).unwrap();
+        let transactions=TransactionStore::new(root.join("transactions"));
+        let identity=SourceIdentity::read_with_hash(&source).unwrap();
+        let backup=history.ensure_backup_verified(&source,identity.sha256.as_deref()).unwrap();
+        let partial=root.join("partial.mkv");fs::write(&partial,ENCODED).unwrap();
+        let mut result=VideoResult::pending("t1",&source,&o);
+        let mut claimed_slot=None;
+        fs::set_permissions(&history_root,std::fs::Permissions::from_mode(0o555)).unwrap();
+        let error=commit(&source,&partial,&source,&o,&probe(),&mut result,&history,&transactions,3,&identity,Some(&backup),&mut claimed_slot).unwrap_err();
+        fs::set_permissions(&history_root,std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(error.contains("original was restored"),"权限撤销按历史失败回滚: {error}");
+        assert_eq!(fs::read(&source).unwrap(),ORIGINAL,"原图字节恢复");
+        assert!(backup.exists());
     }
 
     /// T17（本轮加固 P2-12）：编码期间输出名被外部抢占 → 换下一个候选名发布，

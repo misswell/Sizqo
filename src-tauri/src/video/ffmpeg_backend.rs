@@ -52,7 +52,7 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
         let parent=target.parent().ok_or("Output directory missing")?;
         let estimated=plan.bitrate_kbps.zip(source_probe.duration_us).map(|(b,t)|b.saturating_mul(1000).saturating_mul(t/1000000)/8).unwrap_or(source_probe.size_bytes);
         let needed=estimated.max(source_probe.size_bytes/4).saturating_mul(2).saturating_add(64*1024*1024);
-        if transaction::available_space(parent)?<needed{return Err(format!("Insufficient output disk space: reserve at least {} bytes",needed));}
+        transaction::space_guard(parent,needed,"the encoded output")?;
         // §3.2 覆盖模式在**编码之前**备好原图备份（§2.2 顺序：身份 → 备份 → 编码）。
         // 编码期间用户改了文件，commit 的两次完整复核会拦住；但备份必须先落盘，
         // 否则"备份失败"这种最需要停止的情况会等到烧完几个小时 CPU 才被发现。
@@ -62,7 +62,7 @@ pub fn encode(task_id:&str,source:&Path,options:&VideoOptions,caps:&CapabilityMa
             #[cfg(unix)]{use std::os::unix::fs::MetadataExt;if fs::metadata(parent).map_err(|e|e.to_string())?.dev()==fs::metadata(backup_root).map_err(|e|e.to_string())?.dev(){needed_backup=needed_backup.saturating_add(needed);}}
             // Windows 上"是不是同一块盘"看卷号；查不到就按同一盘处理（多要空间是安全方向）。
             #[cfg(windows)]{let same=match (crate::win32_fs::volume_id_of_path(parent),crate::win32_fs::volume_id_of_path(backup_root)){(Some(a),Some(b))=>a==b,_=>true};if same{needed_backup=needed_backup.saturating_add(needed);}}
-            if transaction::available_space(backup_root)?<needed_backup{return Err("Insufficient disk space for the persistent original backup and encoded output".into());}
+            transaction::space_guard(&backup_root,needed_backup,"the persistent original backup")?;
             result.warnings.push(format!("Replace keeps a persistent original backup of {} bytes",source_probe.size_bytes));
             Some(history.ensure_backup_verified(&source,identity.sha256.as_deref()).map_err(|e|e.to_string())?)
         }else{None};
@@ -438,6 +438,40 @@ mod tests {
         let cancel=Arc::new(AtomicBool::new(false));
         let emit=|_event:VideoProgress|{};
         encode("real-e2e-task",source,options,&caps,"real-e2e-session",1,&roots,None,&history,&transactions,30,2,&logs,cancel,None,"",&emit)
+    }
+
+    /// 8.4 真实 macOS 验证（VideoToolbox）：能力矩阵**实测**硬件编码器 ——
+    /// 本机有 VideoToolbox 就真的用 hevc_videotoolbox 走一遍全链路
+    /// （probe → plan → 硬件编码 → 复探 → 全量校验 → 全解码 → commit），
+    /// 不靠"声明的硬件模式列表"当证据。本机/CI 无 VideoToolbox 时如实跳过。
+    /// 显式运行：`cargo test --lib -- --ignored videotoolbox -- --nocapture`
+    #[test]
+    #[ignore = "requires macOS VideoToolbox; run explicitly for release validation"]
+    fn videotoolbox_real_encode_roundtrip(){
+        let dir=tempfile::tempdir().unwrap();
+        let root=dir.path();
+        let caps=capabilities::capabilities();
+        let encoder=if caps.encoder("hevc_videotoolbox").is_some(){"hevc_videotoolbox"}
+            else if caps.encoder("h264_videotoolbox").is_some(){"h264_videotoolbox"}
+            else {println!("本机无可用 VideoToolbox 硬件编码器，如实跳过（能力矩阵原因: {:?})",caps.reason);return;};
+        println!("实测硬件编码器: {encoder}");
+        assert!(caps.encoder(encoder).unwrap().modes.iter().any(|m|m=="abr"||m=="crf"),"硬件编码器必须经运行时试用而非只看声明");
+        // 源刻意用高码率（CRF 18、高细节 640×480×4s）：硬件编码 500 kbps 的产物
+        // 必须小于源，否则会在"有效但未变小"的跳过门收场（那是正确行为，不是
+        // 本测试的对象）。
+        let options=VideoOptions{encoder:encoder.into(),mode:"abr".into(),bitrate_kbps:Some(500),preset:"medium".into(),audio_policy:"aac".into(),metadata_policy:"strip".into(),container:"mp4".into(),threads:1,..Default::default()};
+        let source=make_fixture(root,"vt-source.mp4",&[
+            "-f","lavfi","-i","testsrc2=size=640x480:rate=24:duration=4",
+            "-f","lavfi","-i","sine=frequency=440:duration=4",
+            "-map","0:v","-map","1:a","-c:v","libx264","-preset","ultrafast","-crf","18","-pix_fmt","yuv420p",
+            "-c:a","aac","-b:a","96k","-shortest"]);
+        let result=encode_full_chain(root,&source,&options);
+        assert!(result.success,"VideoToolbox 全链路必须提交成功: {:?}",result.reason);
+        assert_eq!(result.outcome,Some(ResultOutcome::Committed));
+        assert_eq!(result.encoder_actual,encoder,"实际编码器必须就是硬件编码器");
+        let output=PathBuf::from(result.output_path.as_deref().expect("提交后必须回填 output_path"));
+        let out=probe::probe_cancellable(&output,Duration::from_secs(300),None,true).unwrap();
+        assert_eq!(out.video().unwrap().codec_name,if encoder.starts_with("hevc"){"hevc"}else{"h264"},"产物必须是硬件编码器的 codec");
     }
 
     /// T12 的证据工具：直接 ffprobe（绕开 probe.rs），拿 `-count_frames` 实测解码帧数。

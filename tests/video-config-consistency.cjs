@@ -159,4 +159,80 @@ function installVideoConfig(context) {
   assert.equal(reboot.context.selectedVideoPresetId, '', '没选预设就不预选');
 }
 
+// ── ⑤ 具名场景：保存 balanced 后重启（任务书 3.1 回归清单）────────────
+{
+  const presets = [
+    // 与后端 presets.rs 的 balanced 同参：auto/abr。
+    { id: 'balanced', name: '均衡', available: true,
+      options: { encoder: 'auto', mode: 'abr', bitrateKbps: 4000, crf: null, container: 'mp4', audioPolicy: 'copy' } },
+    // 与后端 quality 同参：libx265 / CRF 28。
+    { id: 'quality', name: '高质量压缩', available: true,
+      options: { encoder: 'libx265', mode: 'crf', crf: 28, container: 'mp4', audioPolicy: 'copy' } },
+  ];
+  const first = makeContext();
+  first.context.videoPresets = presets;
+  installVideoConfig(first.context);
+  assert.equal(vm.runInContext('applyVideoPreset("balanced")', first.context), true, 'balanced 预设必须可用');
+  assert.equal(first.context.videoIntent.intent, 'videoCustom', 'balanced（auto/abr）不匹配任何意图 —— 如实切自定义');
+  vm.runInContext('saveVideoSettings()', first.context);
+  const saved = first.storage.get('sizqo-video-settings');
+  assert.ok(saved, 'balanced 存档已落盘');
+
+  // 重启：同样的存储；意图按 loadCompressSettings 的恢复顺序先回来。
+  const reboot = makeContext();
+  reboot.context.videoPresets = presets;
+  reboot.context.videoIntent = { intent: 'videoCustom', targetMiB: 100 };
+  reboot.storage.set('sizqo-video-settings', saved);
+  installVideoConfig(reboot.context);
+  assert.equal(vm.runInContext('loadVideoSettings()', reboot.context), true);
+  assert.equal(reboot.context.selectedVideoPresetId, 'balanced', '重启后预设选择恢复');
+  assert.equal(reboot.context.currentVideoOptions.mode, 'abr', '重启后 mode 与保存一致');
+  // 启动尾部的意图重铺对 videoCustom 是空操作 —— 存档参数不许被意图默认值覆盖。
+  vm.runInContext(
+    "if (videoIntent.intent !== 'videoCustom') applyVideoOptions(videoRequestFromIntent().options);",
+    reboot.context);
+  assert.equal(reboot.context.currentVideoOptions.mode, 'abr', 'init 重铺后参数仍是保存的那套');
+  // 三方一致：意图编译（自定义=控件）、控件、请求同源。
+  const request = vm.runInContext('videoRequestFromIntent()', reboot.context);
+  assert.equal(request.intent, 'videoCustom');
+  assert.equal(request.options.mode, 'abr');
+  assert.equal(String(request.options.bitrateKbps), String(reboot.context.currentVideoOptions.bitrateKbps));
+  console.log('PASS: 保存 balanced 后重启 —— 预设选择、参数、请求三方一致');
+}
+
+// ── ⑥ 具名场景：保存 quality 后重启 ────────────────────────────────────
+{
+  const presets = [
+    { id: 'quality', name: '高质量压缩', available: true,
+      options: { encoder: 'libx265', mode: 'crf', crf: 28, container: 'mp4', audioPolicy: 'copy' } },
+  ];
+  const first = makeContext();
+  first.context.videoPresets = presets;
+  installVideoConfig(first.context);
+  assert.equal(vm.runInContext('applyVideoPreset("quality")', first.context), true);
+  assert.equal(first.context.videoIntent.intent, 'videoCustom');
+  assert.equal(first.context.currentVideoOptions.encoder, 'libx265');
+  assert.equal(first.context.currentVideoOptions.crf, 28);
+  vm.runInContext('saveVideoSettings()', first.context);
+  const saved = first.storage.get('sizqo-video-settings');
+
+  const reboot = makeContext();
+  reboot.context.videoPresets = presets;
+  reboot.context.videoIntent = { intent: 'videoCustom', targetMiB: 100 };
+  reboot.storage.set('sizqo-video-settings', saved);
+  installVideoConfig(reboot.context);
+  assert.equal(vm.runInContext('loadVideoSettings()', reboot.context), true);
+  assert.equal(reboot.context.selectedVideoPresetId, 'quality', '重启后 quality 预设恢复');
+  assert.equal(reboot.context.currentVideoOptions.encoder, 'libx265', '重启后编码器与保存一致');
+  assert.equal(reboot.context.currentVideoOptions.crf, 28, '重启后 CRF 与保存一致');
+  vm.runInContext(
+    "if (videoIntent.intent !== 'videoCustom') applyVideoOptions(videoRequestFromIntent().options);",
+    reboot.context);
+  assert.equal(reboot.context.currentVideoOptions.crf, 28, 'init 重铺（videoCustom 下跳过）不丢参数');
+  const request = vm.runInContext('videoRequestFromIntent()', reboot.context);
+  assert.equal(request.options.encoder, 'libx265');
+  assert.equal(request.options.crf, 28);
+  console.log('PASS: 保存 quality 后重启 —— 编码器/CRF/预设选择原样恢复');
+}
+
 console.log('PASS: CFG-01 Intent/Preset/Options 三态一致（首启、null 清空、预设同步意图、重启一致、跨语言预设 id）');

@@ -1702,6 +1702,17 @@ fn canonical_path(path: &Path) -> String {
 /// 同步失败按真错误返回，绝不静默假装成功 —— 提交链路上的失败
 /// 由调用方走回滚。
 pub(crate) fn sync_dir(path: &Path) -> Result<(), String> {
+    // 8.1-9 故障注入：指定目录的 fsync 失败替身（rename 已完成、目录项落不了盘）。
+    #[cfg(test)]
+    {
+        let injected = TEST_FAULT_FAIL_DIR_FSYNC_FOR.with(|cell| cell.borrow().clone());
+        if let Some(target) = injected {
+            if target == path {
+                return Err("injected directory fsync failure".into());
+            }
+        }
+    }
+
     #[cfg(unix)]
     {
         fs::File::open(path)
@@ -1753,6 +1764,16 @@ thread_local! {
     /// 权限被撤/写一半断电的替身）。thread-local 同款理由：并行测试互不污染。
     pub(crate) static TEST_FAULT_FAIL_NEXT_HISTORY_STORE: std::cell::Cell<u32>
         = const { std::cell::Cell::new(0) };
+    /// 8.1-9 故障注入：对**指定目录**的 fsync 失败（目录项落不了盘的替身）。
+    /// 按路径限定作用域，避免误伤同一测试流程里更早的其他目录同步。
+    pub(crate) static TEST_FAULT_FAIL_DIR_FSYNC_FOR: std::cell::RefCell<Option<std::path::PathBuf>>
+        = const { std::cell::RefCell::new(None) };
+}
+
+/// 测试用：注入"对指定目录 fsync 失败"（8.1-9）。
+#[cfg(test)]
+pub(crate) fn set_fault_fail_dir_fsync_for(path: Option<std::path::PathBuf>) {
+    TEST_FAULT_FAIL_DIR_FSYNC_FOR.with(|cell| *cell.borrow_mut() = path);
 }
 
 /// 测试用：注入 history 落盘失败（剩余次数）。

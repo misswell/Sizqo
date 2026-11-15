@@ -2779,3 +2779,68 @@ VAL-01a 的预期行为）。
   数据风险。
 - 双实例抢占、VideoToolbox 实测、签名/公证/装订仍未纳入本轮验证范围
   （继承 rc.11 起的发布门禁清单）。
+
+
+## 0.3.6-rc.19 — 验收缺口闭合轮（2026-11-15）
+
+针对复核审计认领的四类缺口补最小闭环，全部为**新增测试证据**（代码本体只有
+可测性抽取：`import_media_core` 从 `probe_media` 拆出、`space_guard` 从
+encode 的空间检查抽出，行为不变）。
+
+### 8.1 故障注入补齐（原清单 1/5/9/12 + 历史"写一半/权限撤销"）
+
+| 注入 | 测试 | 证据 |
+|---|---|---|
+| 1. 备份创建失败 | `a_backup_creation_failure_stops_the_job_before_encoding_sides`（chmod 备份目录只读，root 跳过） | ✅ ensure_backup_verified 失败关闭，原图不动 |
+| 2. 备份 SHA 验证失败 | `a_tampered_backup_refuses_the_commit_before_any_overwrite` | ✅ 覆盖前拒绝，原图/历史/事务账本干净 |
+| 9. 目录 fsync 失败 | `a_directory_fsync_failure_after_history_write_rolls_back`（按路径限定的 fsync 注入） | ✅ rename 已发生但目录落盘失败 → 按历史失败回滚，原图恢复 |
+| 12. 磁盘空间不足 | `a_space_shortage_is_refused_before_any_write` + `space_guard` 注入位 | ✅ 守卫在任何字节落盘前失败；真实目录照常放行 |
+| 历史文件写入中途失败 | `a_midway_history_write_failure_rolls_back_without_touching_the_old_history`（按目标路径的写一半注入） | ✅ rename 未发生、旧历史字节不变、暂存残骸按归属门收走 |
+| 历史目录权限被撤销 | `a_revoked_history_permission_rolls_back_after_the_swap`（chmod history 根只读，root 跳过） | ✅ 交换已发生后按历史失败回滚，原图恢复 |
+
+### VAL-01c 同名附件决定性回归
+
+`same_name_attachments_reconcile_per_position_not_per_name`（真实 ffmpeg）：两份
+**同名**附件（不同内容）→ 按流位置逐项对账：原样拷贝通过；**内容互换的产物被
+拦下**（按名 Map 塌缩的旧实现会放行这一情况）。
+
+### CFG-01 具名回归场景
+
+`tests/video-config-consistency.cjs` 新增两段（跑真代码）：
+- **保存 balanced 后重启**：预设选择/abr 参数/请求三方一致，init 重铺不覆盖存档。
+- **保存 quality 后重启**：libx265 + CRF 28 + 预设 id 原样恢复。
+
+### 验收 C 项：1000 视频导入
+
+- Rust 基准 `import_one_thousand_videos_benchmark`（ignored，真实管线：10 目录
+  × 100 文件 → collect → 分类 → ≤4 并发 ffprobe → 报告）：本机实测
+  **总耗时 10.12s，scanned=1011 / dirs=11 / imported=1000 / probeFailed=1000**，
+  全部失败也无 early-return（同时是 6.1 "完整报告"的证据）。
+- 前端规模证据 `tests/video-covers.cjs::test_one_thousand_items_stay_bounded`：
+  1000 项队列的封面请求恒等于可见行数（12→24 次），缓存条目有界；
+  `test_import_path_never_enqueues_covers_bulk` 钉住"导入路径不再全量排队抽帧"。
+
+### 8.4 VideoToolbox 真实 macOS 验证
+
+`videotoolbox_real_encode_roundtrip`（ignored）：本机（macOS arm64 实机）实测
+**hevc_videotoolbox** 经运行时试用后走全链路（probe → plan → 硬件编码 → 复探 →
+全量校验 → 全解码 → commit），产物 codec=hevc、outcome=Committed ✅。
+Windows NTFS 专属现场验证仍未做（见下）。
+
+### 本轮读数汇总
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| Direct 全量 | `cargo test` | ✅ lib 317 + 集成 15（新增 6 故障注入 + 1 同名附件 + 1 VT + 1 基准） |
+| inproc / App Store | `cargo test --features inproc-backends` / `--no-default-features --features inproc-backends` | ✅ lib 315 ×2 |
+| 前端 | `npm run test:frontend` | ✅ 全绿（video-covers 新增 1000 项场景；config-consistency 新增 2 具名场景） |
+| Swift | `bash scripts/test_swift_history.sh` | ✅ |
+| 真实媒体（ignored） | metadata_policies / s11 / t12 / t13 / t15 / 同名附件 / VideoToolbox | ✅ 7/7 |
+| 崩溃注入 | `cargo test --test crash_injection` | ✅ 8 阶段 |
+
+### 仍未覆盖（如实记录）
+
+- Windows NTFS 专属现场验证（替换/占位/恢复/句柄占用）：Windows CI 测试作业
+  全绿覆盖了跨平台语义，但未做 NTFS 现场专项；需要一台真实 Windows 机器。
+- 磁盘空间耗尽走的是注入位 + 真实 statvfs 放行路径；"真实写满一块盘"的端到端
+  未做（需要可耗尽的独立卷）。
