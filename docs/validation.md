@@ -2875,3 +2875,60 @@ Windows NTFS 专属现场验证仍未做（见下）。
 仍未覆盖（如实记录，与 rc.19 一致）：Windows NTFS 专属现场验证（CI VM 不可替代，
 需要真实 Windows 机器）；"真实写满独立卷"的端到端（空间守卫以注入位 + 真实
 statvfs 放行路径验证）；签名/公证/装订（正式 Release 门禁）。
+
+
+## 0.3.6-rc.22 — 8.2 真实媒体矩阵补齐轮（2026-11-16）
+
+新增三条真实编码往返测试（全部走 encode_full_chain：probe → plan → 编码 →
+复探 → 全量校验 → 全解码 `-f null -xerror` → commit；能力缺失时如实跳过不冒充）：
+
+| 新增测试 | 覆盖 | 本机读数（ffmpeg 9.0.2，arm64） |
+|---|---|---|
+| `av1_real_encode_roundtrip` | **AV1（libsvtav1）**编码往返：产物 codec=av1、`-count_frames` 实测帧数与源逐帧一致 | ✅ |
+| `mov_container_real_encode_roundtrip` | **MOV 容器**编码往返：muxer=mov、音轨保持、帧数一致 | ✅ |
+| `real_variants_reconcile_at_other_resolutions_and_frame_rates` | **不同分辨率**（960×540@24 → resolution=480 真实缩放 → 480×270，逐帧对账）+ **不同帧率**（24fps → 显式 CFR 30 → 实测 60 帧 ±帧间隔容差、平均帧率 ≈30） | ✅ |
+
+### 8.2 覆盖表（逐具名条目 → 证据）
+
+| 8.2 条目 | 证据（全部通过） |
+|---|---|
+| H.264 | metadata_policies / s11 / t12 / t13 / t15 / mov / res+fps 组（h264 编码产物） |
+| H.265 | s11（libx265 编码）、plan 组合拒绝测试 |
+| AV1 | `av1_real_encode_roundtrip`（rc.22 新增，libsvtav1） |
+| MP4 | metadata_policies（mp4 章节载体）、t12/t15、res+fps 组 |
+| MKV | t13 KeepAll 多轨、av1 往返、s11 |
+| MOV | `mov_container_real_encode_roundtrip`（rc.22 新增） |
+| 多音轨 | t13（aac+ac3 双音轨）、s11-① |
+| 多字幕 | t13（srt）、s11-① |
+| 多章节 | t13（章节标题对账）、metadata_policies（mkv/mp4 章节保留） |
+| 附件 | t13（-attach + 内容 SHA 对账）、real_attachments_content_digests |
+| 同名附件 | `same_name_attachments_reconcile_per_position_not_per_name`（内容互换被拦，rc.19） |
+| 可变帧率 | t12（setpts 翻倍间隔夹具 + `-count_frames` 对账）、s11-② |
+| 不同分辨率 | `real_variants_reconcile…` 分辨率组（rc.22 新增）+ plan 缩放单测 |
+| 不同帧率 | `real_variants_reconcile…` 帧率组（rc.22 新增）+ 时间轴容差测试 |
+| 不同像素格式 | s11-③（alpha 拒绝）+ plan 白名单单测（yuv410p9le/bgra/grayf32le） |
+| HDR 与 10-bit 安全拒绝 | s11-④（HDR10 VUI 夹具被拒）+ probe hdr_kind 单测 |
+| 损坏视频 | s11-⑥（覆盖魔数 → probe 干净失败） |
+| 缺少关键元数据的视频 | `a_video_missing_required_metadata_is_refused_with_a_reason`（rc.21：duration 缺失 → targetSize 计划阶段明确拒绝，不拖累 CRF 路径） |
+| 目标体积达标和未达标 | t15（如实回填 target_bytes/met/deviation）+ `a_missed_target_is_committed_as_target_unmet`（rc.18） |
+| 完整解码 | encode() 管线内 `-f null -xerror` 全解码是每条真实测试的必经步骤；产物均另经 `-count_frames` 复探对账 |
+
+读数：`cargo test --lib -- --ignored` **12 passed / 0 failed**（本机）；
+`cargo test`（Direct）lib 319 passed / 0 failed / 12 ignored。
+
+### Windows NTFS 证据来源（改写：引用 CI 实际步骤）
+
+任务书 8.4 "Windows 必须验证 NTFS 下的文件替换、占位、恢复和句柄占用行为"的
+证据来源是 **GitHub Actions `windows-tests` 作业（`runs-on: windows-latest`，
+文件系统为 NTFS）在 NTFS 上实际运行**的以下具名步骤（.github/workflows/tests.yml）：
+
+1. `cargo test --lib (Windows 运行时：目录 fsync / 隔离改名 / 句柄占用)` ——
+   覆盖目录 fsync、三级占名台阶、隔离名、句柄占用、平台感知归属门（写一半
+   残骸在 Windows 上按"证明不了归属就保留"语义处置的测试亦在此步运行）；
+2. `contract vectors (Windows side)` —— 事务恢复契约向量在 Windows 上执行；
+3. `real media matrix (--ignored 真实编码，Windows 侧)` —— 真实编码在 Windows
+   上运行一次。
+
+该作业在 v0.3.6-rc.21 的 Tests run 43779227273 中全绿。**仍保留为遗留项的
+部分**：不依赖 CI 的现场类验证——真实双实例人工并发、手工装包后的运行时核验
+（签名/公证/装订属正式 Release 门禁，与 NTFS 文件系统验证无关）。

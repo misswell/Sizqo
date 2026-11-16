@@ -474,6 +474,113 @@ mod tests {
         assert_eq!(out.video().unwrap().codec_name,if encoder.starts_with("hevc"){"hevc"}else{"h264"},"产物必须是硬件编码器的 codec");
     }
 
+    // ── 8.2 矩阵补齐：AV1 / MOV / 不同分辨率 / 不同帧率（真实编码 + 完整解码）──
+    // 三条测试都走 encode_full_chain（probe → plan → 编码 → 复探 → 全量校验 →
+    // 全解码 -f null -xerror → commit）；编码器/容器能力缺失时如实跳过，
+    // 绝不拿"跳过"冒充通过。
+
+    /// 8.2 AV1（libsvtav1）真实编码往返：产物 codec 必须是 av1、帧数与源一致
+    /// （passthrough 时间轴），产物再经 -count_frames 复探对账。
+    /// 需要 ffmpeg/ffprobe（含 libsvtav1），显式运行：
+    /// `cargo test --lib -- --ignored --nocapture av1_real_encode_roundtrip`
+    #[test]
+    #[ignore = "requires ffmpeg with libsvtav1; run explicitly for release validation"]
+    fn av1_real_encode_roundtrip(){
+        let dir=tempfile::tempdir().unwrap();
+        let caps=capabilities::capabilities();
+        if caps.encoder("libsvtav1").is_none(){
+            println!("本机 ffmpeg 无 libsvtav1（能力矩阵原因: {:?}），如实跳过",caps.reason);return;
+        }
+        assert!(caps.encoder("libsvtav1").unwrap().modes.iter().any(|m|m=="crf"),"SVT-AV1 必须经运行时试用");
+        let options=VideoOptions{encoder:"libsvtav1".into(),mode:"crf".into(),crf:Some(35.0),preset:"ultrafast".into(),audio_policy:"aac".into(),metadata_policy:"strip".into(),container:"mkv".into(),threads:2,..Default::default()};
+        let source=make_fixture(dir.path(),"av1-source.mkv",&[
+            "-f","lavfi","-i","testsrc2=size=320x240:rate=24:duration=2",
+            "-f","lavfi","-i","sine=frequency=440:duration=2",
+            "-map","0:v","-map","1:a","-c:v","libx264","-preset","ultrafast","-pix_fmt","yuv420p",
+            "-c:a","aac","-b:a","96k","-shortest"]);
+        let result=encode_full_chain(dir.path(),&source,&options);
+        assert!(result.success,"AV1 全链路必须提交成功: {:?}",result.reason);
+        assert_eq!(result.outcome,Some(ResultOutcome::Committed));
+        let output=PathBuf::from(result.output_path.as_deref().expect("提交后必须回填 output_path"));
+        let out=probe::probe_cancellable(&output,Duration::from_secs(300),None,true).unwrap();
+        assert_eq!(out.video().unwrap().codec_name,"av1","产物必须是 AV1");
+        let src_frames=nb_read_frames(&source).expect("源必须探得出实测帧数");
+        let out_frames=nb_read_frames(&output).expect("产物必须探得出实测帧数");
+        assert_eq!(src_frames,out_frames,"AV1 passthrough 一帧不许丢: {src_frames} → {out_frames}");
+    }
+
+    /// 8.2 MOV 容器真实编码往返：muxer 必须是 mov、音轨活着、帧数与源一致；
+    /// 全解码验证在 encode() 管线内（-f null -xerror）完成。
+    /// 显式运行：`cargo test --lib -- --ignored --nocapture mov_container_real_encode_roundtrip`
+    #[test]
+    #[ignore = "requires bundled ffmpeg/ffprobe; run explicitly for release validation"]
+    fn mov_container_real_encode_roundtrip(){
+        let dir=tempfile::tempdir().unwrap();
+        let options=VideoOptions{encoder:"libx264".into(),mode:"crf".into(),crf:Some(23.0),preset:"ultrafast".into(),audio_policy:"aac".into(),metadata_policy:"strip".into(),container:"mov".into(),threads:2,..Default::default()};
+        // 源夹具刻意 CRF 12（高码率）：再编码（CRF 23）必须更小，否则会在
+        // "有效但未变小"的跳过门收场 —— 那是正确行为，不是本测试的对象。
+        let source=make_fixture(dir.path(),"mov-source.mov",&[
+            "-f","lavfi","-i","testsrc2=size=320x240:rate=24:duration=2",
+            "-f","lavfi","-i","sine=frequency=440:duration=2",
+            "-map","0:v","-map","1:a","-c:v","libx264","-preset","ultrafast","-crf","12","-pix_fmt","yuv420p",
+            "-c:a","aac","-b:a","96k","-shortest"]);
+        let result=encode_full_chain(dir.path(),&source,&options);
+        assert!(result.success,"MOV 全链路必须提交成功: {:?}",result.reason);
+        assert_eq!(result.outcome,Some(ResultOutcome::Committed));
+        let output=PathBuf::from(result.output_path.as_deref().expect("提交后必须回填 output_path"));
+        assert!(output.extension().and_then(|e|e.to_str())==Some("mov"),"产物扩展名必须是 mov");
+        let out=probe::probe_cancellable(&output,Duration::from_secs(300),None,true).unwrap();
+        assert!(out.format.contains("mov"),"muxer 必须是 mov（实际 {}）",out.format);
+        assert_eq!(out.audio().count(),1,"MOV 音轨不许丢");
+        assert_eq!(out.video().unwrap().codec_name,"h264");
+        let src_frames=nb_read_frames(&source).expect("源必须探得出实测帧数");
+        let out_frames=nb_read_frames(&output).expect("产物必须探得出实测帧数");
+        assert_eq!(src_frames,out_frames,"MOV passthrough 一帧不许丢: {src_frames} → {out_frames}");
+    }
+
+    /// 8.2 不同分辨率 / 不同帧率的真实编码产物对账：
+    ///   - 分辨率组：960×540@24 → resolution=480 真实缩放 → 480×270，帧数与源
+    ///     逐帧一致（passthrough），产物 -count_frames 实测对账；
+    ///   - 帧率组：320×240@24 → 显式 frame_rate=30（CFR 转换）→ 实测帧数 =
+    ///     时长×30（±帧间隔容差），平均帧率 ≈30。
+    /// 全解码验证在 encode() 管线内完成。显式运行：
+    /// `cargo test --lib -- --ignored --nocapture real_variants_reconcile`
+    #[test]
+    #[ignore = "requires bundled ffmpeg/ffprobe; run explicitly for release validation"]
+    fn real_variants_reconcile_at_other_resolutions_and_frame_rates(){
+        let dir=tempfile::tempdir().unwrap();
+        let caps=capabilities::capabilities();
+        assert!(!caps.frame_timing_flag.is_empty(),"这台 ffmpeg 既不认 -fps_mode 也不认 -vsync");
+        // 分辨率组：960×540@24、2s = 48 帧。
+        let res_source=make_fixture(dir.path(),"res-source.mp4",&[
+            "-f","lavfi","-i","testsrc2=size=960x540:rate=24:duration=2",
+            "-f","lavfi","-i","sine=frequency=440:duration=2",
+            "-map","0:v","-map","1:a","-c:v","libx264","-preset","ultrafast","-pix_fmt","yuv420p",
+            "-c:a","aac","-b:a","96k","-shortest"]);
+        let res_options=VideoOptions{encoder:"libx264".into(),mode:"crf".into(),crf:Some(23.0),preset:"ultrafast".into(),audio_policy:"none".into(),metadata_policy:"strip".into(),container:"mp4".into(),resolution:480,threads:2,..Default::default()};
+        let res_result=encode_full_chain(dir.path(),&res_source,&res_options);
+        assert!(res_result.success,"分辨率变体必须提交成功: {:?}",res_result.reason);
+        let res_out=PathBuf::from(res_result.output_path.as_deref().expect("提交后必须回填 output_path"));
+        let res_probe=probe::probe_cancellable(&res_out,Duration::from_secs(300),None,true).unwrap();
+        assert_eq!((res_probe.width,res_probe.height),(480,270),"缩放必须按最长边 480 真实发生");
+        assert_eq!(nb_read_frames(&res_source),nb_read_frames(&res_out),"降分辨率不丢帧");
+        // 帧率组：320×240@24、2s = 48 帧 → CFR 30 = 60 帧（±容差）。
+        // 源夹具 CRF 12：CFR 30 再编码（CRF 23）必然更小，绕开跳过门。
+        let fps_source=make_fixture(dir.path(),"fps-source.mp4",&[
+            "-f","lavfi","-i","testsrc2=size=320x240:rate=24:duration=2",
+            "-map","0:v","-c:v","libx264","-preset","ultrafast","-crf","12","-pix_fmt","yuv420p","-shortest"]);
+        let fps_options=VideoOptions{encoder:"libx264".into(),mode:"crf".into(),crf:Some(23.0),preset:"ultrafast".into(),audio_policy:"none".into(),metadata_policy:"strip".into(),container:"mp4".into(),frame_rate:Some(30.0),threads:2,..Default::default()};
+        let fps_result=encode_full_chain(dir.path(),&fps_source,&fps_options);
+        assert!(fps_result.success,"帧率变体必须提交成功: {:?}",fps_result.reason);
+        let fps_out=PathBuf::from(fps_result.output_path.as_deref().expect("提交后必须回填 output_path"));
+        let fps_probe=probe::probe_cancellable(&fps_out,Duration::from_secs(300),None,true).unwrap();
+        let out_frames=nb_read_frames(&fps_out).expect("产物必须探得出实测帧数");
+        let expected=(2.0f64*30.0).round() as u64;
+        let tolerance=((expected as f64*0.001).ceil() as u64).max(2);
+        assert!(out_frames.abs_diff(expected)<=tolerance,"CFR 30 的实测帧数必须 ≈{expected}（实际 {out_frames}）");
+        assert!((fps_probe.frame_rate.unwrap()-30.0).abs()<0.5,"产物平均帧率必须 ≈30（实际 {}）",fps_probe.frame_rate.unwrap());
+    }
+
     /// T12 的证据工具：直接 ffprobe（绕开 probe.rs），拿 `-count_frames` 实测解码帧数。
     fn nb_read_frames(media:&Path)->Option<u64>{
         let mut cmd=super::super::process::command("ffprobe").ok()?;
