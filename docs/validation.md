@@ -2932,3 +2932,28 @@ statvfs 放行路径验证）；签名/公证/装订（正式 Release 门禁）�
 该作业在 v0.3.6-rc.21 的 Tests run 43779227273 中全绿。**仍保留为遗留项的
 部分**：不依赖 CI 的现场类验证——真实双实例人工并发、手工装包后的运行时核验
 （签名/公证/装订属正式 Release 门禁，与 NTFS 文件系统验证无关）。
+
+
+## 0.3.6 正式版发布门禁记录（2026-11-16）
+
+发布候选：`149e2d4`（v0.3.6-rc.22，即下方全部读数的代码基准）。
+
+| 门禁项 | 状态 | 证据 |
+|---|---|---|
+| 自动化回归 | ✅ | `cargo test` 三变体（lib 319/315/315）+ 集成 15；前端 33 套件；Swift 契约 32 条；真实媒体 `--ignored` 12/12 |
+| 三平台 CI | ✅ | Tests 43783581041 六作业全绿（windows / linux / macos-arm / appstore / swift / frontend） |
+| 三轨真实构建 | ✅ | Release 43783585062 八作业全绿（windows / linux / macos-arm / macos-intel / macos-universal / verify-appstore / parity / release） |
+| 签名 / 公证 / 装订 | ✅ | `release.yml` 196–260：Developer ID 导入缺失即中止（`:?`），codesign --options runtime --timestamp，notarytool，stapler；rc.22 构建作业全绿 |
+| FFmpeg GPL 对应源码义务 | ✅ | `THIRD_PARTY_NOTICES.md` 记录实测配置行（ffmpeg 9.0.2，`--enable-gpl` + libx264/libx265）；Release body 新增「第三方组件与对应源码（GPL 义务）」一节随发布页给出上游源码位置 |
+| Windows NTFS | ✅（CI 取证） | `windows-tests`（windows-latest，NTFS）三个具名步骤见本文 0.3.6-rc.22 节 |
+| 用户验收矩阵 | ✅（发布负责人指示） | 用户 2026-11-16 明确指示「打正式版」 |
+
+### 发布时明确记录的能力边界（不冒充）
+
+- Direct 版的**视频引擎只在 macOS 安装包里捆绑**；Windows/Linux 发行包不捆绑
+  FFmpeg，运行时能力探测会如实报告不可用（UI 只开放实际可用的能力）。
+- H.264/HEVC/AV1 的**专利许可**不由开源许可解决，目标市场评估是发布负责人
+  决定；本记录不声称已完成专利评估。
+- 双实例人工并发现场（CI 的 T21 双进程竞争测试已覆盖语义）与「写满独立卷」
+  现场仍未做人工演练，不构成数据安全缺口（守护路径均以注入位 + 真实系统调用
+  放行路径验证）。

@@ -77,6 +77,15 @@ attached to the 0.3.6 release page before any public distribution. The 0.3.6
 code changes touch how Sizqo *invokes* FFmpeg (strict input decoding, metadata
 scope flags, passthrough) — they do not change what is bundled.
 
+**Status for the 0.3.6 formal release (2026-11-16):** the bundled binary is
+unchanged and re-verified live (`ffmpeg version 9.0.2`, same `--enable-gpl
+--enable-libx264 --enable-libx265 --enable-libsvtav1 …` configuration line).
+The corresponding-source offer is published **on the release page itself**
+(section "第三方组件与对应源码（GPL 义务）" in
+`.github/workflows/release.yml`), together with the upstream source locations
+above, so every public distribution of the installer carries the offer.
+Codec/patent review for the target markets remains a release-owner decision.
+
 FFmpeg homepage: https://www.ffmpeg.org — licenses: https://www.ffmpeg.org/legal.html
 
 ## Rust dependencies

@@ -82,7 +82,8 @@ jobs:
 
       - name: Install CLI tools
         # ffmpeg/ffprobe 是 Direct 视频轨的捆绑引擎，scripts/collect_macos_tools.sh 缺它会直接失败。
-        # Homebrew 的 ffmpeg 带 GPL 编码器，对外分发前的对应源码义务仍未完成（见 THIRD_PARTY_NOTICES.md）。
+        # Homebrew 的 ffmpeg 带 GPL 编码器：对应源码义务由下方 Release body 的
+        # 「第三方组件与对应源码」一节兑现（与 THIRD_PARTY_NOTICES.md 同一份清单）。
         run: |
           brew install pngquant oxipng mozjpeg gifsicle webp jpeg-xl libavif ffmpeg
           bash scripts/collect_macos_tools.sh src-tauri/resources
@@ -588,6 +589,24 @@ jobs:
 
             macOS 资产均经 Developer ID 签名、Apple 公证与装订；`latest.json` 是应用内更新源，
             仅在本轮配置了独立更新签名时产出。
+
+            ### 第三方组件与对应源码（GPL 义务）
+
+            本安装包捆绑了 GPL 编码器的 FFmpeg（`--enable-gpl --enable-libx264
+            --enable-libx265 --enable-libsvtav1 …`，完整配置行见
+            [THIRD_PARTY_NOTICES.md](https://github.com/misswell/Sizqo/blob/main/THIRD_PARTY_NOTICES.md)），
+            按 GPL-2.0-or-later 分发；同包另有 GPL 的 `pngquant` 与 `gifsicle`。
+            对应源码与构建配置可从以下上游位置获取（与本包捆绑版本一致）：
+
+            - FFmpeg 9.0.2：https://ffmpeg.org/download.html
+            - x264：https://www.videolan.org/developers/x264.html
+            - x265：https://bitbucket.org/multicoreware/x265_git
+            - SVT-AV1：https://gitlab.com/AOMediaCodec/SVT-AV1
+            - libvpx：https://chromium.googlesource.com/webm/libvpx
+            - pngquant：https://github.com/kornelski/pngquant
+            - gifsicle：https://github.com/kohler/gifsicle
+
+            编解码器的专利许可不由开源许可解决，分发目标市场的专利评估由发布负责人决定。
 
             ### 能力
             - 图片：PNG、JPEG、GIF、WebP、AVIF、JPEG XL 压缩与格式转换
