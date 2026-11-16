@@ -2844,3 +2844,34 @@ Windows NTFS 专属现场验证仍未做（见下）。
   全绿覆盖了跨平台语义，但未做 NTFS 现场专项；需要一台真实 Windows 机器。
 - 磁盘空间耗尽走的是注入位 + 真实 statvfs 放行路径；"真实写满一块盘"的端到端
   未做（需要可耗尽的独立卷）。
+
+
+## 0.3.6-rc.21 — 8.1 证据映射闭合轮（2026-11-16）
+
+任务书 8.1 的 15 项故障注入逐项对齐到**真实测试**（此前 3/4/7 只有机制级或
+降级路径证据，缺视频 commit 级测试）。代码新增仅两条测试 + 一条 8.2 测试，
+生产行为零改动。
+
+| 8.1 项 | 测试证据（均为通过） |
+|---|---|
+| 1. 备份创建失败 | `a_backup_creation_failure_stops_the_job_before_encoding_sides`（rc.19） |
+| 2. 备份 SHA 验证失败 | `a_tampered_backup_refuses_the_commit_before_any_overwrite`（rc.19） |
+| 3. 源文件在编码过程中变化 | `a_source_modified_before_commit_is_refused_and_never_overwritten`（本轮新增，rc.21）+ 备份期注入 `TEST_FAULT_EDIT_SOURCE_AFTER_COPY` |
+| 4. 源文件在提交前被外部修改 | 同上（同大小原地改写也在内容指纹门内）；交叉证据 `rollback_refuses_to_clobber_an_externally_modified_source`（图片线） |
+| 5. 输出文件名被抢占 | `an_output_name_stolen_during_encoding_moves_to_the_next_candidate` + T21 双实例（tests/dual_instance.rs） |
+| 6. 输出路径日志更新失败 | `a_journal_update_failure_never_orphans_the_output`（rc.18） |
+| 7. 原子交换失败（Linux 降级路径） | `quarantine_publish_commits_and_leaves_no_names_behind` + `quarantine_publish_refuses_when_the_target_is_not_the_baseline_bytes`（publish_replace_via_quarantine 直测，output_transaction.rs:3721/:3748） |
+| 8. 交换成功但历史写入失败 | `a_history_write_failure_after_replace_restores_the_original`（rc.18） |
+| 9. 目录 fsync 失败 | `a_directory_fsync_failure_after_history_write_rolls_back`（rc.19） |
+| 10. 回滚失败 | `a_failed_rollback_keeps_the_full_recovery_scene`（rc.18） |
+| 11. 历史文件损坏 / 写一半 | `a_midway_history_write_failure_rolls_back_without_touching_the_old_history`（rc.19）+ HistoryStore 启动隔离（quarantine_history_file，既有测试） |
+| 12. 磁盘空间不足 | `a_space_shortage_is_refused_before_any_write`（rc.19；注入位 + 真实 statvfs 放行） |
+| 13-15. 逐阶段强杀 / 再次启动恢复 / 重复恢复 | `cargo test --test crash_injection` 8 阶段（SIGKILL + 两次恢复幂等），覆盖 after_backup/after_journal/after_partial/after_publish(含换出文件+状态机)/after_history/legacy/video_after_history_persisted |
+| 8.2 缺少关键元数据的视频 | `a_video_missing_required_metadata_is_refused_with_a_reason`（本轮新增，rc.21）：duration 探不到 + targetSize → 编码前明确拒绝且不拖累 CRF 路径；损坏文件见 s11-⑥ |
+
+读数：`cargo test`（Direct）lib **319 passed / 0 failed / 9 ignored**；其余矩阵
+沿用 rc.20 全绿结论（本轮仅新增测试，未动生产代码）。
+
+仍未覆盖（如实记录，与 rc.19 一致）：Windows NTFS 专属现场验证（CI VM 不可替代，
+需要真实 Windows 机器）；"真实写满独立卷"的端到端（空间守卫以注入位 + 真实
+statvfs 放行路径验证）；签名/公证/装订（正式 Release 门禁）。

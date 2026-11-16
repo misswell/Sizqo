@@ -283,6 +283,21 @@ impl EncodePlan {
         assert!(a.windows(2).any(|w|w==["-map_metadata","-1"]));
         assert!(a.windows(2).any(|w|w==["-map_chapters","-1"]));
     }
+    /// 8.2 缺少关键元数据的视频：duration 探不到 + targetSize —— 编码前给
+    /// 出可理解的拒绝理由，绝不假装算得出预算；同一份文件的非 targetSize
+    /// 路径照常可用（缺 duration 只挡真正需要它的模式）。
+    #[test]
+    fn a_video_missing_required_metadata_is_refused_with_a_reason(){
+        let root=serde_json::json!({"streams":[{"index":0,"codec_type":"video","width":720,"height":1280,"codec_name":"h264","pix_fmt":"yuv420p","avg_frame_rate":"30/1"}],"format":{"format_name":"mp4"}});
+        let p=VideoProbe::parse(root,1234).unwrap();
+        assert!(p.duration_us.is_none(),"夹具必须真的没有 duration");
+        let mut o=VideoOptions::default();o.encoder="libx264".into();o.mode="targetSize".into();o.target_mi_b=Some(8.0);
+        let error=build(&o,&p,&caps(),3).unwrap_err();
+        assert!(error.contains("known duration"),"拒绝理由必须说清缺什么: {error}");
+        let mut o2=VideoOptions::default();o2.encoder="libx264".into();o2.mode="crf".into();
+        assert!(build(&o2,&p,&caps(),3).is_ok(),"缺 duration 不许拖累不需要它的 CRF 路径");
+    }
+
     #[test]fn target_mib_contract(){let v=serde_json::to_value(VideoOptions::default()).unwrap();assert!(v.get("targetMiB").is_some());}
     #[test]fn zero_threads_means_auto_budget(){let mut o=VideoOptions::default();o.threads=0;let p=build(&o,&probe(),&caps(),5).unwrap();assert_eq!(p.threads,5);o.threads=99;let p=build(&o,&probe(),&caps(),5).unwrap();assert_eq!(p.threads,5);}
     #[test]fn vp9_webm_and_ts_contract(){let mut o=VideoOptions::default();o.encoder="libvpx-vp9".into();o.container="webm".into();o.mode="crf".into();o.crf=Some(31.0);o.audio_policy="opus".into();let p=build(&o,&probe(),&caps(),3).unwrap();let a=p.argv(Path::new("in.mp4"),Path::new("out.webm"),1,Path::new("st"));assert!(a.windows(2).any(|w|w==["-b:v","0"]));assert!(a.windows(2).any(|w|w==["-cpu-used","2"]));assert!(a.windows(2).any(|w|w==["-row-mt","1"]));

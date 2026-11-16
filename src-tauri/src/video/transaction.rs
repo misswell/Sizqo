@@ -677,6 +677,38 @@ pub(crate) fn set_fault_no_space(active:bool){
         assert!(backup.exists());
     }
 
+    /// 8.1-3/4：源文件在编码过程中（或提交前一刻）被外部/用户改写 ——
+    /// commit 的身份复核必须在**任何覆盖之前**拒绝：改过的字节是用户的内容，
+    /// 分文不动、不写回、不留事务日志。这条是"宁可失败也不覆盖"的第一现场。
+    #[test]
+    fn a_source_modified_before_commit_is_refused_and_never_overwritten(){
+        let dir=tempfile::tempdir().unwrap();let root=dir.path();
+        let source=root.join("clip.mkv");fs::write(&source,ORIGINAL).unwrap();
+        let o=VideoOptions{output_mode:"replace".into(),container:"mkv".into(),..Default::default()};
+        let history=HistoryStore::new(root.join("history")).unwrap();
+        let transactions=TransactionStore::new(root.join("transactions"));
+        let identity=SourceIdentity::read_with_hash(&source).unwrap();
+        let backup=history.ensure_backup_verified(&source,identity.sha256.as_deref()).unwrap();
+        let partial=root.join("partial.mkv");fs::write(&partial,ENCODED).unwrap();
+        // 编码烧了半小时 CPU 的同时，用户改了源文件（同大小原地改写也在指纹门内）。
+        let user_edited=b"user-edited-their-video-during-encode";
+        fs::write(&source,user_edited).unwrap();
+        let mut result=VideoResult::pending("t1",&source,&o);
+        let mut claimed_slot=None;
+        let error=commit(&source,&partial,&source,&o,&probe(),&mut result,&history,&transactions,3,&identity,Some(&backup),&mut claimed_slot).unwrap_err();
+        assert!(error.contains("Source changed"),"必须如实说明是身份复核拒绝: {error}");
+        // 用户改过的内容一字节不动 —— 绝不拿备份"恢复"回旧版本盖掉新内容。
+        assert_eq!(fs::read(&source).unwrap(),user_edited);
+        // 没有覆盖发生：事务账本干净、历史干净、候选未发布。
+        assert!(!transactions.has_pending(),"未发生覆盖就不许留事务日志");
+        assert!(history.list().is_empty());
+        assert!(!root.join("clip_compressed.mkv").exists());
+        assert!(backup.exists(),"备份原样保留，交由历史/保留策略处置");
+        // 二次确认：候选指纹 ≠ 源位指纹（用户内容 ≠ 我们承诺的产物）。
+        assert_ne!(crate::source_identity::sha256_of(&source).unwrap(),
+                   crate::source_identity::sha256_of(&partial).unwrap());
+    }
+
     /// T17（本轮加固 P2-12）：编码期间输出名被外部抢占 → 换下一个候选名发布，
     /// partial 复用不重新编码，外部文件分文不动，实际路径写进历史与结果。
     /// 现场按跨平台语义构造：计划位被外部内容占住、占位凭证失效（claimed=None，
