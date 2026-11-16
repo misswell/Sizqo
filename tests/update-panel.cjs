@@ -29,6 +29,15 @@ assert.ok(settingsStart > 0, '找不到设置页容器');
 assert.ok(html.includes('id="titlebarProgress"'));
 assert.ok(css.includes('.titlebar-progress'));
 
+// 更新入口的地址必须是 Sizqo 自己的仓库：曾经有一条链到上游 OctoShrink 的
+// "Release 页面"，点开是另一个产品的最新版 —— 用户以为在跟进当前应用。
+const releaseLink = html.slice(html.indexOf('id="updateCheckRow"'));
+const hrefMatch = releaseLink.match(/class="update-link" href="([^"]+)"/);
+assert.ok(hrefMatch, 'Release 页面链接必须存在');
+assert.equal(hrefMatch[1], 'https://github.com/misswell/Sizqo/releases/latest',
+  'Release 页面必须指向 misswell/Sizqo，不许沿用上游仓库');
+assert.ok(!/octo-shrink/i.test(html), '前端任何位置都不许出现上游 OctoShrink 仓库地址');
+
 // ── 行为 ──────────────────────────────────────────────────────────────
 function field(extra) {
   return Object.assign({

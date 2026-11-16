@@ -2957,3 +2957,21 @@ statvfs 放行路径验证）；签名/公证/装订（正式 Release 门禁）�
 - 双实例人工并发现场（CI 的 T21 双进程竞争测试已覆盖语义）与「写满独立卷」
   现场仍未做人工演练，不构成数据安全缺口（守护路径均以注入位 + 真实系统调用
   放行路径验证）。
+
+
+## 0.3.7 — 更新入口地址修正（2026-11-16）
+
+代码审查（用户报告「在线更新地址错了」）结论：
+
+| 路径 | 复核结果 |
+|---|---|
+| `src-tauri/tauri.conf.updater.json` 端点 | ✅ `https://github.com/misswell/Sizqo/releases/latest/download/latest.json` |
+| 已安装 0.3.6 二进制内嵌端点 | ✅ 与配置一致（strings 实测） |
+| `latest.json`（v0.3.6 资产） | ✅ version 0.3.6；platforms 两个 darwin 键；URL 指向真实资产；签名 432 字节 |
+| 前端「Release 页面」链接 | ❌ **曾指向 `misswell/octo-shrink`** → 已修正为 `misswell/Sizqo`（本轮修复） |
+| 回归守卫 | ✅ `tests/update-panel.cjs` 钉住 URL，并禁止前端出现上游仓库地址 |
+| 本地 `scripts/notarize.sh` 生成的 feed | 仅 `darwin-aarch64`（本机构建为 arm64 单架构，符合预期；CI 正式 feed 两个键齐全） |
+| 未配置更新签名的 Direct 构建 | `check_for_update` 返回 `Ok(None)`，面板显示「已是最新版本」——对本地开发构建略有误导，属既有行为，未在本轮改动 |
+
+读数：`npm run test:frontend` 全绿（33 套件，含新增断言）；前端外链审计只剩
+`https://github.com/misswell/Sizqo/releases/latest` 一条。

@@ -3,6 +3,14 @@
 Sizqo's versioning starts at 0.1.0. This file records user-visible changes;
 engineering rules live in [AGENTS.md](AGENTS.md).
 
+## 0.3.7 — 更新入口地址修正（2026-11-16）
+
+- 修复：设置页「Release 页面」链接此前指向上游 OctoShrink 仓库——点开是另一个
+  产品的最新版，用户会以为在跟进当前应用。现指向 `misswell/Sizqo` 的 Releases。
+- 回归测试钉住该地址，并要求前端任何位置不出现上游仓库地址。
+- 在线更新源本身（`latest.json` 端点、签名公钥、更新包 URL）复核无误：
+  应用内检查更新走的是 `releases/latest/download/latest.json`，与本次链接修正无关。
+
 ## 0.3.6 — 可靠性正式版（2026-11-16）
 
 自 0.3.5 起的整轮可靠性工作（rc.18–rc.22）以此为正式发布。相对 0.3.5 的
